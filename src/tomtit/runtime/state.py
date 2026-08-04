@@ -116,8 +116,12 @@ class AttemptEvidence(DomainModel):
     Scenario 2 needs Attempt 1 evidence to stay auditable after Attempt 2 starts,
     and needs machine-checkable counters for objective improvement. Both come
     from observed evidence only; Worker claims never reach this model.
+
+    `run_id` is an explicit field, not something inferred from a snapshot-ID
+    string, so archived evidence can be bound to its run at every trust boundary.
     """
 
+    run_id: str = Field(min_length=1)
     attempt_number: int = Field(ge=1)
     observed_checks: Annotated[
         tuple[ObservedCheckResult, ...], BeforeValidator(_list_to_tuple)
@@ -132,16 +136,31 @@ class AttemptEvidence(DomainModel):
     satisfied_criterion_ids: Annotated[
         tuple[str, ...], BeforeValidator(_list_to_tuple)
     ] = Field(default_factory=tuple)
+    stop_decision: StopDecision | None = None
+    findings: Annotated[tuple[Finding, ...], BeforeValidator(_list_to_tuple)] = Field(
+        default_factory=tuple
+    )
 
     @model_validator(mode="after")
     def validate_attempt_binding(self) -> AttemptEvidence:
-        if any(item.attempt_number != self.attempt_number for item in self.observed_checks):
-            raise ValueError("archived checks must belong to the archived attempt")
-        if (
-            self.observed_patch is not None
-            and self.observed_patch.attempt_number != self.attempt_number
-        ):
-            raise ValueError("archived patch must belong to the archived attempt")
+        for item in self.observed_checks:
+            if item.run_id != self.run_id:
+                raise ValueError("archived checks must belong to the archived run")
+            if item.attempt_number != self.attempt_number:
+                raise ValueError("archived checks must belong to the archived attempt")
+            if item.snapshot_id != f"check:{self.run_id}:{self.attempt_number}:{item.check_id}":
+                raise ValueError("archived check snapshot identity is inconsistent")
+        if self.observed_patch is not None:
+            if self.observed_patch.run_id != self.run_id:
+                raise ValueError("archived patch must belong to the archived run")
+            if self.observed_patch.attempt_number != self.attempt_number:
+                raise ValueError("archived patch must belong to the archived attempt")
+        observed_ids = {item.check_id for item in self.observed_checks}
+        if not set(self.failed_check_ids) <= observed_ids:
+            raise ValueError("archived failed checks must reference archived observations")
+        evaluated_ids = {item.criterion_id for item in self.criterion_evaluations}
+        if not set(self.satisfied_criterion_ids) <= evaluated_ids:
+            raise ValueError("archived satisfied criteria must reference archived evaluations")
         return self
 
     @property
@@ -154,13 +173,26 @@ class AttemptEvidence(DomainModel):
 
 def attempt_evidence_from_observations(
     *,
+    run_id: str,
     attempt_number: int,
     required_checks: tuple[RequiredCheck, ...],
     observed_checks: tuple[ObservedCheckResult, ...],
     observed_patch: ObservedPatchEvidence | None,
     criterion_evaluations: tuple[CriterionEvaluation, ...],
+    stop_decision: StopDecision | None = None,
+    findings: tuple[Finding, ...] = (),
 ) -> AttemptEvidence:
-    """Derive one attempt's archived evidence from observed results only."""
+    """Derive one attempt's archived evidence from observed results only.
+
+    The canonical run ID is supplied explicitly and every observation must agree
+    with it, so a foreign-run observation cannot be archived.
+    """
+
+    for item in observed_checks:
+        if item.run_id != run_id:
+            raise ValueError("observed checks must belong to the canonical run")
+    if observed_patch is not None and observed_patch.run_id != run_id:
+        raise ValueError("observed patch must belong to the canonical run")
 
     expected_exit_codes = {check.id: check.expected_exit_codes for check in required_checks}
     failed = tuple(
@@ -178,13 +210,66 @@ def attempt_evidence_from_observations(
         )
     )
     return AttemptEvidence(
+        run_id=run_id,
         attempt_number=attempt_number,
         observed_checks=observed_checks,
         observed_patch=observed_patch,
         criterion_evaluations=criterion_evaluations,
         failed_check_ids=failed,
         satisfied_criterion_ids=satisfied,
+        stop_decision=stop_decision,
+        findings=findings,
     )
+
+
+REPAIRABLE_FINDING_CATEGORY = "deterministic_check_failure"
+
+
+def repairable_check_finding(
+    *,
+    run_id: str,
+    attempt_number: int,
+    check: RequiredCheck,
+    observed: ObservedCheckResult,
+    acceptance_criterion_id: str | None,
+) -> Finding:
+    """Derive the one canonical repairable finding for a failed required check.
+
+    Identity and content are a deterministic function of canonical Runtime truth,
+    so the same failure always yields the same finding and a finding built for a
+    different run, attempt, or check can never compare equal.
+    """
+
+    return Finding(
+        finding_id=f"finding:{run_id}:{attempt_number}:{check.id}",
+        fingerprint=f"{REPAIRABLE_FINDING_CATEGORY}:{check.id}",
+        severity=FindingSeverity.BLOCKING,
+        category=REPAIRABLE_FINDING_CATEGORY,
+        message=(
+            f"required check {check.id} exited {observed.exit_code}; "
+            f"expected one of {list(check.expected_exit_codes)}"
+        ),
+        evidence_refs=(
+            observed.snapshot_id,
+            observed.stdout_path,
+            observed.stderr_path,
+        ),
+        acceptance_criterion_id=acceptance_criterion_id,
+    )
+
+
+def first_failed_required_check(
+    required_checks: tuple[RequiredCheck, ...],
+    observed_checks: tuple[ObservedCheckResult, ...],
+) -> tuple[RequiredCheck, ObservedCheckResult] | None:
+    """Select the failed check deterministically, in canonical contract order."""
+
+    observed_by_id = {item.check_id: item for item in observed_checks}
+    for check in required_checks:
+        observed = observed_by_id.get(check.id)
+        if observed is not None and observed.exit_code not in check.expected_exit_codes:
+            return check, observed
+    return None
 
 
 def objective_improvement_error(
@@ -222,11 +307,23 @@ def objective_improvement_error(
     return None
 
 
-def task_contract_hash(contract: TaskContract) -> str:
-    """SHA-256 over the contract's canonical JSON with stable key ordering."""
+TASK_CONTRACT_HASH_SCHEMA_VERSION = "tomtit.task_contract_hash.v1"
 
+
+def task_contract_hash(contract: TaskContract) -> str:
+    """SHA-256 over a versioned canonical envelope of the contract.
+
+    The hashed bytes name their own schema version, so a future change to how the
+    contract is canonicalized produces a different hash instead of silently
+    colliding with values produced by this version.
+    """
+
+    envelope = {
+        "schema_version": TASK_CONTRACT_HASH_SCHEMA_VERSION,
+        "task_contract": json.loads(contract.model_dump_json()),
+    }
     canonical = json.dumps(
-        json.loads(contract.model_dump_json()),
+        envelope,
         sort_keys=True,
         separators=(",", ":"),
         ensure_ascii=False,
@@ -389,6 +486,9 @@ class RunRecord(DomainModel):
             raise ValueError("attempt history must be unique and strictly increasing")
         if archived_attempts and archived_attempts[-1] >= max(self.attempt_count, 1):
             raise ValueError("attempt history cannot contain the current or a later attempt")
+        # Archived evidence is canonical run state; it must belong to this run.
+        if any(item.run_id != self.run_id for item in self.attempt_history):
+            raise ValueError("attempt history must belong to the canonical run")
 
         if self.state is RunState.COMPLETED:
             if self.attempt_count < 1:
@@ -446,6 +546,7 @@ class RunRecord(DomainModel):
                 # A revised run may only complete on proven objective improvement.
                 # Runs with no earlier attempt are unaffected by this rule.
                 current_evidence = attempt_evidence_from_observations(
+                    run_id=self.run_id,
                     attempt_number=self.attempt_count,
                     required_checks=self.task_contract.required_checks,
                     observed_checks=self.observed_checks,

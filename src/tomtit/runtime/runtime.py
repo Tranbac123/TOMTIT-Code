@@ -7,7 +7,12 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from tomtit.domain.contracts import StopDecision, TaskContract, VerificationPlan
+from tomtit.domain.contracts import (
+    Finding,
+    StopDecision,
+    TaskContract,
+    VerificationPlan,
+)
 from tomtit.domain.enums import (
     CriterionStatus,
     EvaluationEventType,
@@ -49,7 +54,9 @@ from tomtit.runtime.state import (
     TransitionReason,
     artifact_file_error,
     attempt_evidence_from_observations,
+    first_failed_required_check,
     objective_improvement_error,
+    repairable_check_finding,
     patch_evidence_error,
     required_check_coverage_error,
     task_contract_hash,
@@ -117,9 +124,31 @@ _TRANSITION_EVENT_TYPES: dict[RunState, EvaluationEventType] = {
 
 TOMTIT_POLICY_VERSION = "mvp-execution-policy-v0.3"
 
+# Entering these states carries its own canonical record, so the generic public
+# transition API must never be the writer.
+_RUNTIME_COMMITTED_STATES: dict[RunState, str] = {
+    RunState.COMPLETED: (
+        "COMPLETED is committed by complete_run() as one prepared operation"
+    ),
+    RunState.REVISING: (
+        "REVISING is committed by commit_revision_decision() together with its "
+        "DecisionEvent; the generic transition API cannot enter it"
+    ),
+}
+
 
 class RevisionNotAllowed(RuntimeError):
     """Raised when a REVISE proposal cannot be accepted as canonical."""
+
+
+@dataclass(frozen=True, slots=True)
+class _RevisionMetadata:
+    """Decision metadata derived from canonical Runtime truth only."""
+
+    policy_version: str
+    allowed_actions: tuple[NextAction, ...]
+    binding_constraints: tuple[str, ...]
+    budget_snapshot: BudgetSnapshot
 
 
 @dataclass(frozen=True, slots=True)
@@ -216,6 +245,7 @@ class Runtime:
                 "Scenario 2 requires a deterministic Attempt 1 failure"
             )
 
+        self.record_repairable_failure()
         self.commit_revision_decision(self.build_revision_proposal())
         self.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
 
@@ -308,29 +338,82 @@ class Runtime:
 
     # ---- Scenario 2: one bounded revision ----------------------------------
 
-    def build_revision_proposal(self) -> DecisionEventDraft:
-        """Build a Coordinator-side REVISE proposal from current observed evidence.
+    def record_repairable_failure(self) -> RunRecord:
+        """Materialize the canonical repairable branch result for a failed attempt.
 
-        This is a *proposal only*. It appends nothing, mutates nothing, and
-        carries no identity, timestamp, or sequence. Runtime remains the only
-        writer; a caller may equally construct this draft itself.
+        Policy requires every branch that asks for another attempt to produce a
+        `StopDecision` with `next_action=REVISE`, `repairable=true`,
+        `owner_input_required=false`, and null outcome and stop reason, plus the
+        finding that justifies repair. Both are derived here from observed
+        evidence; Worker claims are not an input.
+        """
+
+        record = self._record
+        if record.state is not RunState.CHECKING:
+            raise InvalidTransitionError(
+                "a repairable failure can only be recorded from CHECKING"
+            )
+        finding = self._canonical_repairable_finding()
+        if finding is None:
+            raise RevisionNotAllowed(
+                "a repairable failure requires at least one failed required check"
+            )
+        self._replace_record(
+            stop_decision=StopDecision(
+                outcome=None,
+                stop_reason=None,
+                repairable=True,
+                owner_input_required=False,
+                next_action=NextAction.REVISE,
+            ),
+            unresolved_findings=(finding,),
+        )
+        return self._record
+
+    def _canonical_repairable_finding(self) -> Finding | None:
+        """Derive the one repairable finding for the first failed required check."""
+
+        record = self._record
+        selected = first_failed_required_check(
+            record.task_contract.required_checks,
+            record.observed_checks,
+        )
+        if selected is None:
+            return None
+        check, observed = selected
+        criterion_id = next(
+            (
+                criterion.id
+                for criterion in record.task_contract.acceptance_criteria
+                if check.id in criterion.required_check_ids
+            ),
+            None,
+        )
+        return repairable_check_finding(
+            run_id=record.run_id,
+            attempt_number=record.attempt_count,
+            check=check,
+            observed=observed,
+            acceptance_criterion_id=criterion_id,
+        )
+
+    def _canonical_revision_metadata(self) -> _RevisionMetadata:
+        """Derive decision metadata from canonical Runtime truth.
+
+        Used both to build the proposal and, independently, to re-derive expected
+        values at the commit boundary. A caller field is never validated against
+        another caller field.
         """
 
         record = self._record
         contract = record.task_contract
-        evidence_ids = [item.snapshot_id for item in record.observed_checks]
-        if record.observed_patch is not None:
-            evidence_ids.append(record.observed_patch.snapshot_id)
-        return DecisionEventDraft(
+        budget_remains = record.attempt_count + 1 <= contract.max_attempts
+        allowed_actions = (
+            (NextAction.REVISE, NextAction.FAIL) if budget_remains else (NextAction.FAIL,)
+        )
+        return _RevisionMetadata(
             policy_version=TOMTIT_POLICY_VERSION,
-            task_contract_hash=task_contract_hash(contract),
-            run_id=record.run_id,
-            attempt_number=record.attempt_count,
-            state_before=record.state,
-            evidence_snapshot_ids=tuple(evidence_ids),
-            allowed_actions=(NextAction.REVISE, NextAction.FAIL),
-            selected_action=NextAction.REVISE,
-            reason_code=DecisionReasonCode.DETERMINISTIC_REPAIRABLE_CHECK_FAILURE,
+            allowed_actions=allowed_actions,
             binding_constraints=(
                 f"max_attempts={contract.max_attempts}",
                 "deterministic_evidence_required",
@@ -341,6 +424,34 @@ class Runtime:
                 hard_max_attempts=contract.hard_max_attempts,
                 time_budget_seconds=contract.time_budget_seconds,
             ),
+        )
+
+    def build_revision_proposal(self) -> DecisionEventDraft:
+        """Build a Coordinator-side REVISE proposal from current observed evidence.
+
+        This is a *proposal only*. It appends nothing, mutates nothing, and
+        carries no identity, timestamp, or sequence. Runtime remains the only
+        writer; a caller may equally construct this draft itself, and the commit
+        boundary re-derives every canonical field regardless.
+        """
+
+        record = self._record
+        metadata = self._canonical_revision_metadata()
+        evidence_ids = [item.snapshot_id for item in record.observed_checks]
+        if record.observed_patch is not None:
+            evidence_ids.append(record.observed_patch.snapshot_id)
+        return DecisionEventDraft(
+            policy_version=metadata.policy_version,
+            task_contract_hash=task_contract_hash(record.task_contract),
+            run_id=record.run_id,
+            attempt_number=record.attempt_count,
+            state_before=record.state,
+            evidence_snapshot_ids=tuple(evidence_ids),
+            allowed_actions=metadata.allowed_actions,
+            selected_action=NextAction.REVISE,
+            reason_code=DecisionReasonCode.DETERMINISTIC_REPAIRABLE_CHECK_FAILURE,
+            binding_constraints=metadata.binding_constraints,
+            budget_snapshot=metadata.budget_snapshot,
             state_after=RunState.REVISING,
         )
 
@@ -388,6 +499,56 @@ class Runtime:
                 f"{contract.max_attempts} attempts used"
             )
 
+        # Every remaining proposal field is re-derived from canonical truth and
+        # compared for exact equality. No caller field validates another.
+        metadata = self._canonical_revision_metadata()
+        if validated.policy_version != metadata.policy_version:
+            raise RevisionNotAllowed(
+                f"proposal policy_version {validated.policy_version!r} does not match "
+                f"the canonical policy {metadata.policy_version!r}"
+            )
+        if validated.allowed_actions != metadata.allowed_actions:
+            raise RevisionNotAllowed(
+                f"proposal allowed_actions {[a.value for a in validated.allowed_actions]} "
+                f"do not match canonical {[a.value for a in metadata.allowed_actions]}"
+            )
+        if validated.binding_constraints != metadata.binding_constraints:
+            raise RevisionNotAllowed(
+                f"proposal binding_constraints {list(validated.binding_constraints)} "
+                f"do not match canonical {list(metadata.binding_constraints)}"
+            )
+        if validated.budget_snapshot != metadata.budget_snapshot:
+            raise RevisionNotAllowed(
+                "proposal budget_snapshot does not match the canonical budget"
+            )
+
+        # The policy-required repairable branch result must already exist.
+        stop_decision = record.stop_decision
+        if stop_decision is None:
+            raise RevisionNotAllowed("REVISE requires a recorded repairable StopDecision")
+        if stop_decision.next_action is not NextAction.REVISE:
+            raise RevisionNotAllowed("REVISE requires StopDecision.next_action=revise")
+        if not stop_decision.repairable:
+            raise RevisionNotAllowed("REVISE requires StopDecision.repairable=true")
+        if stop_decision.owner_input_required:
+            raise RevisionNotAllowed("REVISE requires owner_input_required=false")
+        if stop_decision.outcome is not None or stop_decision.stop_reason is not None:
+            raise RevisionNotAllowed("a REVISE StopDecision must not set outcome or stop reason")
+
+        expected_finding = self._canonical_repairable_finding()
+        if expected_finding is None:
+            raise RevisionNotAllowed("REVISE requires at least one failed required check")
+        if len(record.unresolved_findings) != 1:
+            raise RevisionNotAllowed(
+                f"REVISE requires exactly one repairable finding, found "
+                f"{len(record.unresolved_findings)}"
+            )
+        if record.unresolved_findings[0] != expected_finding:
+            raise RevisionNotAllowed(
+                "the recorded finding does not match the canonical repairable finding "
+                f"for run {record.run_id} attempt {record.attempt_count}"
+            )
+
         current_evidence = self._current_attempt_evidence()
         if not current_evidence.failed_check_ids:
             raise RevisionNotAllowed("REVISE requires at least one failed required check")
@@ -402,15 +563,25 @@ class Runtime:
             )
 
         # Preparation: fallible work only, nothing canonical is touched.
+        # The archive carries the branch result forward; the current attempt's
+        # decision and findings are cleared because they belong to Attempt 1.
+        archived = current_evidence.model_copy(
+            update={
+                "stop_decision": stop_decision,
+                "findings": record.unresolved_findings,
+            }
+        )
         next_attempt = record.attempt_count + 1
         candidate = self._build_record(
             state=RunState.REVISING,
             attempt_count=next_attempt,
-            attempt_history=(*record.attempt_history, current_evidence),
+            attempt_history=(*record.attempt_history, archived),
             observed_checks=(),
             observed_patch=None,
             criterion_evaluations=(),
             worker_result=None,
+            stop_decision=None,
+            unresolved_findings=(),
         )
         prepared_decision = self._event_log.prepare_decision(
             validated,
@@ -455,6 +626,7 @@ class Runtime:
     def _current_attempt_evidence(self) -> AttemptEvidence:
         record = self._record
         return attempt_evidence_from_observations(
+            run_id=record.run_id,
             attempt_number=record.attempt_count,
             required_checks=record.task_contract.required_checks,
             observed_checks=record.observed_checks,
@@ -463,14 +635,21 @@ class Runtime:
         )
 
     def transition(self, target: RunState, reason: TransitionReason) -> None:
-        """Validate and record one canonical non-terminal transition."""
+        """Validate and record one canonical unprotected transition.
+
+        States whose entry carries its own canonical record — the terminal report
+        for COMPLETED, the DecisionEvent for REVISING — are refused here. The
+        edge is checked first so a genuinely illegal move is still reported as
+        such; the protected-target refusal then applies whatever reason was
+        supplied.
+        """
 
         current = self._record.state
-        self._assert_transition_legal(current, target, reason)
-        if target is RunState.COMPLETED:
-            raise InvalidTransitionError(
-                "COMPLETED is committed by complete_run() as one prepared operation"
-            )
+        self._assert_transition_edge(current, target)
+        protected = _RUNTIME_COMMITTED_STATES.get(target)
+        if protected is not None:
+            raise InvalidTransitionError(protected)
+        self._assert_transition_reason(current, target, reason)
         self._validate_transition_preconditions(current, target)
         self._replace_record(state=target)
         self._append_transition_event(current, target, reason)
@@ -630,6 +809,11 @@ class Runtime:
         target: RunState,
         reason: TransitionReason,
     ) -> None:
+        self._assert_transition_edge(current, target)
+        self._assert_transition_reason(current, target, reason)
+
+    @staticmethod
+    def _assert_transition_edge(current: RunState, target: RunState) -> None:
         if current in {
             RunState.COMPLETED,
             RunState.FAILED,
@@ -639,6 +823,13 @@ class Runtime:
             raise InvalidTransitionError("terminal states cannot transition")
         if target not in _ALLOWED_TRANSITIONS.get(current, set()):
             raise InvalidTransitionError(f"illegal transition: {current.value} -> {target.value}")
+
+    @staticmethod
+    def _assert_transition_reason(
+        current: RunState,
+        target: RunState,
+        reason: TransitionReason,
+    ) -> None:
         expected_reason = _EXPECTED_TRANSITION_REASONS[(current, target)]
         if reason is not expected_reason:
             raise InvalidTransitionError(
