@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import inspect
 import json
+from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -41,6 +42,8 @@ from tomtit.reporting import (
     STAGED_REPORT_NAME,
     TerminalReport,
     build_terminal_report,
+    publish_staged_report,
+    stage_terminal_report,
     write_terminal_report,
 )
 from tomtit.runtime import CompletionBasis, InMemoryEventLog, TransitionReason
@@ -1445,11 +1448,17 @@ def test_report_publication_failure_recovers_the_pre_completion_run(
     assert_clean_failure_result(runtime, tmp_path)
 
 
-def test_event_batch_append_failure_recovers_after_report_publication(
+def test_event_batch_append_failure_happens_before_any_report_exists(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Recovery after a failure occurring after the final report was published."""
+    """SOL-RH01 Path A under the new ordering: events commit before publication.
+
+    Codex's Path A needed publication to already have happened when the event
+    append failed, so rollback had to delete a final report and a failed deletion
+    stranded it. The final report is now created last, so the publisher is never
+    reached and there is nothing to delete.
+    """
 
     published: list[Path] = []
     real_publish = runtime_module.publish_staged_report
@@ -1469,7 +1478,7 @@ def test_event_batch_append_failure_recovers_after_report_publication(
     with pytest.raises(OSError, match="event batch append failed"):
         runtime.run_scenario_1()
 
-    assert published, "the report must have been published before the failure"
+    assert published == [], "publication must not be reached when events fail"
     assert_clean_failure_result(runtime, tmp_path)
 
 
@@ -1579,6 +1588,277 @@ def test_no_supported_failure_creates_duplicate_terminal_events(
     assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
     assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
     assert runtime.record.state is RunState.CHECKING
+
+
+# ---------------------------------------------------------------------------
+# SOL-RH01 final patch — creating the final report is the commit point.
+#
+# Codex reproduced two contradictory states: canonical CHECKING with zero
+# terminal events but a surviving report.v1.json, which then blocked retry.
+# Path A needed a rollback to delete an already published report; Path B needed
+# a publisher that created the report and then raised. Both are structurally
+# impossible now, and these tests hold that structure in place.
+# ---------------------------------------------------------------------------
+
+
+FORBIDDEN_CONTRADICTION = (
+    "canonical CHECKING with no terminal events must never leave a final report"
+)
+
+
+def assert_no_contradictory_terminal_artifact(runtime: Runtime, directory: Path) -> None:
+    if runtime.record.state is RunState.CHECKING:
+        assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+        assert not (directory / "report.v1.json").exists(), FORBIDDEN_CONTRADICTION
+
+
+def no_op_remove(path: Path) -> None:
+    """Models cleanup that silently fails to remove anything."""
+
+
+def test_event_append_failure_before_publication_is_fully_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.1: terminal-event append failure, then a retry that succeeds exactly once."""
+
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError, match="event batch append failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+    assert_no_contradictory_terminal_artifact(runtime, tmp_path)
+
+    monkeypatch.undo()
+    record = runtime.complete_run()
+
+    assert record.state is RunState.COMPLETED
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+    assert not staged_report_path(tmp_path).exists()
+
+
+def test_partial_event_append_is_rolled_back_and_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.2: one terminal event lands, then the append raises."""
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    log = runtime._event_log
+
+    def partial_batch(prepared: Sequence[object]) -> None:
+        log._serialized_events.append(prepared[0].serialized)  # type: ignore[attr-defined]
+        raise OSError("partial event batch append failed")
+
+    monkeypatch.setattr(log, "_append_prepared_batch", partial_batch)
+
+    with pytest.raises(OSError, match="partial event batch append failed"):
+        runtime.run_scenario_1()
+
+    assert len(runtime.events) == 9
+    assert_clean_failure_result(runtime, tmp_path)
+    assert_no_contradictory_terminal_artifact(runtime, tmp_path)
+
+    monkeypatch.undo()
+    record = runtime.complete_run()
+
+    assert record.state is RunState.COMPLETED
+    assert len(runtime.events) == 11
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+
+
+def test_final_link_creation_failure_is_fully_retryable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.3: the publisher raises without creating the final report."""
+
+    def failing_publish(staged: Path, final: Path) -> Path:
+        raise OSError("final link creation failed")
+
+    monkeypatch.setattr(runtime_module, "publish_staged_report", failing_publish)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    with pytest.raises(OSError, match="final link creation failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+    assert_no_contradictory_terminal_artifact(runtime, tmp_path)
+
+    monkeypatch.undo()
+    record = runtime.complete_run()
+
+    assert record.state is RunState.COMPLETED
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+
+
+def test_staged_cleanup_failure_after_publication_keeps_the_terminal_result(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.4: cleanup failure past the commit point must never undo completion."""
+
+    monkeypatch.setattr(runtime_module, "_remove_quietly", no_op_remove)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    record = runtime.run_scenario_1()
+
+    assert record.state is RunState.COMPLETED
+    assert record.outcome is Outcome.COMPLETED
+    assert record.stop_reason is StopReason.ACCEPTANCE_SATISFIED
+    assert record.report_path == str(tmp_path / "report.v1.json")
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert (tmp_path / "report.v1.json").is_file()
+    # The bounded cost of a cleanup failure: a private staged file may survive.
+    assert staged_report_path(tmp_path).exists()
+
+    with pytest.raises(InvalidTransitionError, match="terminal"):
+        runtime.complete_run()
+
+    assert runtime.record.state is RunState.COMPLETED
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+
+
+def test_final_report_removal_failure_path_cannot_occur(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.5: Codex Path A with cleanup that removes nothing at all.
+
+    Previously this stranded report.v1.json and made retry raise FileExistsError.
+    """
+
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    monkeypatch.setattr(runtime_module, "_remove_quietly", no_op_remove)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError, match="event batch append failed"):
+        runtime.run_scenario_1()
+
+    assert runtime.record.state is RunState.CHECKING
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert not (tmp_path / "report.v1.json").exists(), FORBIDDEN_CONTRADICTION
+
+    # Retry succeeds with no manual filesystem cleanup, even though the stale
+    # staged file was never removed.
+    monkeypatch.undo()
+    record = runtime.complete_run()
+
+    assert record.state is RunState.COMPLETED
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert not staged_report_path(tmp_path).exists()
+
+
+def test_publisher_does_not_remove_the_staged_report(tmp_path: Path) -> None:
+    """9.6a: the publisher performs one operation, so it cannot be ambiguous.
+
+    Codex Path B relied on a publisher that linked the final report and then
+    raised while unlinking, leaving the caller unable to know the report existed.
+    """
+
+    staged = stage_terminal_report(tmp_path, "staged report body\n")
+    final = tmp_path / "report.v1.json"
+
+    result = publish_staged_report(staged, final)
+
+    assert result == final
+    assert final.is_file()
+    assert staged.exists(), "publication must not own staged cleanup"
+
+    with pytest.raises(FileExistsError):
+        publish_staged_report(staged, final)
+
+
+def test_staged_unlink_failure_after_publication_keeps_completion_committed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.6b: the former in-publisher unlink now fails after the commit point."""
+
+    real_publish = runtime_module.publish_staged_report
+
+    def publish_then_fail_cleanup(staged: Path, final: Path) -> Path:
+        result = real_publish(staged, final)
+        assert final.is_file()
+        return result
+
+    monkeypatch.setattr(runtime_module, "publish_staged_report", publish_then_fail_cleanup)
+    monkeypatch.setattr(runtime_module, "_remove_quietly", no_op_remove)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    record = runtime.run_scenario_1()
+
+    assert record.state is RunState.COMPLETED
+    assert record.report_path == str(tmp_path / "report.v1.json")
+    assert (tmp_path / "report.v1.json").is_file()
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert runtime.record.state is not RunState.CHECKING
+
+
+def test_remove_quietly_swallows_removal_failure(tmp_path: Path) -> None:
+    """The real cleanup helper must not raise when removal is impossible."""
+
+    undeletable = tmp_path / "a-directory"
+    (undeletable / "child").mkdir(parents=True)
+
+    runtime_module._remove_quietly(undeletable)
+
+    assert undeletable.is_dir()
+
+
+def test_normal_success_leaves_one_report_and_no_staged_file(tmp_path: Path) -> None:
+    """9.7."""
+
+    runtime = make_runtime(tmp_path)
+    record = runtime.run_scenario_1()
+
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+    assert list(tmp_path.glob(STAGED_REPORT_NAME)) == []
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert record.report_path == str(tmp_path / "report.v1.json")
+
+
+def test_earlier_history_is_byte_identical_after_pre_publication_rollback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """9.9: rollback never rewrites committed nonterminal history."""
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    log = runtime._event_log
+
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    monkeypatch.setattr(log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError):
+        runtime.run_scenario_1()
+
+    after_rollback = list(log._serialized_events)
+    assert len(after_rollback) == 9
+
+    monkeypatch.undo()
+    runtime.complete_run()
+
+    assert log._serialized_events[:9] == after_rollback
+    assert len(log._serialized_events) == 11
 
 
 # ---------------------------------------------------------------------------

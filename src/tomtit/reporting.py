@@ -186,7 +186,7 @@ def stage_terminal_report(directory: Path, rendered: str) -> Path:
 
     The staged file is never the terminal report. It exists so that all report
     bytes are on disk before Runtime commits canonical completion, leaving only a
-    link-and-unlink publication step afterwards.
+    single link operation afterwards.
     """
 
     directory.mkdir(parents=True, exist_ok=True)
@@ -198,14 +198,20 @@ def stage_terminal_report(directory: Path, rendered: str) -> Path:
 
 
 def publish_staged_report(staged: Path, final: Path) -> Path:
-    """Publish a staged report as the write-once terminal report.
+    """Create the write-once terminal report from a staged report.
 
-    ``os.link`` fails rather than overwriting when the final report already
-    exists, which preserves write-once behaviour without a read-then-write race.
+    This performs exactly one filesystem operation and returns as soon as the
+    final report exists. ``os.link`` either creates the final name and returns,
+    or raises without creating it, so the caller can always infer from the return
+    whether the terminal report now exists.
+
+    Removing the staged file is deliberately *not* done here. A publisher that
+    created the final report and then raised would leave its caller unable to
+    tell that the terminal result had already been committed, which is exactly
+    how a rollback could delete or contradict a committed report.
     """
 
     os.link(staged, final)
-    staged.unlink()
     return final
 
 

@@ -319,28 +319,33 @@ class Runtime:
     def _commit_completion(self, prepared: _PreparedCompletion) -> RunRecord:
         """Apply the prepared completion, or restore the pre-completion run.
 
-        Only assignment, publication, an append of already serialized events, and
-        cleanup happen here. On failure the canonical record and the event journal
-        are restored, a report published by this operation is removed, and the
-        run stays retryable from CHECKING.
+        Creating the final report is the commit point, and it is deliberately the
+        last fallible step. Everything before it is reversible in memory, so a
+        failure rolls the record and journal back with no terminal report ever
+        having existed — rollback therefore never has to delete a final report,
+        and a retry never collides with a surviving one.
+
+        Once the final report exists the terminal result is committed: the
+        completed record, the terminal-event pair, and the report stand together.
+        Only best-effort cleanup of the private staged file follows, and its
+        failure must never undo that commit.
         """
 
         previous_record = self._record
         checkpoint = self._event_log._checkpoint()
-        published = False
         try:
             self._record = prepared.record
-            publish_staged_report(prepared.staged_report, prepared.final_report)
-            published = True
             self._event_log._append_prepared_batch(prepared.events)
+            # Commit point. publish_staged_report performs one atomic link, so if
+            # it raises the final report was not created by this operation.
+            publish_staged_report(prepared.staged_report, prepared.final_report)
         except BaseException:
             self._record = previous_record
             self._event_log._restore_to_checkpoint(checkpoint)
-            if published:
-                _remove_quietly(prepared.final_report)
             _remove_quietly(prepared.staged_report)
             raise
 
+        # Past the commit point: best effort only, never a rollback trigger.
         _remove_quietly(prepared.staged_report)
         return self._record
 
