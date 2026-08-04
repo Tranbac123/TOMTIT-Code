@@ -20,7 +20,11 @@ from tomtit.domain.enums import (
 )
 from tomtit.domain.evaluation import EvaluationEvent
 from tomtit.fakes import FakeCheckRunner, FakeWorker
-from tomtit.reporting import build_terminal_report, write_terminal_report
+from tomtit.reporting import (
+    build_terminal_report_from_validated_record,
+    render_terminal_report,
+    write_rendered_terminal_report,
+)
 from tomtit.runtime.events import InMemoryEventLog, utc_now
 from tomtit.runtime.state import (
     CompletionBasis,
@@ -167,19 +171,7 @@ class Runtime:
             stop_decision=decision,
             verification_status=VerificationStatus.DETERMINISTICALLY_CHECKED,
         )
-        self.transition(RunState.COMPLETED, TransitionReason.TERMINATION_DECIDED)
-
-        report = build_terminal_report(self._record, generated_at=self._clock())
-        report_path = write_terminal_report(
-            self._report_directory / "report.v1.json",
-            report,
-        )
-        self._replace_record(report_path=str(report_path))
-        self._append_event(
-            EvaluationEventType.REPORT_GENERATED,
-            payload={"artifact_path": str(report_path), "schema_version": "report.v1"},
-        )
-        return self._record
+        return self.complete_run()
 
     def start_attempt(self) -> None:
         """Let Runtime start canonical Attempt 1 and enter IMPLEMENTING."""
@@ -192,9 +184,72 @@ class Runtime:
         self.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
 
     def transition(self, target: RunState, reason: TransitionReason) -> None:
-        """Validate and record one canonical transition."""
+        """Validate and record one canonical non-terminal transition."""
 
         current = self._record.state
+        self._assert_transition_legal(current, target, reason)
+        if target is RunState.COMPLETED:
+            raise InvalidTransitionError(
+                "COMPLETED is committed by complete_run() as one prepared operation"
+            )
+        self._validate_transition_preconditions(current, target)
+        self._replace_record(state=target)
+        self._append_transition_event(current, target, reason)
+
+    def complete_run(self) -> RunRecord:
+        """Prepare the whole completion operation, then commit it atomically.
+
+        Ordering is the invariant this method exists to hold. Completion
+        validation, terminal-report construction, and report serialization are all
+        fallible, so they run first, against a candidate record that is not yet
+        canonical. Only once they succeed does Runtime store the completed record,
+        append ``RUN_COMPLETED``, publish the already rendered report, and append
+        ``REPORT_GENERATED``. No completion validation runs after canonical state
+        changes, so a failure leaves the run in CHECKING with no completion event
+        and no report.
+        """
+
+        current = self._record.state
+        reason = TransitionReason.TERMINATION_DECIDED
+        self._assert_transition_legal(current, RunState.COMPLETED, reason)
+        self._validate_transition_preconditions(current, RunState.COMPLETED)
+        decision = self._record.stop_decision
+        if decision is None:
+            raise InvalidTransitionError("StopDecision is required before completion")
+
+        # ---- preparation: every fallible step, no canonical mutation ----
+        candidate = self._build_record(
+            state=RunState.COMPLETED,
+            outcome=decision.outcome,
+            stop_reason=decision.stop_reason,
+            completion_basis=CompletionBasis.DETERMINISTIC_EVIDENCE,
+            completed_at=self._clock(),
+        )
+        validated = validate_completed_record(candidate)
+        report = build_terminal_report_from_validated_record(
+            validated,
+            generated_at=self._clock(),
+        )
+        rendered = render_terminal_report(report)
+        report_path = self._report_directory / "report.v1.json"
+
+        # ---- commit: completion is already proven from here on ----
+        self._record = validated
+        self._append_transition_event(current, RunState.COMPLETED, reason)
+        written_path = write_rendered_terminal_report(report_path, rendered)
+        self._replace_record(report_path=str(written_path))
+        self._append_event(
+            EvaluationEventType.REPORT_GENERATED,
+            payload={"artifact_path": str(written_path), "schema_version": "report.v1"},
+        )
+        return self._record
+
+    def _assert_transition_legal(
+        self,
+        current: RunState,
+        target: RunState,
+        reason: TransitionReason,
+    ) -> None:
         if current in {
             RunState.COMPLETED,
             RunState.FAILED,
@@ -211,24 +266,12 @@ class Runtime:
                 f"reason {expected_reason.value}"
             )
 
-        self._validate_transition_preconditions(current, target)
-        if target is RunState.COMPLETED:
-            decision = self._record.stop_decision
-            if decision is None:
-                raise InvalidTransitionError("StopDecision is required before completion")
-            candidate = self._build_record(
-                state=target,
-                outcome=decision.outcome,
-                stop_reason=decision.stop_reason,
-                completion_basis=CompletionBasis.DETERMINISTIC_EVIDENCE,
-                completed_at=self._clock(),
-            )
-            # The shared completion gate is authoritative; the canonical record is
-            # only committed once it proves every completion invariant, so an
-            # artifact deleted after CHECKING still aborts the transition.
-            self._record = validate_completed_record(candidate)
-        else:
-            self._replace_record(state=target)
+    def _append_transition_event(
+        self,
+        current: RunState,
+        target: RunState,
+        reason: TransitionReason,
+    ) -> None:
         self._append_event(
             _TRANSITION_EVENT_TYPES[target],
             payload={

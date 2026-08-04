@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import UTC, datetime
+from types import MappingProxyType
 
 import pytest
 from pydantic import ValidationError
@@ -485,3 +486,60 @@ def test_event_payload_json_schema_generation_still_succeeds() -> None:
 def test_event_payload_rejects_non_mapping_input() -> None:
     with pytest.raises(ValidationError):
         event_with_payload(["not", "a", "mapping"])  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# SOL-M03 — FrozenPayload internal state is frozen after construction.
+# ---------------------------------------------------------------------------
+
+
+def test_payload_rejects_internal_slot_reassignment() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(AttributeError):
+        event.payload._data = MappingProxyType({"top": "CORRUPTED"})  # type: ignore[union-attr]
+
+    assert event.payload["check_id"] == "unit-tests"
+    assert "top" not in event.payload
+    assert json.loads(event.model_dump_json())["payload"]["check_id"] == "unit-tests"
+
+
+def test_nested_payload_rejects_internal_slot_reassignment() -> None:
+    event = event_with_payload(nested_payload())
+    nested = event.payload["nested"]
+
+    with pytest.raises(AttributeError):
+        nested._data = MappingProxyType({"key": "CORRUPTED"})
+
+    assert event.payload["nested"]["key"] == "value"
+
+
+def test_payload_rejects_arbitrary_attribute_assignment() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(AttributeError):
+        event.payload.injected = "value"  # type: ignore[attr-defined]
+    with pytest.raises(AttributeError):
+        event.payload["nested"].injected = "value"
+
+    assert not hasattr(event.payload, "injected")
+
+
+def test_payload_rejects_internal_attribute_deletion() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(AttributeError):
+        del event.payload._data  # type: ignore[union-attr]
+
+    assert event.payload["check_id"] == "unit-tests"
+
+
+def test_frozen_payload_survives_round_trip_with_frozen_internals() -> None:
+    event = event_with_payload(nested_payload())
+
+    restored = EvaluationEvent.model_validate_json(event.model_dump_json())
+
+    assert isinstance(restored.payload, FrozenPayload)
+    with pytest.raises(AttributeError):
+        restored.payload._data = MappingProxyType({"top": "CORRUPTED"})  # type: ignore[union-attr]
+    assert restored.payload == event.payload

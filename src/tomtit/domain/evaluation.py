@@ -83,8 +83,20 @@ class FrozenPayload(Mapping[str, Any]):
             if not isinstance(key, str):
                 raise ValueError("event payload keys must be strings")
             frozen[key] = _freeze_payload_value(value)
-        # MappingProxyType keeps the backing dict unreachable and unwritable.
-        self._data = MappingProxyType(frozen)
+        # MappingProxyType keeps the backing dict unreachable and unwritable, and
+        # object.__setattr__ is the only way past the freeze below. Initialization
+        # is the sole moment canonical internal state may be assigned.
+        object.__setattr__(self, "_data", MappingProxyType(frozen))
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(
+            f"{type(self).__name__} is immutable; cannot assign attribute {name!r}"
+        )
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(
+            f"{type(self).__name__} is immutable; cannot delete attribute {name!r}"
+        )
 
     def __getitem__(self, key: str) -> Any:
         return self._data[key]

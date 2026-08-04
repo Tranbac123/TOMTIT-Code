@@ -86,15 +86,33 @@ class TerminalReport(DomainModel):
 
 
 def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> TerminalReport:
-    """Build a COMPLETED report from a freshly validated canonical snapshot.
+    """Public trust boundary: re-prove an untrusted record, then build its report.
 
-    The untrusted input record is reconstructed and re-proven by the shared
-    completion gate first; every field below is then read only from the validated
-    record, so tampering applied through ``model_copy(update=...)`` cannot reach
-    ``report.v1.json``.
+    The input record is reconstructed and re-proven by the shared completion gate
+    before any field is read, so tampering applied through
+    ``model_copy(update=...)`` cannot reach ``report.v1.json``. Callers that have
+    already proven a record with :func:`validate_completed_record` should use
+    :func:`build_terminal_report_from_validated_record` instead, so the
+    filesystem-backed gate runs exactly once per completion operation.
     """
 
-    validated_record = validate_completed_record(record)
+    return build_terminal_report_from_validated_record(
+        validate_completed_record(record),
+        generated_at=generated_at,
+    )
+
+
+def build_terminal_report_from_validated_record(
+    validated_record: RunRecord,
+    *,
+    generated_at: datetime,
+) -> TerminalReport:
+    """Build the report from a record already proven by the shared completion gate.
+
+    This performs no completion validation and touches no filesystem. The caller
+    owns that proof, which lets Runtime finish every fallible completion step
+    before it mutates canonical state.
+    """
 
     if validated_record.outcome is None or validated_record.stop_reason is None:
         raise ValueError("terminal report requires a terminal outcome")
@@ -160,11 +178,26 @@ def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> Termi
     )
 
 
-def write_terminal_report(path: Path, report: TerminalReport) -> Path:
-    """Persist report.v1.json exactly once; existing history is never overwritten."""
+def render_terminal_report(report: TerminalReport) -> str:
+    """Serialize a terminal report without touching the filesystem.
+
+    Runtime renders during completion preparation so serialization cannot fail
+    after canonical state has been committed.
+    """
+
+    return report.model_dump_json(indent=2) + "\n"
+
+
+def write_rendered_terminal_report(path: Path, rendered: str) -> Path:
+    """Persist an already rendered report exactly once."""
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("x", encoding="utf-8") as handle:
-        handle.write(report.model_dump_json(indent=2))
-        handle.write("\n")
+        handle.write(rendered)
     return path
+
+
+def write_terminal_report(path: Path, report: TerminalReport) -> Path:
+    """Persist report.v1.json exactly once; existing history is never overwritten."""
+
+    return write_rendered_terminal_report(path, render_terminal_report(report))

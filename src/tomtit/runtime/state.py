@@ -127,9 +127,23 @@ def required_check_coverage_error(
         results = observed_by_check[check.id]
         if len(results) != 1:
             return f"required check {check.id} has {len(results)} observed results, expected 1"
-        if results[0].exit_code not in check.expected_exit_codes:
+        observed = results[0]
+        # The contract, not the observation, is authoritative about which command
+        # a check ID names. A matching ID must not silently redefine it.
+        if observed.argv != check.argv:
             return (
-                f"required check {check.id} observed exit code {results[0].exit_code} "
+                f"required check {check.id} observed argv {list(observed.argv)} "
+                f"does not match the contract argv {list(check.argv)}"
+            )
+        if observed.cwd_relative != check.cwd_relative:
+            return (
+                f"required check {check.id} observed cwd_relative "
+                f"{observed.cwd_relative!r} does not match the contract "
+                f"cwd_relative {check.cwd_relative!r}"
+            )
+        if observed.exit_code not in check.expected_exit_codes:
+            return (
+                f"required check {check.id} observed exit code {observed.exit_code} "
                 f"is not an expected exit code"
             )
     return None

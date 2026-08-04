@@ -359,9 +359,10 @@ def test_append_only_log_returns_detached_event_payloads(tmp_path: Path) -> None
     original_state = first_snapshot[transition_index].payload["to_state"]
 
     # F-004: the detached snapshot is now deeply immutable, so the journal is
-    # protected by rejection rather than only by copying.
+    # protected by rejection rather than only by copying. The declared payload type
+    # is a read-only Mapping, so this assignment is also a static-analysis error.
     with pytest.raises(TypeError):
-        first_snapshot[transition_index].payload["to_state"] = "CORRUPTED"
+        first_snapshot[transition_index].payload["to_state"] = "CORRUPTED"  # type: ignore[index]
 
     assert runtime.events[transition_index].payload["to_state"] == original_state
     assert len(runtime.events) == 11
@@ -671,10 +672,14 @@ def test_runtime_clock_is_single_authority_for_terminal_chronology(
         (tmp_path / "report.v1.json").read_text(encoding="utf-8")
     )
     assert record.completed_at is not None
+    # SOL-H01 ordering: the report object is prepared while completion is still
+    # provisional, so its generated_at precedes the RUN_COMPLETED event that
+    # records the committed transition. All four stamps still come from the single
+    # Runtime clock and remain monotonic.
     assert (
         record.completed_at
-        <= run_completed.timestamp
         <= report.generated_at
+        <= run_completed.timestamp
         <= report_generated.timestamp
     )
     assert tuple(event.timestamp for event in runtime.events) == tuple(
@@ -906,25 +911,51 @@ def test_untampered_completed_record_still_builds_immutable_report(tmp_path: Pat
 
 
 class ArtifactDeletingClock(StepClock):
-    """Deletes an evidence artifact exactly when Runtime stamps completed_at.
+    """Deletes an evidence artifact at a chosen point in the completion sequence.
 
-    This reproduces the F-002 threat of an artifact disappearing after Runtime
-    finished CHECKING but before completion is committed.
+    Runtime owns the only clock, so a clock hook is the narrowest way to make an
+    artifact disappear at an exact step without adding production-only callbacks.
     """
 
-    def __init__(self, runtime_holder: list[Runtime]) -> None:
+    def __init__(
+        self,
+        runtime_holder: list[Runtime],
+        *,
+        when: Callable[[RunRecord], bool] | None = None,
+    ) -> None:
         super().__init__()
         self._runtime_holder = runtime_holder
+        self._when = when or (
+            lambda record: record.state is RunState.CHECKING
+            and record.stop_decision is not None
+        )
         self.deleted: Path | None = None
 
     def __call__(self) -> datetime:
         if self._runtime_holder and self.deleted is None:
             record = self._runtime_holder[0].record
-            if record.state is RunState.CHECKING and record.stop_decision is not None:
+            if record.observed_checks and self._when(record):
                 path = Path(record.observed_checks[0].stdout_path)
                 path.unlink()
                 self.deleted = path
         return super().__call__()
+
+
+def runtime_with_clock(directory: Path, clock: Callable[[], datetime]) -> Runtime:
+    return Runtime(
+        run_id="run-ordering",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(artifact_directory=directory / "artifacts"),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=directory,
+        clock=clock,
+    )
+
+
+def event_type_count(runtime: Runtime, event_type: EvaluationEventType) -> int:
+    return sum(1 for event in runtime.events if event.event_type is event_type)
 
 
 def test_runtime_and_report_boundary_share_one_completion_gate(tmp_path: Path) -> None:
@@ -973,35 +1004,37 @@ def test_runtime_and_report_boundary_share_one_completion_gate(tmp_path: Path) -
 # ---------------------------------------------------------------------------
 
 
-def no_progress_values(*, attempt_count: int) -> dict[str, object]:
+def no_progress_record(*, attempt_count: int) -> RunRecord:
+    """Build a terminal NO_PROGRESS record with typed keywords, not dict expansion."""
+
     started_at = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
-    return {
-        "run_id": "run-no-progress",
-        "task_contract": task_contract(),
-        "verification_plan": verification_plan(),
-        "state": RunState.FAILED,
-        "attempt_count": attempt_count,
-        "stop_decision": StopDecision(
+    return RunRecord(
+        run_id="run-no-progress",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        state=RunState.FAILED,
+        attempt_count=attempt_count,
+        stop_decision=StopDecision(
             outcome=Outcome.FAILED,
             stop_reason=StopReason.NO_PROGRESS,
             repairable=False,
             owner_input_required=False,
             next_action=NextAction.FAIL,
         ),
-        "outcome": Outcome.FAILED,
-        "stop_reason": StopReason.NO_PROGRESS,
-        "started_at": started_at,
-        "completed_at": started_at + timedelta(seconds=5),
-    }
+        outcome=Outcome.FAILED,
+        stop_reason=StopReason.NO_PROGRESS,
+        started_at=started_at,
+        completed_at=started_at + timedelta(seconds=5),
+    )
 
 
 def test_direct_construction_rejects_attempt_one_no_progress() -> None:
     with pytest.raises(ValidationError, match="NO_PROGRESS requires attempt_count >= 2"):
-        RunRecord(**no_progress_values(attempt_count=1))
+        no_progress_record(attempt_count=1)
 
 
 def test_revalidation_rejects_copied_attempt_one_no_progress() -> None:
-    valid = RunRecord(**no_progress_values(attempt_count=2))
+    valid = no_progress_record(attempt_count=2)
     corrupted = valid.model_copy(update={"attempt_count": 1})
 
     with pytest.raises(ValidationError, match="NO_PROGRESS requires attempt_count >= 2"):
@@ -1030,6 +1063,175 @@ def test_report_boundary_rejects_copied_attempt_one_no_progress(tmp_path: Path) 
         build_terminal_report(corrupted, generated_at=StepClock()())
 
 
+# ---------------------------------------------------------------------------
+# SOL-H01 — completion preparation must finish before canonical mutation.
+# ---------------------------------------------------------------------------
+
+
+def test_successful_completion_commits_state_events_and_one_report(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    record = runtime.run_scenario_1()
+
+    assert record.state is RunState.COMPLETED
+    assert record.outcome is Outcome.COMPLETED
+    assert record.stop_reason is StopReason.ACCEPTANCE_SATISFIED
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+
+    report_path = tmp_path / "report.v1.json"
+    assert record.report_path == str(report_path)
+    assert report_path.is_file()
+    report = TerminalReport.model_validate_json(report_path.read_text(encoding="utf-8"))
+    assert report.outcome is Outcome.COMPLETED
+    with pytest.raises(ValidationError):
+        report.attempts = 99
+
+
+def test_failed_completion_preparation_leaves_no_partial_canonical_state(
+    tmp_path: Path,
+) -> None:
+    holder: list[Runtime] = []
+    clock = ArtifactDeletingClock(holder)
+    runtime = runtime_with_clock(tmp_path, clock)
+    holder.append(runtime)
+
+    with pytest.raises(CompletionInvariantError, match="stdout artifact"):
+        runtime.run_scenario_1()
+
+    assert clock.deleted is not None
+    assert runtime.record.state is RunState.CHECKING
+    assert runtime.record.outcome is None
+    assert runtime.record.stop_reason is None
+    assert runtime.record.completed_at is None
+    assert runtime.record.report_path is None
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
+    assert not (tmp_path / "report.v1.json").exists()
+
+
+def test_completion_does_not_revalidate_artifacts_after_canonical_commit(
+    tmp_path: Path,
+) -> None:
+    """An artifact lost after the commit point must not undo a proven completion.
+
+    Before SOL-H01 this raised from the second, post-commit validation and left
+    canonical COMPLETED with a RUN_COMPLETED event and no report.
+    """
+
+    holder: list[Runtime] = []
+    clock = ArtifactDeletingClock(
+        holder,
+        when=lambda record: record.state is RunState.COMPLETED,
+    )
+    runtime = runtime_with_clock(tmp_path, clock)
+    holder.append(runtime)
+
+    record = runtime.run_scenario_1()
+
+    assert clock.deleted is not None
+    assert not clock.deleted.exists()
+    assert record.state is RunState.COMPLETED
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert (tmp_path / "report.v1.json").is_file()
+
+
+def test_public_report_boundary_still_rejects_untrusted_records(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    Path(record.observed_checks[0].stderr_path).unlink()
+
+    with pytest.raises(CompletionInvariantError, match="stderr artifact"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_completion_is_not_reachable_through_the_generic_transition(tmp_path: Path) -> None:
+    """From CHECKING the move is otherwise legal, so this exercises the real guard."""
+
+    runner = FakeCheckRunner(
+        artifact_directory=tmp_path / "artifacts",
+        outcomes={"unit-tests": FakeCheckOutcome(exit_code=1)},
+    )
+    runtime = make_runtime(tmp_path, runner=runner)
+    with pytest.raises(CompletionConditionsNotMet):
+        runtime.run_scenario_1()
+    assert runtime.record.state is RunState.CHECKING
+
+    with pytest.raises(InvalidTransitionError, match="complete_run"):
+        runtime.transition(RunState.COMPLETED, TransitionReason.TERMINATION_DECIDED)
+
+    assert runtime.record.state is RunState.CHECKING
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert not (tmp_path / "report.v1.json").exists()
+
+
+# ---------------------------------------------------------------------------
+# SOL-M02 — observed check metadata must match its authoritative RequiredCheck.
+# ---------------------------------------------------------------------------
+
+
+def test_completion_accepts_matching_check_metadata(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    contract_check = record.task_contract.required_checks[0]
+
+    assert record.observed_checks[0].argv == contract_check.argv
+    assert record.observed_checks[0].cwd_relative == contract_check.cwd_relative
+
+    report = build_terminal_report(record, generated_at=StepClock()())
+
+    assert report.observed_evidence[0].argv == contract_check.argv
+    assert report.observed_evidence[0].cwd_relative == contract_check.cwd_relative
+
+
+@pytest.mark.parametrize(
+    ("metadata_update", "expected_message"),
+    (
+        ({"argv": ("totally", "different", "command")}, "does not match the contract argv"),
+        ({"cwd_relative": "different-dir"}, "does not match the contract cwd_relative"),
+        (
+            {"argv": ("other",), "cwd_relative": "elsewhere"},
+            "does not match the contract argv",
+        ),
+    ),
+)
+def test_completion_rejects_check_metadata_contradicting_the_contract(
+    tmp_path: Path,
+    metadata_update: dict[str, object],
+    expected_message: str,
+) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(
+        record,
+        record.observed_checks[0].model_copy(update=metadata_update),
+    )
+
+    with pytest.raises(ValidationError, match=expected_message):
+        validate_completed_record(tampered)
+    with pytest.raises(ValidationError, match=expected_message):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_worker_claim_cannot_excuse_contradicting_check_metadata(tmp_path: Path) -> None:
+    record = completed_record(
+        tmp_path,
+        worker=FakeWorker(worker_result(claimed_checks=("unit-tests",))),
+    )
+    assert record.worker_result is not None
+    assert record.worker_result.claimed_checks == ("unit-tests",)
+
+    tampered = with_checks(
+        record,
+        record.observed_checks[0].model_copy(
+            update={"argv": ("python", "-m", "pytest", "tests/other")}
+        ),
+    )
+
+    with pytest.raises(ValidationError, match="does not match the contract argv"):
+        validate_completed_record(tampered)
+    with pytest.raises(ValidationError, match="does not match the contract argv"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
 def test_no_progress_is_structurally_allowed_from_attempt_two() -> None:
     """NO_PROGRESS is not rejected merely for existing once a baseline attempt exists.
 
@@ -1037,7 +1239,7 @@ def test_no_progress_is_structurally_allowed_from_attempt_two() -> None:
     ProgressSnapshot comparison remain unimplemented and out of scope.
     """
 
-    record = RunRecord(**no_progress_values(attempt_count=2))
+    record = no_progress_record(attempt_count=2)
 
     assert record.attempt_count == 2
     assert record.stop_reason is StopReason.NO_PROGRESS
