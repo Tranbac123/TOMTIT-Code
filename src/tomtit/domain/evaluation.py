@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
 from types import MappingProxyType
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BeforeValidator,
@@ -27,11 +27,14 @@ from tomtit.domain.enums import (
     ExperimentArm,
     FailureCategory,
     HumanInterventionSource,
+    NextAction,
     OverallResult,
     Outcome,
     OwnerCriterionStatus,
     OwnerGoalStatus,
+    RunState,
     StopReason,
+    StringEnum,
     TernaryStatus,
     ValidityStatus,
     VerificationStatus,
@@ -250,6 +253,88 @@ class EvaluationEvent(DomainModel):
     attempt_number: Annotated[int | None, Field(ge=1)] = None
     actor: NonEmptyString
     payload: ImmutableEventPayload = Field(default_factory=lambda: FrozenPayload({}))
+
+
+class DecisionReasonCode(StringEnum):
+    """Closed decision-reason vocabulary.
+
+    Gate 2 needs exactly one code: a deterministic check failed in a way the
+    Coordinator judges repairable within the remaining attempt budget. This is
+    deliberately not a taxonomy or a scoring framework.
+    """
+
+    DETERMINISTIC_REPAIRABLE_CHECK_FAILURE = "DETERMINISTIC_REPAIRABLE_CHECK_FAILURE"
+
+
+class BudgetSnapshot(DomainModel):
+    """Attempt and time budget as observed when the decision was proposed."""
+
+    attempt_number: Annotated[int, Field(ge=1)]
+    max_attempts: Annotated[int, Field(ge=1)]
+    hard_max_attempts: Annotated[int, Field(ge=1)]
+    time_budget_seconds: Annotated[int, Field(gt=0)]
+
+    @model_validator(mode="after")
+    def validate_budget(self) -> BudgetSnapshot:
+        if self.max_attempts > self.hard_max_attempts:
+            raise ValueError("max_attempts cannot exceed hard_max_attempts")
+        return self
+
+
+class DecisionEventDraft(DomainModel):
+    """A Coordinator-side decision proposal.
+
+    A draft is untrusted input. It carries no `append_sequence`, no
+    `decision_id`, and no `decision_timestamp`: identity, ordering, and time are
+    Runtime authority. `DomainModel` forbids extra fields, so a caller that tries
+    to supply any of them is rejected by validation rather than by convention.
+    """
+
+    decision_schema_version: Literal["decision-event.v1"] = "decision-event.v1"
+    policy_version: NonEmptyString
+    task_contract_hash: NonEmptyString
+    run_id: NonEmptyString
+    attempt_number: Annotated[int, Field(ge=1)]
+    state_before: RunState
+    evidence_snapshot_ids: Annotated[
+        tuple[NonEmptyString, ...], BeforeValidator(_list_to_tuple)
+    ] = Field(min_length=1)
+    allowed_actions: Annotated[
+        tuple[NextAction, ...], BeforeValidator(_list_to_tuple)
+    ] = Field(min_length=1)
+    selected_action: NextAction
+    reason_code: DecisionReasonCode
+    binding_constraints: Annotated[
+        tuple[NonEmptyString, ...], BeforeValidator(_list_to_tuple)
+    ] = Field(default_factory=tuple)
+    budget_snapshot: BudgetSnapshot
+    state_after: RunState
+
+    @model_validator(mode="after")
+    def validate_proposal(self) -> DecisionEventDraft:
+        if self.selected_action not in self.allowed_actions:
+            raise ValueError("selected_action must be one of allowed_actions")
+        if len(set(self.allowed_actions)) != len(self.allowed_actions):
+            raise ValueError("allowed_actions must be unique")
+        if len(set(self.evidence_snapshot_ids)) != len(self.evidence_snapshot_ids):
+            raise ValueError("evidence_snapshot_ids must be unique")
+        if self.budget_snapshot.attempt_number != self.attempt_number:
+            raise ValueError("budget snapshot must describe the deciding attempt")
+        if self.state_before is self.state_after:
+            raise ValueError("a decision must change the canonical state")
+        return self
+
+
+class PersistedDecisionEvent(DecisionEventDraft):
+    """The immutable Runtime-owned record of an accepted decision.
+
+    `decision_id`, `decision_timestamp`, and `append_sequence` are added by the
+    owning Runtime append store and never by a caller.
+    """
+
+    decision_id: NonEmptyString
+    decision_timestamp: datetime
+    append_sequence: Annotated[int, Field(ge=1)]
 
 
 class TaskOutcome(DomainModel):

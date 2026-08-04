@@ -19,7 +19,13 @@ from tomtit.domain.enums import (
     VerificationMode,
     VerificationStatus,
 )
-from tomtit.domain.evaluation import EvaluationEvent
+from tomtit.domain.evaluation import (
+    BudgetSnapshot,
+    DecisionEventDraft,
+    DecisionReasonCode,
+    EvaluationEvent,
+    PersistedDecisionEvent,
+)
 from tomtit.fakes import FakeCheckRunner, FakeWorker
 from tomtit.reporting import (
     STAGED_REPORT_NAME,
@@ -28,16 +34,25 @@ from tomtit.reporting import (
     render_terminal_report,
     stage_terminal_report,
 )
-from tomtit.runtime.events import InMemoryEventLog, PreparedEvent, utc_now
+from tomtit.runtime.events import (
+    InMemoryEventLog,
+    PreparedDecision,
+    PreparedEvent,
+    utc_now,
+)
 from tomtit.runtime.state import (
+    AttemptEvidence,
     CompletionBasis,
     CriterionEvaluation,
     ObservedCheckResult,
     RunRecord,
     TransitionReason,
     artifact_file_error,
+    attempt_evidence_from_observations,
+    objective_improvement_error,
     patch_evidence_error,
     required_check_coverage_error,
+    task_contract_hash,
     validate_completed_record,
 )
 
@@ -75,7 +90,8 @@ _ALLOWED_TRANSITIONS: dict[RunState, set[RunState]] = {
     RunState.PREPARING: {RunState.IMPLEMENTING},
     RunState.IMPLEMENTING: {RunState.COLLECTING_EVIDENCE},
     RunState.COLLECTING_EVIDENCE: {RunState.CHECKING},
-    RunState.CHECKING: {RunState.COMPLETED},
+    RunState.CHECKING: {RunState.COMPLETED, RunState.REVISING},
+    RunState.REVISING: {RunState.IMPLEMENTING},
 }
 
 _EXPECTED_TRANSITION_REASONS: dict[tuple[RunState, RunState], TransitionReason] = {
@@ -84,6 +100,8 @@ _EXPECTED_TRANSITION_REASONS: dict[tuple[RunState, RunState], TransitionReason] 
     (RunState.PREPARING, RunState.IMPLEMENTING): TransitionReason.WORKER_ASSIGNED,
     (RunState.IMPLEMENTING, RunState.COLLECTING_EVIDENCE): TransitionReason.WORKER_FINISHED,
     (RunState.COLLECTING_EVIDENCE, RunState.CHECKING): TransitionReason.EVIDENCE_READY,
+    (RunState.CHECKING, RunState.REVISING): TransitionReason.REVISION_APPROVED,
+    (RunState.REVISING, RunState.IMPLEMENTING): TransitionReason.WORKER_ASSIGNED,
     (RunState.CHECKING, RunState.COMPLETED): TransitionReason.TERMINATION_DECIDED,
 }
 
@@ -93,8 +111,24 @@ _TRANSITION_EVENT_TYPES: dict[RunState, EvaluationEventType] = {
     RunState.IMPLEMENTING: EvaluationEventType.WORKER_ASSIGNED,
     RunState.COLLECTING_EVIDENCE: EvaluationEventType.WORKER_FINISHED,
     RunState.CHECKING: EvaluationEventType.EVIDENCE_COLLECTED,
+    RunState.REVISING: EvaluationEventType.REVISION_REQUESTED,
     RunState.COMPLETED: EvaluationEventType.RUN_COMPLETED,
 }
+
+TOMTIT_POLICY_VERSION = "mvp-execution-policy-v0.3"
+
+
+class RevisionNotAllowed(RuntimeError):
+    """Raised when a REVISE proposal cannot be accepted as canonical."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedRevision:
+    """Decision and canonical transition, both built before anything is committed."""
+
+    record: RunRecord
+    decision: PreparedDecision
+    event: PreparedEvent
 
 
 class Runtime:
@@ -147,18 +181,81 @@ class Runtime:
         self.transition(RunState.PREPARING, TransitionReason.WORKSPACE_PREPARED)
 
         self.start_attempt()
-        self._append_event(EvaluationEventType.WORKER_STARTED, payload={"attempt_number": 1})
-        worker_result = self._worker.execute(self._record.task_contract, 1)
+        observed_checks = self._execute_attempt()
+
+        if not self._attempt_satisfies_completion(observed_checks):
+            raise CompletionConditionsNotMet(
+                "observed evidence did not satisfy every criterion and required check"
+            )
+
+        return self._decide_completion()
+
+    def run_scenario_2(self) -> RunRecord:
+        """Attempt 1 fails deterministically, one bounded revision, Attempt 2 completes.
+
+        The revision decision is proposed Coordinator-side and accepted by Runtime
+        as one atomic DecisionEvent-plus-transition. Attempt 2 collects fresh
+        observed evidence, and completion runs through the frozen Scenario 1 path.
+        """
+
+        if self._record.state is not RunState.CREATED:
+            raise InvalidTransitionError("Scenario 2 can start only from CREATED")
+        self._append_event(
+            EvaluationEventType.TASK_SUBMITTED,
+            payload={"goal": self._record.task_contract.goal},
+        )
+        self.transition(RunState.CONTRACT_READY, TransitionReason.CONTRACT_RESOLVED)
+        self._assert_scenario_1_preflight()
+        self._append_event(EvaluationEventType.RUN_STARTED, payload={"state": "CONTRACT_READY"})
+        self.transition(RunState.PREPARING, TransitionReason.WORKSPACE_PREPARED)
+
+        self.start_attempt()
+        attempt_1_checks = self._execute_attempt()
+        if self._attempt_satisfies_completion(attempt_1_checks):
+            raise CompletionConditionsNotMet(
+                "Scenario 2 requires a deterministic Attempt 1 failure"
+            )
+
+        self.commit_revision_decision(self.build_revision_proposal())
+        self.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
+
+        attempt_2_checks = self._execute_attempt()
+        if not self._attempt_satisfies_completion(attempt_2_checks):
+            raise CompletionConditionsNotMet(
+                "Attempt 2 observed evidence did not satisfy every criterion and check"
+            )
+        improvement_error = objective_improvement_error(
+            self._record.attempt_history[-1],
+            self._current_attempt_evidence(),
+        )
+        if improvement_error is not None:
+            raise CompletionConditionsNotMet(improvement_error)
+
+        return self._decide_completion()
+
+    def _execute_attempt(self) -> tuple[ObservedCheckResult, ...]:
+        """Run one attempt from IMPLEMENTING to CHECKING and evaluate its evidence.
+
+        Evidence is always collected fresh for the canonical attempt number, so a
+        later attempt can never present an earlier attempt's observations.
+        """
+
+        attempt_number = self._record.attempt_count
+        self._append_event(
+            EvaluationEventType.WORKER_STARTED,
+            payload={"attempt_number": attempt_number},
+        )
+        worker_result = self._worker.execute(self._record.task_contract, attempt_number)
         self._replace_record(worker_result=worker_result)
         self.transition(RunState.COLLECTING_EVIDENCE, TransitionReason.WORKER_FINISHED)
 
         observed_checks = tuple(
-            self._check_runner.run(check, self._record.run_id, 1)
+            self._check_runner.run(check, self._record.run_id, attempt_number)
             for check in self._record.task_contract.required_checks
         )
         observed_patch = self._check_runner.collect_patch_evidence(
             self._record.run_id,
-            1,
+            attempt_number,
         )
         self._replace_record(
             observed_checks=observed_checks,
@@ -169,19 +266,23 @@ class Runtime:
         evaluations = self._evaluate_deterministic_criteria(observed_checks)
         self._replace_record(criterion_evaluations=evaluations)
         self._append_check_events(observed_checks)
+        return observed_checks
 
-        if (
-            not evaluations
-            or any(
-                evaluation.status is not CriterionStatus.SATISFIED
+    def _attempt_satisfies_completion(
+        self,
+        observed_checks: tuple[ObservedCheckResult, ...],
+    ) -> bool:
+        evaluations = self._record.criterion_evaluations
+        return bool(
+            evaluations
+            and all(
+                evaluation.status is CriterionStatus.SATISFIED
                 for evaluation in evaluations
             )
-            or not self._completion_evidence_is_sufficient(observed_checks)
-        ):
-            raise CompletionConditionsNotMet(
-                "observed evidence did not satisfy every criterion and required check"
-            )
+            and self._completion_evidence_is_sufficient(observed_checks)
+        )
 
+    def _decide_completion(self) -> RunRecord:
         decision = StopDecision(
             outcome=Outcome.COMPLETED,
             stop_reason=StopReason.ACCEPTANCE_SATISFIED,
@@ -201,9 +302,165 @@ class Runtime:
         if self._record.state is not RunState.PREPARING:
             raise InvalidTransitionError("Attempt 1 can start only from PREPARING")
         if self._record.attempt_count != 0:
-            raise InvalidTransitionError("Commit 2 supports exactly one attempt")
+            raise InvalidTransitionError("Attempt 1 can start only once")
         self._replace_record(attempt_count=1)
         self.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
+
+    # ---- Scenario 2: one bounded revision ----------------------------------
+
+    def build_revision_proposal(self) -> DecisionEventDraft:
+        """Build a Coordinator-side REVISE proposal from current observed evidence.
+
+        This is a *proposal only*. It appends nothing, mutates nothing, and
+        carries no identity, timestamp, or sequence. Runtime remains the only
+        writer; a caller may equally construct this draft itself.
+        """
+
+        record = self._record
+        contract = record.task_contract
+        evidence_ids = [item.snapshot_id for item in record.observed_checks]
+        if record.observed_patch is not None:
+            evidence_ids.append(record.observed_patch.snapshot_id)
+        return DecisionEventDraft(
+            policy_version=TOMTIT_POLICY_VERSION,
+            task_contract_hash=task_contract_hash(contract),
+            run_id=record.run_id,
+            attempt_number=record.attempt_count,
+            state_before=record.state,
+            evidence_snapshot_ids=tuple(evidence_ids),
+            allowed_actions=(NextAction.REVISE, NextAction.FAIL),
+            selected_action=NextAction.REVISE,
+            reason_code=DecisionReasonCode.DETERMINISTIC_REPAIRABLE_CHECK_FAILURE,
+            binding_constraints=(
+                f"max_attempts={contract.max_attempts}",
+                "deterministic_evidence_required",
+            ),
+            budget_snapshot=BudgetSnapshot(
+                attempt_number=record.attempt_count,
+                max_attempts=contract.max_attempts,
+                hard_max_attempts=contract.hard_max_attempts,
+                time_budget_seconds=contract.time_budget_seconds,
+            ),
+            state_after=RunState.REVISING,
+        )
+
+    def commit_revision_decision(
+        self,
+        draft: DecisionEventDraft,
+    ) -> PersistedDecisionEvent:
+        """Validate a REVISE proposal, then commit decision and transition together.
+
+        Either the persisted DecisionEvent exists *and* the canonical transition
+        to the next attempt is applied, or neither happened. Every fallible step
+        — validation, identity and sequence assignment, model construction and
+        serialization — runs during preparation, before anything is committed.
+        """
+
+        prepared = self._prepare_revision(draft)
+        return self._commit_revision(prepared)
+
+    def _prepare_revision(self, draft: DecisionEventDraft) -> _PreparedRevision:
+        record = self._record
+        contract = record.task_contract
+
+        # Reconstruct the untrusted proposal through full validation first.
+        validated = DecisionEventDraft.model_validate(draft.model_dump(mode="python"))
+
+        if validated.selected_action is not NextAction.REVISE:
+            raise RevisionNotAllowed("only REVISE decisions are supported by this gate")
+        if record.state is not RunState.CHECKING:
+            raise RevisionNotAllowed(
+                f"REVISE requires state CHECKING, not {record.state.value}"
+            )
+        if validated.state_before is not record.state:
+            raise RevisionNotAllowed("proposal state_before must match canonical state")
+        if validated.state_after is not RunState.REVISING:
+            raise RevisionNotAllowed("a REVISE decision must move the run to REVISING")
+        if validated.run_id != record.run_id:
+            raise RevisionNotAllowed("proposal must belong to the current run")
+        if validated.attempt_number != record.attempt_count:
+            raise RevisionNotAllowed("proposal must belong to the current attempt")
+        if validated.task_contract_hash != task_contract_hash(contract):
+            raise RevisionNotAllowed("proposal task_contract_hash does not match the contract")
+        if record.attempt_count + 1 > contract.max_attempts:
+            raise RevisionNotAllowed(
+                f"attempt budget exhausted: {record.attempt_count} of "
+                f"{contract.max_attempts} attempts used"
+            )
+
+        current_evidence = self._current_attempt_evidence()
+        if not current_evidence.failed_check_ids:
+            raise RevisionNotAllowed("REVISE requires at least one failed required check")
+        expected_ids = set(current_evidence.evidence_snapshot_ids)
+        proposed_ids = set(validated.evidence_snapshot_ids)
+        if proposed_ids != expected_ids:
+            missing = sorted(expected_ids - proposed_ids)
+            unexpected = sorted(proposed_ids - expected_ids)
+            raise RevisionNotAllowed(
+                "proposal evidence must be exactly the current attempt's observed "
+                f"evidence: missing={missing}, unexpected={unexpected}"
+            )
+
+        # Preparation: fallible work only, nothing canonical is touched.
+        next_attempt = record.attempt_count + 1
+        candidate = self._build_record(
+            state=RunState.REVISING,
+            attempt_count=next_attempt,
+            attempt_history=(*record.attempt_history, current_evidence),
+            observed_checks=(),
+            observed_patch=None,
+            criterion_evaluations=(),
+            worker_result=None,
+        )
+        prepared_decision = self._event_log.prepare_decision(
+            validated,
+            decision_timestamp=self._clock(),
+        )
+        prepared_event = self._prepare_event(
+            candidate,
+            timestamp=self._clock(),
+            event_type=_TRANSITION_EVENT_TYPES[RunState.REVISING],
+            payload={
+                "from_state": record.state.value,
+                "to_state": RunState.REVISING.value,
+                "transition_reason": TransitionReason.REVISION_APPROVED.value,
+                "decision_id": prepared_decision.decision.decision_id,
+                "append_sequence": prepared_decision.decision.append_sequence,
+                "next_attempt_number": next_attempt,
+            },
+        )
+        return _PreparedRevision(
+            record=candidate,
+            decision=prepared_decision,
+            event=prepared_event,
+        )
+
+    def _commit_revision(self, prepared: _PreparedRevision) -> PersistedDecisionEvent:
+        """Commit the decision and the canonical transition as one unit."""
+
+        previous_record = self._record
+        event_checkpoint = self._event_log._checkpoint()
+        decision_checkpoint = self._event_log._decision_checkpoint()
+        try:
+            self._record = prepared.record
+            self._event_log._append_prepared_decision(prepared.decision)
+            self._event_log._append_prepared_batch((prepared.event,))
+        except BaseException:
+            self._record = previous_record
+            self._event_log._restore_decisions_to_checkpoint(decision_checkpoint)
+            self._event_log._restore_to_checkpoint(event_checkpoint)
+            raise
+        return prepared.decision.decision
+
+    def _current_attempt_evidence(self) -> AttemptEvidence:
+        record = self._record
+        return attempt_evidence_from_observations(
+            attempt_number=record.attempt_count,
+            required_checks=record.task_contract.required_checks,
+            observed_checks=record.observed_checks,
+            observed_patch=record.observed_patch,
+            criterion_evaluations=record.criterion_evaluations,
+        )
 
     def transition(self, target: RunState, reason: TransitionReason) -> None:
         """Validate and record one canonical non-terminal transition."""
@@ -428,6 +685,17 @@ class Runtime:
         if current is RunState.PREPARING and target is RunState.IMPLEMENTING:
             if self._record.attempt_count != 1:
                 raise InvalidTransitionError("Attempt 1 must start before IMPLEMENTING")
+        if current is RunState.REVISING and target is RunState.IMPLEMENTING:
+            # The revision decision already advanced the canonical attempt and
+            # archived the previous attempt's evidence.
+            if self._record.attempt_count < 2:
+                raise InvalidTransitionError("revision must advance the canonical attempt")
+            if self._record.attempt_count > self._record.task_contract.max_attempts:
+                raise InvalidTransitionError("attempt budget exhausted")
+            if not self._record.attempt_history:
+                raise InvalidTransitionError("revision must archive the previous attempt")
+            if self._record.observed_checks or self._record.observed_patch is not None:
+                raise InvalidTransitionError("a new attempt must start without stale evidence")
         if current is RunState.IMPLEMENTING and target is RunState.COLLECTING_EVIDENCE:
             if self._record.worker_result is None:
                 raise InvalidTransitionError("WorkerResult is required after IMPLEMENTING")

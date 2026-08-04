@@ -41,6 +41,8 @@ class FakeCheckRunner:
 
     artifact_directory: Path
     outcomes: dict[str, FakeCheckOutcome] = field(default_factory=dict)
+    # Scenario 2 needs a check that fails on Attempt 1 and passes on Attempt 2.
+    attempt_outcomes: dict[tuple[int, str], FakeCheckOutcome] = field(default_factory=dict)
     patch_changed_files: tuple[ObservedChangedFile, ...] = field(
         default_factory=lambda: (
             ObservedChangedFile(path="src/fixture.py", operation=ScopeOperation.MODIFY),
@@ -58,7 +60,10 @@ class FakeCheckRunner:
         attempt_number: int,
     ) -> ObservedCheckResult:
         self.calls.append((check.id, attempt_number))
-        outcome = self.outcomes.get(check.id, FakeCheckOutcome())
+        outcome = self.attempt_outcomes.get(
+            (attempt_number, check.id),
+            self.outcomes.get(check.id, FakeCheckOutcome()),
+        )
         check_key = sha256(check.id.encode("utf-8")).hexdigest()[:16]
         attempt_directory = self.artifact_directory / f"attempt-{attempt_number}"
         attempt_directory.mkdir(parents=True, exist_ok=True)

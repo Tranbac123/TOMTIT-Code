@@ -19,7 +19,14 @@ from tomtit.domain.contracts import (
     WorkerResult,
 )
 from tomtit.domain.enums import OwnerDecision
-from tomtit.domain.evaluation import EvaluationEvent, ExperimentRunRecord, TaskOutcome
+from tomtit.domain.evaluation import (
+    BudgetSnapshot,
+    DecisionEventDraft,
+    EvaluationEvent,
+    ExperimentRunRecord,
+    PersistedDecisionEvent,
+    TaskOutcome,
+)
 
 def test_all_commit_1_contracts_generate_json_schema() -> None:
     models = [
@@ -40,6 +47,9 @@ def test_all_commit_1_contracts_generate_json_schema() -> None:
         EvaluationEvent,
         ExperimentRunRecord,
         TaskOutcome,
+        BudgetSnapshot,
+        DecisionEventDraft,
+        PersistedDecisionEvent,
     ]
     for model in models:
         schema = model.model_json_schema()
@@ -87,6 +97,9 @@ def test_canonical_models_do_not_expose_mutable_list_fields() -> None:
         EvaluationEvent,
         ExperimentRunRecord,
         TaskOutcome,
+        BudgetSnapshot,
+        DecisionEventDraft,
+        PersistedDecisionEvent,
     ]
 
     mutable_fields = {

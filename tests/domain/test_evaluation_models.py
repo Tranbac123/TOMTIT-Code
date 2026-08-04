@@ -8,12 +8,16 @@ import pytest
 from pydantic import ValidationError
 
 from tomtit.domain.evaluation import (
+    BudgetSnapshot,
     ContractInferenceAccuracy,
+    DecisionEventDraft,
+    DecisionReasonCode,
     EvaluationEvent,
     ExperimentRunRecord,
     ExperimentWorker,
     FrozenPayload,
     OwnerCriterionEvaluation,
+    PersistedDecisionEvent,
     OwnerEvaluation,
     TaskOutcome,
 )
@@ -23,11 +27,13 @@ from tomtit.domain.enums import (
     CostSource,
     EvaluationEventType,
     ExperimentArm,
+    NextAction,
     HumanInterventionSource,
     OverallResult,
     Outcome,
     OwnerCriterionStatus,
     OwnerGoalStatus,
+    RunState,
     StopReason,
     TernaryStatus,
     ValidityStatus,
@@ -543,3 +549,107 @@ def test_frozen_payload_survives_round_trip_with_frozen_internals() -> None:
     with pytest.raises(AttributeError):
         restored.payload._data = MappingProxyType({"top": "CORRUPTED"})  # type: ignore[union-attr]
     assert restored.payload == event.payload
+
+
+# ---------------------------------------------------------------------------
+# Gate 2 — DecisionEvent draft/persisted authority split.
+# ---------------------------------------------------------------------------
+
+
+def budget_snapshot(**updates: object) -> BudgetSnapshot:
+    values: dict[str, object] = {
+        "attempt_number": 1,
+        "max_attempts": 2,
+        "hard_max_attempts": 3,
+        "time_budget_seconds": 120,
+    }
+    values.update(updates)
+    return BudgetSnapshot(**values)  # type: ignore[arg-type]
+
+
+def decision_draft(**updates: object) -> DecisionEventDraft:
+    values: dict[str, object] = {
+        "policy_version": "mvp-execution-policy-v0.3",
+        "task_contract_hash": "a" * 64,
+        "run_id": "run-1",
+        "attempt_number": 1,
+        "state_before": RunState.CHECKING,
+        "evidence_snapshot_ids": ("check:run-1:1:unit-tests",),
+        "allowed_actions": (NextAction.REVISE, NextAction.FAIL),
+        "selected_action": NextAction.REVISE,
+        "reason_code": DecisionReasonCode.DETERMINISTIC_REPAIRABLE_CHECK_FAILURE,
+        "budget_snapshot": budget_snapshot(),
+        "state_after": RunState.REVISING,
+    }
+    values.update(updates)
+    return DecisionEventDraft(**values)  # type: ignore[arg-type]
+
+
+def test_decision_draft_accepts_a_valid_revise_proposal() -> None:
+    draft = decision_draft()
+
+    assert draft.decision_schema_version == "decision-event.v1"
+    assert draft.selected_action is NextAction.REVISE
+    assert isinstance(draft.evidence_snapshot_ids, tuple)
+    assert isinstance(draft.allowed_actions, tuple)
+
+
+@pytest.mark.parametrize(
+    "runtime_owned_field",
+    ("append_sequence", "decision_id", "decision_timestamp"),
+)
+def test_decision_draft_rejects_runtime_owned_fields(runtime_owned_field: str) -> None:
+    with pytest.raises(ValidationError):
+        decision_draft(**{runtime_owned_field: 1})
+
+
+def test_decision_draft_requires_selected_action_within_allowed_actions() -> None:
+    with pytest.raises(ValidationError, match="allowed_actions"):
+        decision_draft(allowed_actions=(NextAction.FAIL,))
+
+
+def test_decision_draft_rejects_duplicate_evidence_ids() -> None:
+    duplicate = ("check:run-1:1:unit-tests", "check:run-1:1:unit-tests")
+    with pytest.raises(ValidationError, match="evidence_snapshot_ids must be unique"):
+        decision_draft(evidence_snapshot_ids=duplicate)
+
+
+def test_decision_draft_requires_a_state_change() -> None:
+    with pytest.raises(ValidationError, match="must change the canonical state"):
+        decision_draft(state_after=RunState.CHECKING)
+
+
+def test_decision_draft_requires_matching_budget_attempt() -> None:
+    with pytest.raises(ValidationError, match="deciding attempt"):
+        decision_draft(budget_snapshot=budget_snapshot(attempt_number=2))
+
+
+def test_persisted_decision_carries_runtime_owned_identity() -> None:
+    persisted = PersistedDecisionEvent(
+        **decision_draft().model_dump(),
+        decision_id="decision-1",
+        decision_timestamp=datetime.now(UTC),
+        append_sequence=1,
+    )
+
+    assert persisted.append_sequence == 1
+    assert persisted.decision_id == "decision-1"
+    restored = PersistedDecisionEvent.model_validate_json(persisted.model_dump_json())
+    assert restored == persisted
+    with pytest.raises(ValidationError):
+        persisted.append_sequence = 2
+
+
+def test_persisted_decision_rejects_a_non_positive_sequence() -> None:
+    with pytest.raises(ValidationError):
+        PersistedDecisionEvent(
+            **decision_draft().model_dump(),
+            decision_id="decision-1",
+            decision_timestamp=datetime.now(UTC),
+            append_sequence=0,
+        )
+
+
+def test_budget_snapshot_rejects_max_above_hard_max() -> None:
+    with pytest.raises(ValidationError, match="hard_max_attempts"):
+        budget_snapshot(max_attempts=3, hard_max_attempts=2)
