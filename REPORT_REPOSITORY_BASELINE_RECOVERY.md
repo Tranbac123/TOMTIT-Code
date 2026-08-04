@@ -130,7 +130,7 @@ NOT_AN_IMPLEMENTATION_APPROVAL
 | `git diff --cached --stat` (pre-Commit A) | 0 |
 | `git diff --cached --check` (pre-Commit A) | 2 — pre-existing trailing whitespace at `SYSTEM.md:3`, in untouched original content; not modified per scope restriction |
 | `git commit -m "chore(repo): establish recovered reviewed baseline"` | 0 |
-| `python3 -m pytest -q` (full suite) | 0 — 94 passed |
+| `python3 -m pytest -q` (full suite) | 0 — 91 passed *(corrected; see §6a)* |
 | `python3 -m pytest tests/scenarios/test_scenario_1.py -q` | 0 — 31 passed |
 | `python3 -m compileall -q src tests` | 0 |
 | `ruff check .` | 0 — no findings (ruff 0.1.7, installed) |
@@ -140,6 +140,34 @@ NOT_AN_IMPLEMENTATION_APPROVAL
 | `git commit -m "docs(audit): record recovered baseline evidence"` | 0 |
 | `git status --short` (post Commit B) | 0, clean |
 | `git diff` / `git diff --cached` (final) | 0, empty |
+
+## 6a. Correction history — test-count evidence
+
+```text
+CURRENT_BASELINE_TEST_COUNT_VERIFIED=91
+RECOVERY_REPORT_TEST_COUNT_94=CORRECTED
+HISTORICAL_91_TO_94_CAUSE=NOT_PROVEN
+```
+
+- Commit B (`docs(audit): record recovered baseline evidence`,
+  `eb5bb397f812c51f356dae97512b44223a7012a7`) originally recorded the full-suite
+  result in §5 above as `94 passed`.
+- Codex Terra's independent baseline provenance review
+  (`REPORT_CODEX_TERRA_BASELINE_REVIEW.md`) reproduced the current clean
+  tracked baseline at Commit B and found exactly `91 collected` and `91
+  passed`, not `94`.
+- No Git evidence available in this repository (no reflog, no prior commits,
+  no dangling objects) proves why the historical count differed from the
+  current reproducible count. The cause of the 91-to-94 discrepancy is
+  `NOT_PROVEN` and is not speculated on here.
+- This correction (Commit D, `docs(audit): correct recovered baseline test
+  evidence`) updates only the §5 test-count claim in this report to match the
+  reproducible current evidence. It does not rewrite, amend, or delete Commit
+  A, Commit B, or Commit C, and no prior Git history was altered.
+- This correction does not approve Commit 1 or Commit 2 implementation
+  behavior.
+- `BASELINE-L01` and findings `F-002`–`F-005` remain `OPEN` and are not
+  addressed by this correction.
 
 ## 6. Known unresolved findings
 
