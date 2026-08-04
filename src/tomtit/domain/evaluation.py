@@ -2,10 +2,20 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator, Mapping, Sequence
 from datetime import datetime
+from types import MappingProxyType
 from typing import Annotated, Any
 
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import (
+    BeforeValidator,
+    Field,
+    GetCoreSchemaHandler,
+    GetJsonSchemaHandler,
+    model_validator,
+)
+from pydantic.json_schema import JsonSchemaValue
+from pydantic_core import CoreSchema, core_schema
 
 from tomtit.domain.contracts import DomainModel, NonEmptyString, _list_to_tuple
 from tomtit.domain.enums import (
@@ -29,6 +39,104 @@ from tomtit.domain.enums import (
 
 NonNegativeInt = Annotated[int, Field(ge=0)]
 NonNegativeFloat = Annotated[float, Field(ge=0)]
+
+
+def _freeze_payload_value(value: Any) -> Any:
+    """Recursively convert an event payload value into an immutable canonical value."""
+
+    if isinstance(value, FrozenPayload):
+        return value
+    if isinstance(value, Mapping):
+        return FrozenPayload(value)
+    # str and bytes are Sequences but are already immutable scalars here.
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return tuple(_freeze_payload_value(item) for item in value)
+    return value
+
+
+def _unfreeze_payload_value(value: Any) -> Any:
+    """Convert a canonical payload value back into plain JSON-shaped builtins."""
+
+    if isinstance(value, Mapping):
+        return {key: _unfreeze_payload_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_unfreeze_payload_value(item) for item in value]
+    return value
+
+
+class FrozenPayload(Mapping[str, Any]):
+    """Deeply immutable mapping used for canonical append-only event payloads.
+
+    Every nested mapping becomes a ``FrozenPayload`` and every nested sequence
+    becomes a tuple, so a payload cannot be mutated after validation at any depth.
+    Input containers are copied during freezing, so a caller keeping a reference to
+    the original object can never reach canonical state.
+    """
+
+    __slots__ = ("_data",)
+
+    _data: Mapping[str, Any]
+
+    def __init__(self, data: Mapping[str, Any]) -> None:
+        frozen: dict[str, Any] = {}
+        for key, value in data.items():
+            if not isinstance(key, str):
+                raise ValueError("event payload keys must be strings")
+            frozen[key] = _freeze_payload_value(value)
+        # MappingProxyType keeps the backing dict unreachable and unwritable.
+        self._data = MappingProxyType(frozen)
+
+    def __getitem__(self, key: str) -> Any:
+        return self._data[key]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __repr__(self) -> str:
+        return f"{type(self).__name__}({dict(self._data)!r})"
+
+    def __hash__(self) -> int:
+        return hash(frozenset(self._data.items()))
+
+    @classmethod
+    def _validate(cls, value: Any) -> FrozenPayload:
+        if isinstance(value, FrozenPayload):
+            return value
+        if isinstance(value, Mapping):
+            return cls(value)
+        raise ValueError("event payload must be a mapping")
+
+    @classmethod
+    def __get_pydantic_core_schema__(
+        cls,
+        source_type: Any,
+        handler: GetCoreSchemaHandler,
+    ) -> CoreSchema:
+        return core_schema.no_info_plain_validator_function(
+            cls._validate,
+            serialization=core_schema.plain_serializer_function_ser_schema(
+                _unfreeze_payload_value,
+                return_schema=core_schema.any_schema(),
+                when_used="always",
+            ),
+        )
+
+    @classmethod
+    def __get_pydantic_json_schema__(
+        cls,
+        schema: CoreSchema,
+        handler: GetJsonSchemaHandler,
+    ) -> JsonSchemaValue:
+        return {"type": "object", "additionalProperties": True}
+
+
+# The declared type is the read-only interface callers may rely on; the validated
+# value is always a FrozenPayload. Mapping has no __setitem__, so static analysis
+# rejects payload mutation as well.
+ImmutableEventPayload = Annotated[Mapping[str, Any], FrozenPayload]
 
 
 class ContractInferenceAccuracy(DomainModel):
@@ -129,7 +237,7 @@ class EvaluationEvent(DomainModel):
     run_id: NonEmptyString
     attempt_number: Annotated[int | None, Field(ge=1)] = None
     actor: NonEmptyString
-    payload: dict[str, Any] = Field(default_factory=dict)
+    payload: ImmutableEventPayload = Field(default_factory=lambda: FrozenPayload({}))
 
 
 class TaskOutcome(DomainModel):

@@ -10,8 +10,10 @@ from pydantic import ValidationError
 from tomtit.domain.contracts import (
     AcceptanceCriterion,
     CriterionAssignment,
+    Finding,
     RequiredCheck,
     ScopeRule,
+    StopDecision,
     TaskContract,
     VerificationPlan,
     WorkerResult,
@@ -19,6 +21,7 @@ from tomtit.domain.contracts import (
 from tomtit.domain.enums import (
     CriterionStatus,
     EvaluationEventType,
+    FindingSeverity,
     NextAction,
     Outcome,
     RunState,
@@ -42,9 +45,11 @@ from tomtit.runtime.runtime import (
     Runtime,
 )
 from tomtit.runtime.state import (
+    CompletionInvariantError,
     ObservedCheckResult,
     ObservedPatchEvidence,
     RunRecord,
+    validate_completed_record,
 )
 
 
@@ -353,7 +358,10 @@ def test_append_only_log_returns_detached_event_payloads(tmp_path: Path) -> None
     )
     original_state = first_snapshot[transition_index].payload["to_state"]
 
-    first_snapshot[transition_index].payload["to_state"] = "CORRUPTED"
+    # F-004: the detached snapshot is now deeply immutable, so the journal is
+    # protected by rejection rather than only by copying.
+    with pytest.raises(TypeError):
+        first_snapshot[transition_index].payload["to_state"] = "CORRUPTED"
 
     assert runtime.events[transition_index].payload["to_state"] == original_state
     assert len(runtime.events) == 11
@@ -680,3 +688,357 @@ def test_event_log_rejects_independent_clock_injection() -> None:
             clock=StepClock(),
             event_id_factory=id_factory(),
         )
+
+
+# ---------------------------------------------------------------------------
+# F-002 — the terminal-report trust boundary re-proves completion invariants.
+# Every case below tampers with an already COMPLETED record through unsafe
+# model_copy(update=...) and asserts build_terminal_report() refuses it.
+# ---------------------------------------------------------------------------
+
+
+def completed_record(tmp_path: Path, *, worker: FakeWorker | None = None) -> RunRecord:
+    return make_runtime(tmp_path, worker=worker).run_scenario_1()
+
+
+def with_checks(record: RunRecord, *checks: ObservedCheckResult) -> RunRecord:
+    return record.model_copy(update={"observed_checks": checks})
+
+
+def with_patch(record: RunRecord, **updates: object) -> RunRecord:
+    assert record.observed_patch is not None
+    return record.model_copy(
+        update={"observed_patch": record.observed_patch.model_copy(update=updates)}
+    )
+
+
+def replace_with_directory(raw_path: str) -> None:
+    path = Path(raw_path)
+    path.unlink()
+    path.mkdir()
+
+
+def test_report_rejects_check_result_downgraded_to_failed(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(
+        record,
+        record.observed_checks[0].model_copy(update={"exit_code": 1}),
+    )
+
+    with pytest.raises(ValidationError, match="not an expected exit code"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_missing_required_check_result(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(record)
+
+    with pytest.raises(ValidationError, match=r"missing=\['unit-tests'\]"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_duplicate_results_for_one_required_check(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(record, record.observed_checks[0], record.observed_checks[0])
+
+    with pytest.raises(ValidationError, match="has 2 observed results, expected 1"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_foreign_run_check_evidence(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(
+        record,
+        record.observed_checks[0].model_copy(update={"run_id": "foreign-run"}),
+    )
+
+    with pytest.raises(ValidationError, match="belong to the canonical run"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_wrong_attempt_check_evidence(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_checks(
+        record,
+        record.observed_checks[0].model_copy(update={"attempt_number": 2}),
+    )
+
+    with pytest.raises(ValidationError, match="belong to canonical attempt"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_deleted_stdout_artifact(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    Path(record.observed_checks[0].stdout_path).unlink()
+
+    with pytest.raises(CompletionInvariantError, match="stdout artifact"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_report_rejects_deleted_stderr_artifact(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    Path(record.observed_checks[0].stderr_path).unlink()
+
+    with pytest.raises(CompletionInvariantError, match="stderr artifact"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_report_rejects_directory_as_stdout_artifact(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    replace_with_directory(record.observed_checks[0].stdout_path)
+
+    with pytest.raises(CompletionInvariantError, match="stdout artifact.*regular file"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_report_rejects_deleted_patch_artifact(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    assert record.observed_patch is not None
+    Path(record.observed_patch.artifact_path).unlink()
+
+    with pytest.raises(CompletionInvariantError, match="patch artifact"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_report_rejects_directory_as_patch_artifact(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    assert record.observed_patch is not None
+    replace_with_directory(record.observed_patch.artifact_path)
+
+    with pytest.raises(CompletionInvariantError, match="patch artifact.*regular file"):
+        build_terminal_report(record, generated_at=StepClock()())
+
+
+def test_report_rejects_incomplete_patch_evidence(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_patch(record, evidence_complete=False)
+
+    with pytest.raises(ValidationError, match="evidence_complete"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_patch_evidence_without_diff(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_patch(record, diff_exists=False)
+
+    with pytest.raises(ValidationError, match="diff exists"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_patch_evidence_with_scope_violation(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = with_patch(record, scope_violations=("outside.txt: modify is out of scope",))
+
+    with pytest.raises(ValidationError, match="without scope violations"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_unresolved_blocking_finding(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = record.model_copy(
+        update={
+            "unresolved_findings": (
+                Finding(
+                    finding_id="finding-1",
+                    fingerprint="scope:src/fixture.py:tests-pass",
+                    severity=FindingSeverity.BLOCKING,
+                    category="correctness",
+                    message="unresolved blocking defect",
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="no unresolved blocking finding"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_unsatisfied_deterministic_criterion(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    tampered = record.model_copy(
+        update={
+            "criterion_evaluations": (
+                record.criterion_evaluations[0].model_copy(
+                    update={"status": CriterionStatus.UNSATISFIED}
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(ValidationError, match="all criteria satisfied"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_report_rejects_absent_required_check_despite_worker_claim(tmp_path: Path) -> None:
+    record = completed_record(
+        tmp_path,
+        worker=FakeWorker(worker_result(claimed_checks=("unit-tests",))),
+    )
+    assert record.worker_result is not None
+    assert record.worker_result.claimed_checks == ("unit-tests",)
+
+    tampered = with_checks(record)
+
+    with pytest.raises(ValidationError, match=r"missing=\['unit-tests'\]"):
+        build_terminal_report(tampered, generated_at=StepClock()())
+
+
+def test_untampered_completed_record_still_builds_immutable_report(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+
+    report = build_terminal_report(record, generated_at=StepClock()())
+
+    assert report.schema_version == "report.v1"
+    assert report.outcome is Outcome.COMPLETED
+    assert report.stop_reason is StopReason.ACCEPTANCE_SATISFIED
+    assert report.completion_basis is CompletionBasis.DETERMINISTIC_EVIDENCE
+    assert report.attempts == 1
+    assert report.checks_executed == ("unit-tests",)
+    assert report.changed_files == ("src/fixture.py",)
+    assert report.acceptance_criteria[0].status is CriterionStatus.SATISFIED
+    assert report.blocking_findings == ()
+    assert report.scope_violations == ()
+
+    with pytest.raises(ValidationError):
+        report.attempts = 2
+    with pytest.raises(AttributeError):
+        report.checks_executed.append("injected")  # type: ignore[attr-defined]
+
+
+class ArtifactDeletingClock(StepClock):
+    """Deletes an evidence artifact exactly when Runtime stamps completed_at.
+
+    This reproduces the F-002 threat of an artifact disappearing after Runtime
+    finished CHECKING but before completion is committed.
+    """
+
+    def __init__(self, runtime_holder: list[Runtime]) -> None:
+        super().__init__()
+        self._runtime_holder = runtime_holder
+        self.deleted: Path | None = None
+
+    def __call__(self) -> datetime:
+        if self._runtime_holder and self.deleted is None:
+            record = self._runtime_holder[0].record
+            if record.state is RunState.CHECKING and record.stop_decision is not None:
+                path = Path(record.observed_checks[0].stdout_path)
+                path.unlink()
+                self.deleted = path
+        return super().__call__()
+
+
+def test_runtime_and_report_boundary_share_one_completion_gate(tmp_path: Path) -> None:
+    runtime_directory = tmp_path / "runtime"
+    runtime_directory.mkdir()
+    holder: list[Runtime] = []
+    clock = ArtifactDeletingClock(holder)
+    runtime = Runtime(
+        run_id="run-shared-gate",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(artifact_directory=runtime_directory / "artifacts"),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=runtime_directory,
+        clock=clock,
+    )
+    holder.append(runtime)
+
+    with pytest.raises(CompletionInvariantError) as runtime_rejection:
+        runtime.run_scenario_1()
+
+    assert clock.deleted is not None
+    assert runtime.record.state is RunState.CHECKING
+    assert runtime.record.outcome is None
+    assert not (runtime_directory / "report.v1.json").exists()
+
+    report_directory = tmp_path / "report"
+    report_directory.mkdir()
+    record = completed_record(report_directory)
+    Path(record.observed_checks[0].stdout_path).unlink()
+
+    with pytest.raises(CompletionInvariantError) as report_rejection:
+        build_terminal_report(record, generated_at=StepClock()())
+
+    with pytest.raises(CompletionInvariantError) as gate_rejection:
+        validate_completed_record(record)
+
+    # Same tampering, same gate, same rejection at every authority boundary.
+    assert str(runtime_rejection.value) == str(report_rejection.value)
+    assert str(report_rejection.value) == str(gate_rejection.value)
+
+
+# ---------------------------------------------------------------------------
+# F-003 — Attempt 1 can never be canonicalized as NO_PROGRESS.
+# ---------------------------------------------------------------------------
+
+
+def no_progress_values(*, attempt_count: int) -> dict[str, object]:
+    started_at = datetime(2026, 8, 3, 14, 0, tzinfo=timezone.utc)
+    return {
+        "run_id": "run-no-progress",
+        "task_contract": task_contract(),
+        "verification_plan": verification_plan(),
+        "state": RunState.FAILED,
+        "attempt_count": attempt_count,
+        "stop_decision": StopDecision(
+            outcome=Outcome.FAILED,
+            stop_reason=StopReason.NO_PROGRESS,
+            repairable=False,
+            owner_input_required=False,
+            next_action=NextAction.FAIL,
+        ),
+        "outcome": Outcome.FAILED,
+        "stop_reason": StopReason.NO_PROGRESS,
+        "started_at": started_at,
+        "completed_at": started_at + timedelta(seconds=5),
+    }
+
+
+def test_direct_construction_rejects_attempt_one_no_progress() -> None:
+    with pytest.raises(ValidationError, match="NO_PROGRESS requires attempt_count >= 2"):
+        RunRecord(**no_progress_values(attempt_count=1))
+
+
+def test_revalidation_rejects_copied_attempt_one_no_progress() -> None:
+    valid = RunRecord(**no_progress_values(attempt_count=2))
+    corrupted = valid.model_copy(update={"attempt_count": 1})
+
+    with pytest.raises(ValidationError, match="NO_PROGRESS requires attempt_count >= 2"):
+        RunRecord.model_validate(corrupted.model_dump(mode="python"))
+
+
+def test_report_boundary_rejects_copied_attempt_one_no_progress(tmp_path: Path) -> None:
+    record = completed_record(tmp_path)
+    assert record.attempt_count == 1
+    corrupted = record.model_copy(
+        update={
+            "state": RunState.FAILED,
+            "outcome": Outcome.FAILED,
+            "stop_reason": StopReason.NO_PROGRESS,
+            "stop_decision": StopDecision(
+                outcome=Outcome.FAILED,
+                stop_reason=StopReason.NO_PROGRESS,
+                repairable=False,
+                owner_input_required=False,
+                next_action=NextAction.FAIL,
+            ),
+        }
+    )
+
+    with pytest.raises(ValidationError, match="NO_PROGRESS requires attempt_count >= 2"):
+        build_terminal_report(corrupted, generated_at=StepClock()())
+
+
+def test_no_progress_is_structurally_allowed_from_attempt_two() -> None:
+    """NO_PROGRESS is not rejected merely for existing once a baseline attempt exists.
+
+    This is a structural invariant test only. Scenario 4 no-progress execution and
+    ProgressSnapshot comparison remain unimplemented and out of scope.
+    """
+
+    record = RunRecord(**no_progress_values(attempt_count=2))
+
+    assert record.attempt_count == 2
+    assert record.stop_reason is StopReason.NO_PROGRESS
+    assert record.state is RunState.FAILED

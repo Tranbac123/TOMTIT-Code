@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 
 import pytest
@@ -10,6 +11,7 @@ from tomtit.domain.evaluation import (
     EvaluationEvent,
     ExperimentRunRecord,
     ExperimentWorker,
+    FrozenPayload,
     OwnerCriterionEvaluation,
     OwnerEvaluation,
     TaskOutcome,
@@ -351,3 +353,135 @@ def test_evaluation_collections_are_immutable_tuples() -> None:
         evaluation.criteria.clear()  # type: ignore[attr-defined]
     with pytest.raises(AttributeError):
         evaluation.criteria[0].evidence.append("other")  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
+# F-004 — EvaluationEvent.payload is deeply immutable after validation.
+# ---------------------------------------------------------------------------
+
+
+def event_with_payload(payload: dict[str, object]) -> EvaluationEvent:
+    return EvaluationEvent(
+        event_id="event-1",
+        schema_version="evaluation-event.v1",
+        timestamp=datetime.now(UTC),
+        event_type=EvaluationEventType.CHECK_PASSED,
+        task_id="task-1",
+        run_id="run-1",
+        attempt_number=1,
+        actor="runtime",
+        payload=payload,
+    )
+
+
+def nested_payload() -> dict[str, object]:
+    return {
+        "check_id": "unit-tests",
+        "nested": {"items": ["a", "b"], "key": "value"},
+    }
+
+
+def test_event_payload_rejects_top_level_mutation() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(TypeError):
+        event.payload["new_key"] = "injected"  # type: ignore[index]
+
+    assert "new_key" not in event.payload
+
+
+def test_event_payload_rejects_nested_mapping_mutation() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(TypeError):
+        event.payload["nested"]["key"] = "injected"  # type: ignore[index]
+
+    assert event.payload["nested"]["key"] == "value"
+
+
+def test_event_payload_rejects_nested_list_append() -> None:
+    event = event_with_payload(nested_payload())
+
+    with pytest.raises(AttributeError):
+        event.payload["nested"]["items"].append("c")  # type: ignore[attr-defined]
+
+    assert event.payload["nested"]["items"] == ("a", "b")
+
+
+def test_mutating_original_payload_dict_does_not_reach_the_event() -> None:
+    original = nested_payload()
+    event = event_with_payload(original)
+
+    original["check_id"] = "tampered"
+    original["added_after"] = True
+
+    assert event.payload["check_id"] == "unit-tests"
+    assert "added_after" not in event.payload
+
+
+def test_mutating_original_nested_list_does_not_reach_the_event() -> None:
+    original = nested_payload()
+    event = event_with_payload(original)
+
+    nested = original["nested"]
+    assert isinstance(nested, dict)
+    items = nested["items"]
+    assert isinstance(items, list)
+    items.append("tampered")
+    nested["key"] = "tampered"
+
+    assert event.payload["nested"]["items"] == ("a", "b")
+    assert event.payload["nested"]["key"] == "value"
+
+
+def test_event_payload_list_values_become_immutable_canonical_values() -> None:
+    event = event_with_payload({"argv": ["python", "-m", "pytest"], "nested": {"x": [1]}})
+
+    assert isinstance(event.payload, FrozenPayload)
+    assert event.payload["argv"] == ("python", "-m", "pytest")
+    assert isinstance(event.payload["argv"], tuple)
+    assert isinstance(event.payload["nested"], FrozenPayload)
+    assert isinstance(event.payload["nested"]["x"], tuple)
+
+
+def test_event_payload_json_dump_emits_plain_objects_and_arrays() -> None:
+    event = event_with_payload(nested_payload())
+
+    dumped = event.model_dump(mode="json")["payload"]
+
+    assert dumped == {
+        "check_id": "unit-tests",
+        "nested": {"items": ["a", "b"], "key": "value"},
+    }
+    assert isinstance(dumped, dict)
+    assert isinstance(dumped["nested"], dict)
+    assert isinstance(dumped["nested"]["items"], list)
+
+
+def test_event_payload_json_round_trip_preserves_content_and_immutability() -> None:
+    event = event_with_payload(nested_payload())
+
+    serialized = event.model_dump_json()
+    restored = EvaluationEvent.model_validate_json(serialized)
+
+    assert json.loads(serialized)["payload"]["nested"]["items"] == ["a", "b"]
+    assert restored.payload == event.payload
+    assert restored == event
+    assert isinstance(restored.payload, FrozenPayload)
+    assert isinstance(restored.payload["nested"]["items"], tuple)
+
+    with pytest.raises(TypeError):
+        restored.payload["nested"]["key"] = "injected"  # type: ignore[index]
+
+
+def test_event_payload_json_schema_generation_still_succeeds() -> None:
+    schema = EvaluationEvent.model_json_schema()
+
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert schema["properties"]["payload"]["type"] == "object"
+
+
+def test_event_payload_rejects_non_mapping_input() -> None:
+    with pytest.raises(ValidationError):
+        event_with_payload(["not", "a", "mapping"])  # type: ignore[arg-type]

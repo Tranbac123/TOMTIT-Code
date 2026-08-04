@@ -26,9 +26,12 @@ from tomtit.runtime.state import (
     CompletionBasis,
     CriterionEvaluation,
     ObservedCheckResult,
-    ObservedPatchEvidence,
     RunRecord,
     TransitionReason,
+    artifact_file_error,
+    patch_evidence_error,
+    required_check_coverage_error,
+    validate_completed_record,
 )
 
 
@@ -147,8 +150,7 @@ class Runtime:
                 evaluation.status is not CriterionStatus.SATISFIED
                 for evaluation in evaluations
             )
-            or not self._all_required_checks_passed(observed_checks)
-            or not self._patch_evidence_allows_completion(observed_patch)
+            or not self._completion_evidence_is_sufficient(observed_checks)
         ):
             raise CompletionConditionsNotMet(
                 "observed evidence did not satisfy every criterion and required check"
@@ -214,13 +216,17 @@ class Runtime:
             decision = self._record.stop_decision
             if decision is None:
                 raise InvalidTransitionError("StopDecision is required before completion")
-            self._replace_record(
+            candidate = self._build_record(
                 state=target,
                 outcome=decision.outcome,
                 stop_reason=decision.stop_reason,
                 completion_basis=CompletionBasis.DETERMINISTIC_EVIDENCE,
                 completed_at=self._clock(),
             )
+            # The shared completion gate is authoritative; the canonical record is
+            # only committed once it proves every completion invariant, so an
+            # artifact deleted after CHECKING still aborts the transition.
+            self._record = validate_completed_record(candidate)
         else:
             self._replace_record(state=target)
         self._append_event(
@@ -268,22 +274,12 @@ class Runtime:
             if set(observed_ids) != set(expected_ids):
                 raise InvalidTransitionError("observed evidence must cover every required check")
         if current is RunState.CHECKING and target is RunState.COMPLETED:
-            self._validate_observed_evidence_provenance_and_artifacts()
+            # Completion evidence itself is proven once, by validate_completed_record.
+            # Only the transition-legality precondition belongs here.
             if self._record.stop_decision is None:
                 raise InvalidTransitionError("StopDecision is required before completion")
             if self._record.stop_decision.next_action is not NextAction.COMPLETE:
                 raise InvalidTransitionError("completion requires next_action=complete")
-            if not self._record.criterion_evaluations or any(
-                item.status is not CriterionStatus.SATISFIED
-                for item in self._record.criterion_evaluations
-            ):
-                raise InvalidTransitionError("all criteria must be satisfied")
-            if not self._all_required_checks_passed(self._record.observed_checks):
-                raise InvalidTransitionError("all required checks must pass")
-            if self._record.observed_patch is None or not self._patch_evidence_allows_completion(
-                self._record.observed_patch
-            ):
-                raise InvalidTransitionError("complete in-scope patch evidence is required")
 
     def _validate_observed_evidence_provenance_and_artifacts(self) -> None:
         if not self._record.observed_checks:
@@ -307,30 +303,23 @@ class Runtime:
 
     @staticmethod
     def _require_regular_file(raw_path: str, label: str) -> None:
-        if not Path(raw_path).is_file():
-            raise InvalidTransitionError(f"{label} must exist and be a regular file")
+        error = artifact_file_error(raw_path, label)
+        if error is not None:
+            raise InvalidTransitionError(error)
 
-    @staticmethod
-    def _patch_evidence_allows_completion(evidence: ObservedPatchEvidence) -> bool:
-        return (
-            evidence.diff_exists
-            and evidence.evidence_complete
-            and not evidence.scope_violations
-        )
-
-    def _all_required_checks_passed(
+    def _completion_evidence_is_sufficient(
         self,
         observed_checks: tuple[ObservedCheckResult, ...],
     ) -> bool:
-        observed_by_id = {item.check_id: item for item in observed_checks}
-        required_checks = self._record.task_contract.required_checks
+        """Screen deterministic evidence using the shared completion predicates."""
+
         return (
-            len(observed_by_id) == len(required_checks)
-            and all(
-                check.id in observed_by_id
-                and observed_by_id[check.id].exit_code in check.expected_exit_codes
-                for check in required_checks
+            required_check_coverage_error(
+                self._record.task_contract.required_checks,
+                observed_checks,
             )
+            is None
+            and patch_evidence_error(self._record.observed_patch) is None
         )
 
     def _evaluate_deterministic_criteria(
@@ -404,10 +393,13 @@ class Runtime:
             payload=payload,
         )
 
-    def _replace_record(self, **updates: object) -> None:
+    def _build_record(self, **updates: object) -> RunRecord:
         values = {
             field_name: getattr(self._record, field_name)
             for field_name in type(self._record).model_fields
         }
         values.update(updates)
-        self._record = RunRecord(**values)
+        return RunRecord(**values)
+
+    def _replace_record(self, **updates: object) -> None:
+        self._record = self._build_record(**updates)

@@ -4,12 +4,15 @@ from __future__ import annotations
 
 from datetime import datetime
 from enum import Enum
+from pathlib import Path
 from typing import Annotated
 
 from pydantic import BeforeValidator, Field, model_validator
 
 from tomtit.domain.contracts import (
     DomainModel,
+    Finding,
+    RequiredCheck,
     StopDecision,
     TaskContract,
     VerificationPlan,
@@ -18,6 +21,7 @@ from tomtit.domain.contracts import (
 )
 from tomtit.domain.enums import (
     CriterionStatus,
+    FindingSeverity,
     NextAction,
     Outcome,
     RunState,
@@ -91,6 +95,68 @@ class CriterionEvaluation(DomainModel):
     )
 
 
+class CompletionInvariantError(ValueError):
+    """Raised when a record cannot prove the canonical completion invariants."""
+
+
+def required_check_coverage_error(
+    required_checks: tuple[RequiredCheck, ...],
+    observed_checks: tuple[ObservedCheckResult, ...],
+) -> str | None:
+    """Return why required-check coverage fails completion, or None when it holds.
+
+    Runtime and the terminal-report boundary share this single definition so a
+    Worker claim can never substitute for exactly one passing observed result.
+    """
+
+    observed_by_check: dict[str, list[ObservedCheckResult]] = {}
+    for observed in observed_checks:
+        observed_by_check.setdefault(observed.check_id, []).append(observed)
+
+    required_ids = {check.id for check in required_checks}
+    if not required_ids:
+        return "deterministic completion requires at least one required check"
+    if set(observed_by_check) != required_ids:
+        missing = sorted(required_ids - set(observed_by_check))
+        unexpected = sorted(set(observed_by_check) - required_ids)
+        return (
+            "observed results must cover exactly the required checks: "
+            f"missing={missing}, unexpected={unexpected}"
+        )
+    for check in required_checks:
+        results = observed_by_check[check.id]
+        if len(results) != 1:
+            return f"required check {check.id} has {len(results)} observed results, expected 1"
+        if results[0].exit_code not in check.expected_exit_codes:
+            return (
+                f"required check {check.id} observed exit code {results[0].exit_code} "
+                f"is not an expected exit code"
+            )
+    return None
+
+
+def patch_evidence_error(evidence: ObservedPatchEvidence | None) -> str | None:
+    """Return why patch evidence cannot support completion, or None when it can."""
+
+    if evidence is None:
+        return "completion requires observed patch evidence"
+    if not evidence.evidence_complete:
+        return "completion requires evidence_complete patch evidence"
+    if not evidence.diff_exists:
+        return "completion requires patch evidence proving a diff exists"
+    if evidence.scope_violations:
+        return "completion requires patch evidence without scope violations"
+    return None
+
+
+def artifact_file_error(raw_path: str, label: str) -> str | None:
+    """Return why an evidence artifact is unusable, or None when it is a regular file."""
+
+    if not Path(raw_path).is_file():
+        return f"{label} must exist and be a regular file"
+    return None
+
+
 class RunRecord(DomainModel):
     """Immutable snapshot of the canonical run state owned by Runtime."""
 
@@ -106,6 +172,9 @@ class RunRecord(DomainModel):
     observed_patch: ObservedPatchEvidence | None = None
     criterion_evaluations: Annotated[
         tuple[CriterionEvaluation, ...], BeforeValidator(_list_to_tuple)
+    ] = Field(default_factory=tuple)
+    unresolved_findings: Annotated[
+        tuple[Finding, ...], BeforeValidator(_list_to_tuple)
     ] = Field(default_factory=tuple)
     stop_decision: StopDecision | None = None
     outcome: Outcome | None = None
@@ -142,28 +211,50 @@ class RunRecord(DomainModel):
         ):
             raise ValueError("non-terminal state cannot contain terminal outcome fields")
 
+        # F-003: Attempt 1 has no previous ProgressSnapshot, so it can never be
+        # canonicalized as NO_PROGRESS. Enforced here, independently of Runtime
+        # reachability, so direct construction, revalidation at a trust boundary,
+        # and report generation all reject the same invalid record.
+        declared_stop_reasons = {self.stop_reason}
+        if self.stop_decision is not None:
+            declared_stop_reasons.add(self.stop_decision.stop_reason)
+        if StopReason.NO_PROGRESS in declared_stop_reasons and self.attempt_count < 2:
+            raise ValueError(
+                "NO_PROGRESS requires attempt_count >= 2 because Attempt 1 has no "
+                "previous ProgressSnapshot to compare against"
+            )
+
         evaluation_ids = [item.criterion_id for item in self.criterion_evaluations]
         if len(evaluation_ids) != len(set(evaluation_ids)):
             raise ValueError("criterion evaluations must have unique criterion IDs")
 
         if self.state is RunState.COMPLETED:
-            if self.observed_patch is None:
-                raise ValueError("COMPLETED requires observed patch evidence")
-            if (
-                not self.observed_patch.diff_exists
-                or not self.observed_patch.evidence_complete
-                or self.observed_patch.scope_violations
+            if self.attempt_count < 1:
+                raise ValueError("COMPLETED requires at least one recorded attempt")
+            observed_patch = self.observed_patch
+            patch_error = patch_evidence_error(observed_patch)
+            if patch_error is not None or observed_patch is None:
+                raise ValueError(f"COMPLETED rejected: {patch_error}")
+            coverage_error = required_check_coverage_error(
+                self.task_contract.required_checks,
+                self.observed_checks,
+            )
+            if coverage_error is not None:
+                raise ValueError(f"COMPLETED rejected: {coverage_error}")
+            if any(
+                finding.severity is FindingSeverity.BLOCKING
+                for finding in self.unresolved_findings
             ):
-                raise ValueError("COMPLETED requires complete in-scope patch evidence")
+                raise ValueError("COMPLETED requires no unresolved blocking finding")
             if any(item.run_id != self.run_id for item in self.observed_checks):
                 raise ValueError("COMPLETED observed checks must belong to the canonical run")
             if any(
                 item.attempt_number != self.attempt_count for item in self.observed_checks
             ):
                 raise ValueError("COMPLETED observed checks must belong to canonical attempt")
-            if self.observed_patch.run_id != self.run_id:
+            if observed_patch.run_id != self.run_id:
                 raise ValueError("COMPLETED observed patch must belong to the canonical run")
-            if self.observed_patch.attempt_number != self.attempt_count:
+            if observed_patch.attempt_number != self.attempt_count:
                 raise ValueError("COMPLETED observed patch must belong to canonical attempt")
             expected_ids = {item.id for item in self.task_contract.acceptance_criteria}
             if set(evaluation_ids) != expected_ids:
@@ -190,3 +281,39 @@ class RunRecord(DomainModel):
             ):
                 raise ValueError("COMPLETED requires all criteria satisfied")
         return self
+
+
+def validate_completed_record(record: RunRecord) -> RunRecord:
+    """Prove every completion invariant and return the revalidated canonical record.
+
+    This is the single completion gate. Runtime calls it before it commits the
+    transition into COMPLETED, and the terminal-report boundary calls it before it
+    reads any report field, so neither side can drift from the other.
+
+    Structural invariants live in :meth:`RunRecord.validate_runtime_snapshot` and are
+    re-proven here by revalidating a detached dump, which defeats unsafe
+    ``model_copy(update=...)`` tampering. Filesystem-backed artifact proofs cannot
+    live in the model validator, so they run here against the revalidated record.
+    """
+
+    validated = RunRecord.model_validate(record.model_dump(mode="python"))
+
+    if validated.state is not RunState.COMPLETED:
+        raise CompletionInvariantError("completion requires COMPLETED state")
+
+    for observed in validated.observed_checks:
+        for raw_path, label in (
+            (observed.stdout_path, "stdout artifact"),
+            (observed.stderr_path, "stderr artifact"),
+        ):
+            error = artifact_file_error(raw_path, label)
+            if error is not None:
+                raise CompletionInvariantError(f"check {observed.check_id}: {error}")
+
+    observed_patch = validated.observed_patch
+    if observed_patch is None:
+        raise CompletionInvariantError("completion requires observed patch evidence")
+    patch_artifact_error = artifact_file_error(observed_patch.artifact_path, "patch artifact")
+    if patch_artifact_error is not None:
+        raise CompletionInvariantError(patch_artifact_error)
+    return validated

@@ -16,8 +16,8 @@ from tomtit.domain.contracts import (
 )
 from tomtit.domain.enums import (
     CriterionStatus,
+    FindingSeverity,
     Outcome,
-    RunState,
     StopReason,
     VerificationMethod,
     VerificationMode,
@@ -28,6 +28,7 @@ from tomtit.runtime.state import (
     ObservedCheckResult,
     ObservedPatchEvidence,
     RunRecord,
+    validate_completed_record,
 )
 
 
@@ -85,12 +86,16 @@ class TerminalReport(DomainModel):
 
 
 def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> TerminalReport:
-    """Build a COMPLETED report from a freshly validated canonical snapshot."""
+    """Build a COMPLETED report from a freshly validated canonical snapshot.
 
-    validated_record = RunRecord.model_validate(record.model_dump(mode="python"))
+    The untrusted input record is reconstructed and re-proven by the shared
+    completion gate first; every field below is then read only from the validated
+    record, so tampering applied through ``model_copy(update=...)`` cannot reach
+    ``report.v1.json``.
+    """
 
-    if validated_record.state is not RunState.COMPLETED:
-        raise ValueError("Commit 2 terminal report requires COMPLETED state")
+    validated_record = validate_completed_record(record)
+
     if validated_record.outcome is None or validated_record.stop_reason is None:
         raise ValueError("terminal report requires a terminal outcome")
     if (
@@ -145,6 +150,11 @@ def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> Termi
             item.check_id for item in validated_record.observed_checks
         ),
         scope_violations=validated_record.observed_patch.scope_violations,
+        blocking_findings=tuple(
+            finding.fingerprint
+            for finding in validated_record.unresolved_findings
+            if finding.severity is FindingSeverity.BLOCKING
+        ),
         remaining_risks=validated_record.worker_result.remaining_risks,
         recommended_next_action="review generated patch artifact",
     )
