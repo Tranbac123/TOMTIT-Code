@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal
@@ -86,32 +87,31 @@ class TerminalReport(DomainModel):
 
 
 def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> TerminalReport:
-    """Public trust boundary: re-prove an untrusted record, then build its report.
+    """The sole public trust boundary for building a terminal report.
 
     The input record is reconstructed and re-proven by the shared completion gate
     before any field is read, so tampering applied through
-    ``model_copy(update=...)`` cannot reach ``report.v1.json``. Callers that have
-    already proven a record with :func:`validate_completed_record` should use
-    :func:`build_terminal_report_from_validated_record` instead, so the
-    filesystem-backed gate runs exactly once per completion operation.
+    ``model_copy(update=...)`` cannot reach ``report.v1.json``. Every caller
+    outside Runtime's own validated completion preparation must use this function.
     """
 
-    return build_terminal_report_from_validated_record(
+    return _build_terminal_report_from_validated_record(
         validate_completed_record(record),
         generated_at=generated_at,
     )
 
 
-def build_terminal_report_from_validated_record(
+def _build_terminal_report_from_validated_record(
     validated_record: RunRecord,
     *,
     generated_at: datetime,
 ) -> TerminalReport:
-    """Build the report from a record already proven by the shared completion gate.
+    """Private: build the report from a record the caller has already proven.
 
-    This performs no completion validation and touches no filesystem. The caller
-    owns that proof, which lets Runtime finish every fallible completion step
-    before it mutates canonical state.
+    This performs no completion validation and touches no filesystem, so it is
+    only sound immediately after :func:`validate_completed_record` has proven the
+    same record. Runtime's completion preparation is the only permitted caller;
+    everyone else uses :func:`build_terminal_report`.
     """
 
     if validated_record.outcome is None or validated_record.stop_reason is None:
@@ -176,6 +176,37 @@ def build_terminal_report_from_validated_record(
         remaining_risks=validated_record.worker_result.remaining_risks,
         recommended_next_action="review generated patch artifact",
     )
+
+
+STAGED_REPORT_NAME = ".report.v1.json.staged"
+
+
+def stage_terminal_report(directory: Path, rendered: str) -> Path:
+    """Write the complete report to a private temporary file in the final directory.
+
+    The staged file is never the terminal report. It exists so that all report
+    bytes are on disk before Runtime commits canonical completion, leaving only a
+    link-and-unlink publication step afterwards.
+    """
+
+    directory.mkdir(parents=True, exist_ok=True)
+    staged = directory / STAGED_REPORT_NAME
+    with staged.open("w", encoding="utf-8") as handle:
+        handle.write(rendered)
+        handle.flush()
+    return staged
+
+
+def publish_staged_report(staged: Path, final: Path) -> Path:
+    """Publish a staged report as the write-once terminal report.
+
+    ``os.link`` fails rather than overwriting when the final report already
+    exists, which preserves write-once behaviour without a read-then-write race.
+    """
+
+    os.link(staged, final)
+    staged.unlink()
+    return final
 
 
 def render_terminal_report(report: TerminalReport) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
@@ -21,11 +22,13 @@ from tomtit.domain.enums import (
 from tomtit.domain.evaluation import EvaluationEvent
 from tomtit.fakes import FakeCheckRunner, FakeWorker
 from tomtit.reporting import (
-    build_terminal_report_from_validated_record,
+    STAGED_REPORT_NAME,
+    _build_terminal_report_from_validated_record,
+    publish_staged_report,
     render_terminal_report,
-    write_rendered_terminal_report,
+    stage_terminal_report,
 )
-from tomtit.runtime.events import InMemoryEventLog, utc_now
+from tomtit.runtime.events import InMemoryEventLog, PreparedEvent, utc_now
 from tomtit.runtime.state import (
     CompletionBasis,
     CriterionEvaluation,
@@ -41,6 +44,25 @@ from tomtit.runtime.state import (
 
 class InvalidTransitionError(RuntimeError):
     """Raised when a caller attempts to bypass the canonical state machine."""
+
+
+@dataclass(frozen=True, slots=True)
+class _PreparedCompletion:
+    """Everything terminal completion needs, built before any canonical mutation."""
+
+    record: RunRecord
+    staged_report: Path
+    final_report: Path
+    events: tuple[PreparedEvent, ...]
+
+
+def _remove_quietly(path: Path) -> None:
+    """Best-effort cleanup that never masks the failure being recovered from."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:  # pragma: no cover - cleanup failure is a documented risk
+        pass
 
 
 class CompletionConditionsNotMet(RuntimeError):
@@ -197,16 +219,17 @@ class Runtime:
         self._append_transition_event(current, target, reason)
 
     def complete_run(self) -> RunRecord:
-        """Prepare the whole completion operation, then commit it atomically.
+        """Terminal completion as one prepare/commit/recover unit.
 
-        Ordering is the invariant this method exists to hold. Completion
-        validation, terminal-report construction, and report serialization are all
-        fallible, so they run first, against a candidate record that is not yet
-        canonical. Only once they succeed does Runtime store the completed record,
-        append ``RUN_COMPLETED``, publish the already rendered report, and append
-        ``REPORT_GENERATED``. No completion validation runs after canonical state
-        changes, so a failure leaves the run in CHECKING with no completion event
-        and no report.
+        Completion has exactly two externally observable results. Either the run
+        is COMPLETED with its report and both terminal events, or nothing moved
+        and the run is still retryable from CHECKING. Every normally fallible
+        step — timestamps, event IDs, model validation, serialization, report
+        rendering, report staging, and the authoritative evidence gate — happens
+        in :meth:`_prepare_completion` before canonical state or the event journal
+        is touched. :meth:`_commit_completion` then performs only assignment,
+        publication, and an append of already serialized events, and undoes them
+        all if any of those raise.
         """
 
         current = self._record.state
@@ -217,32 +240,127 @@ class Runtime:
         if decision is None:
             raise InvalidTransitionError("StopDecision is required before completion")
 
-        # ---- preparation: every fallible step, no canonical mutation ----
-        candidate = self._build_record(
-            state=RunState.COMPLETED,
-            outcome=decision.outcome,
-            stop_reason=decision.stop_reason,
-            completion_basis=CompletionBasis.DETERMINISTIC_EVIDENCE,
-            completed_at=self._clock(),
-        )
-        validated = validate_completed_record(candidate)
-        report = build_terminal_report_from_validated_record(
-            validated,
-            generated_at=self._clock(),
-        )
-        rendered = render_terminal_report(report)
-        report_path = self._report_directory / "report.v1.json"
+        prepared = self._prepare_completion(current, reason, decision)
+        return self._commit_completion(prepared)
 
-        # ---- commit: completion is already proven from here on ----
-        self._record = validated
-        self._append_transition_event(current, RunState.COMPLETED, reason)
-        written_path = write_rendered_terminal_report(report_path, rendered)
-        self._replace_record(report_path=str(written_path))
-        self._append_event(
-            EvaluationEventType.REPORT_GENERATED,
-            payload={"artifact_path": str(written_path), "schema_version": "report.v1"},
+    def _prepare_completion(
+        self,
+        current: RunState,
+        reason: TransitionReason,
+        decision: StopDecision,
+    ) -> _PreparedCompletion:
+        """Do every fallible piece of work, mutating nothing canonical.
+
+        The evidence gate runs last so that required artifacts are proven to exist
+        at the final Runtime-controlled moment before canonical assignment. No
+        clock call, ID allocation, model construction, serialization, rendering,
+        or staging happens after it.
+        """
+
+        final_report = self._report_directory / "report.v1.json"
+        # Known up front so a staging call that fails part-way through still has
+        # its partial file removed by the handler below.
+        staged_report = self._report_directory / STAGED_REPORT_NAME
+        try:
+            completed_at = self._clock()
+            generated_at = self._clock()
+            run_completed_at = self._clock()
+            report_generated_at = self._clock()
+
+            candidate = self._build_record(
+                state=RunState.COMPLETED,
+                outcome=decision.outcome,
+                stop_reason=decision.stop_reason,
+                completion_basis=CompletionBasis.DETERMINISTIC_EVIDENCE,
+                completed_at=completed_at,
+                report_path=str(final_report),
+            )
+
+            run_completed = self._prepare_event(
+                candidate,
+                timestamp=run_completed_at,
+                event_type=_TRANSITION_EVENT_TYPES[RunState.COMPLETED],
+                payload={
+                    "from_state": current.value,
+                    "to_state": RunState.COMPLETED.value,
+                    "transition_reason": reason.value,
+                },
+            )
+            report_generated = self._prepare_event(
+                candidate,
+                timestamp=report_generated_at,
+                event_type=EvaluationEventType.REPORT_GENERATED,
+                payload={
+                    "artifact_path": str(final_report),
+                    "schema_version": "report.v1",
+                },
+            )
+
+            report = _build_terminal_report_from_validated_record(
+                candidate,
+                generated_at=generated_at,
+            )
+            rendered = render_terminal_report(report)
+            stage_terminal_report(self._report_directory, rendered)
+
+            # Final Runtime-controlled proof; nothing fallible follows before commit.
+            validate_completed_record(candidate)
+        except BaseException:
+            _remove_quietly(staged_report)
+            raise
+
+        return _PreparedCompletion(
+            record=candidate,
+            staged_report=staged_report,
+            final_report=final_report,
+            events=(run_completed, report_generated),
         )
+
+    def _commit_completion(self, prepared: _PreparedCompletion) -> RunRecord:
+        """Apply the prepared completion, or restore the pre-completion run.
+
+        Only assignment, publication, an append of already serialized events, and
+        cleanup happen here. On failure the canonical record and the event journal
+        are restored, a report published by this operation is removed, and the
+        run stays retryable from CHECKING.
+        """
+
+        previous_record = self._record
+        checkpoint = self._event_log._checkpoint()
+        published = False
+        try:
+            self._record = prepared.record
+            publish_staged_report(prepared.staged_report, prepared.final_report)
+            published = True
+            self._event_log._append_prepared_batch(prepared.events)
+        except BaseException:
+            self._record = previous_record
+            self._event_log._restore_to_checkpoint(checkpoint)
+            if published:
+                _remove_quietly(prepared.final_report)
+            _remove_quietly(prepared.staged_report)
+            raise
+
+        _remove_quietly(prepared.staged_report)
         return self._record
+
+    def _prepare_event(
+        self,
+        record: RunRecord,
+        *,
+        timestamp: datetime,
+        event_type: EvaluationEventType,
+        payload: dict[str, object],
+    ) -> PreparedEvent:
+        return self._event_log.prepare(
+            timestamp=timestamp,
+            event_type=event_type,
+            task_id=record.task_contract.task_id,
+            run_id=record.run_id,
+            attempt_number=(record.attempt_count or None),
+            actor="runtime",
+            payload=payload,
+        )
 
     def _assert_transition_legal(
         self,

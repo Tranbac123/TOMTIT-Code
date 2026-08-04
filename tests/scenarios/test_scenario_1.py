@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import inspect
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
 
 import pytest
+import tomtit.reporting as reporting_module
+import tomtit.runtime.runtime as runtime_module
+import tomtit.runtime.state as state_module
 from pydantic import ValidationError
 from tomtit.domain.contracts import (
     AcceptanceCriterion,
@@ -34,6 +38,7 @@ from tomtit.domain.enums import (
 )
 from tomtit.fakes import FakeCheckOutcome, FakeCheckRunner, FakeWorker
 from tomtit.reporting import (
+    STAGED_REPORT_NAME,
     TerminalReport,
     build_terminal_report,
     write_terminal_report,
@@ -921,23 +926,40 @@ class ArtifactDeletingClock(StepClock):
         self,
         runtime_holder: list[Runtime],
         *,
-        when: Callable[[RunRecord], bool] | None = None,
+        completion_call: int = 1,
     ) -> None:
         super().__init__()
         self._runtime_holder = runtime_holder
-        self._when = when or (
-            lambda record: record.state is RunState.CHECKING
-            and record.stop_decision is not None
-        )
+        self._completion_call = completion_call
+        self._completion_calls = 0
         self.deleted: Path | None = None
 
     def __call__(self) -> datetime:
         if self._runtime_holder and self.deleted is None:
             record = self._runtime_holder[0].record
-            if record.observed_checks and self._when(record):
-                path = Path(record.observed_checks[0].stdout_path)
-                path.unlink()
-                self.deleted = path
+            in_completion = (
+                record.state is RunState.CHECKING and record.stop_decision is not None
+            )
+            if record.observed_checks and in_completion:
+                self._completion_calls += 1
+                if self._completion_calls == self._completion_call:
+                    path = Path(record.observed_checks[0].stdout_path)
+                    path.unlink()
+                    self.deleted = path
+        return super().__call__()
+
+
+class StateRecordingClock(StepClock):
+    """Records the canonical state observed at every clock call."""
+
+    def __init__(self, runtime_holder: list[Runtime]) -> None:
+        super().__init__()
+        self._runtime_holder = runtime_holder
+        self.observed_states: list[RunState] = []
+
+    def __call__(self) -> datetime:
+        if self._runtime_holder:
+            self.observed_states.append(self._runtime_holder[0].record.state)
         return super().__call__()
 
 
@@ -1110,31 +1132,22 @@ def test_failed_completion_preparation_leaves_no_partial_canonical_state(
     assert not (tmp_path / "report.v1.json").exists()
 
 
-def test_completion_does_not_revalidate_artifacts_after_canonical_commit(
-    tmp_path: Path,
-) -> None:
-    """An artifact lost after the commit point must not undo a proven completion.
+def test_no_clock_call_occurs_after_canonical_completion(tmp_path: Path) -> None:
+    """SOL-RM02: every timestamp is allocated before the evidence gate and commit.
 
-    Before SOL-H01 this raised from the second, post-commit validation and left
-    canonical COMPLETED with a RUN_COMPLETED event and no report.
+    Before this patch the clock was called for report.generated_at after the gate,
+    which is the window that let a required artifact vanish before COMPLETED.
     """
 
     holder: list[Runtime] = []
-    clock = ArtifactDeletingClock(
-        holder,
-        when=lambda record: record.state is RunState.COMPLETED,
-    )
+    clock = StateRecordingClock(holder)
     runtime = runtime_with_clock(tmp_path, clock)
     holder.append(runtime)
 
-    record = runtime.run_scenario_1()
+    runtime.run_scenario_1()
 
-    assert clock.deleted is not None
-    assert not clock.deleted.exists()
-    assert record.state is RunState.COMPLETED
-    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
-    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
-    assert (tmp_path / "report.v1.json").is_file()
+    assert clock.observed_states
+    assert RunState.COMPLETED not in clock.observed_states
 
 
 def test_public_report_boundary_still_rejects_untrusted_records(tmp_path: Path) -> None:
@@ -1230,6 +1243,464 @@ def test_worker_claim_cannot_excuse_contradicting_check_metadata(tmp_path: Path)
         validate_completed_record(tampered)
     with pytest.raises(ValidationError, match="does not match the contract argv"):
         build_terminal_report(tampered, generated_at=StepClock()())
+
+
+# ---------------------------------------------------------------------------
+# SOL-RH01 — terminal completion is one prepare/commit/recover unit.
+# Every supported failure must leave the defined retryable failure result.
+# ---------------------------------------------------------------------------
+
+
+def staged_report_path(directory: Path) -> Path:
+    return directory / STAGED_REPORT_NAME
+
+
+def assert_clean_failure_result(runtime: Runtime, directory: Path) -> None:
+    """The single defined failure result: nothing moved, completion retryable."""
+
+    record = runtime.record
+    assert record.state is RunState.CHECKING
+    assert record.outcome is None
+    assert record.stop_reason is None
+    assert record.completed_at is None
+    assert record.report_path is None
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
+    assert not (directory / "report.v1.json").exists()
+    assert not staged_report_path(directory).exists()
+
+
+def failing_id_factory(*, fail_on: int) -> Callable[[], str]:
+    counter = 0
+
+    def next_id() -> str:
+        nonlocal counter
+        counter += 1
+        if counter == fail_on:
+            raise RuntimeError(f"event id factory failed on event {fail_on}")
+        return f"event-{counter:03d}"
+
+    return next_id
+
+
+def blank_id_factory(*, blank_on: int) -> Callable[[], str]:
+    """Returns an invalid empty ID, so EvaluationEvent validation fails."""
+
+    counter = 0
+
+    def next_id() -> str:
+        nonlocal counter
+        counter += 1
+        return "" if counter == blank_on else f"event-{counter:03d}"
+
+    return next_id
+
+
+def runtime_with_id_factory(directory: Path, factory: Callable[[], str]) -> Runtime:
+    return Runtime(
+        run_id="run-failure",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(artifact_directory=directory / "artifacts"),
+        event_log=InMemoryEventLog(event_id_factory=factory),
+        report_directory=directory,
+        clock=StepClock(),
+    )
+
+
+# Terminal events are the 10th and 11th events of Scenario 1.
+RUN_COMPLETED_EVENT_INDEX = 10
+REPORT_GENERATED_EVENT_INDEX = 11
+
+
+def test_run_completed_event_id_failure_leaves_clean_failure_result(tmp_path: Path) -> None:
+    runtime = runtime_with_id_factory(
+        tmp_path, failing_id_factory(fail_on=RUN_COMPLETED_EVENT_INDEX)
+    )
+
+    with pytest.raises(RuntimeError, match="event id factory failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_run_completed_event_validation_failure_leaves_clean_failure_result(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_with_id_factory(
+        tmp_path, blank_id_factory(blank_on=RUN_COMPLETED_EVENT_INDEX)
+    )
+
+    with pytest.raises(ValidationError):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_report_generated_event_id_failure_leaves_clean_failure_result(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_with_id_factory(
+        tmp_path, failing_id_factory(fail_on=REPORT_GENERATED_EVENT_INDEX)
+    )
+
+    with pytest.raises(RuntimeError, match="event id factory failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_report_generated_event_validation_failure_leaves_clean_failure_result(
+    tmp_path: Path,
+) -> None:
+    runtime = runtime_with_id_factory(
+        tmp_path, blank_id_factory(blank_on=REPORT_GENERATED_EVENT_INDEX)
+    )
+
+    with pytest.raises(ValidationError):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_report_directory_preparation_failure_leaves_clean_failure_result(
+    tmp_path: Path,
+) -> None:
+    """Sol's reproduction: a regular file as report_directory passes preflight."""
+
+    report_directory = tmp_path / "occupied"
+    report_directory.write_text("not a directory", encoding="utf-8")
+    runtime = Runtime(
+        run_id="run-occupied-report-dir",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(artifact_directory=tmp_path / "artifacts"),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=report_directory,
+        clock=StepClock(),
+    )
+
+    with pytest.raises((FileExistsError, NotADirectoryError, FileNotFoundError)):
+        runtime.run_scenario_1()
+
+    record = runtime.record
+    assert record.state is RunState.CHECKING
+    assert record.outcome is None
+    assert record.report_path is None
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
+    assert report_directory.read_text(encoding="utf-8") == "not a directory"
+
+
+def test_staged_report_creation_failure_leaves_clean_failure_result(tmp_path: Path) -> None:
+    staged_report_path(tmp_path).mkdir(parents=True)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    with pytest.raises(IsADirectoryError):
+        runtime.run_scenario_1()
+
+    record = runtime.record
+    assert record.state is RunState.CHECKING
+    assert record.outcome is None
+    assert record.report_path is None
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert not (tmp_path / "report.v1.json").exists()
+
+
+def test_staged_report_write_failure_removes_the_partial_staged_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_stage(directory: Path, rendered: str) -> Path:
+        directory.mkdir(parents=True, exist_ok=True)
+        staged = directory / STAGED_REPORT_NAME
+        with staged.open("w", encoding="utf-8") as handle:
+            handle.write(rendered[: len(rendered) // 2])
+        raise OSError("staged report write failed")
+
+    monkeypatch.setattr(runtime_module, "stage_terminal_report", failing_stage)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    with pytest.raises(OSError, match="staged report write failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_report_publication_failure_recovers_the_pre_completion_run(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_publish(staged: Path, final: Path) -> Path:
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(runtime_module, "publish_staged_report", failing_publish)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+
+    with pytest.raises(OSError, match="publication failed"):
+        runtime.run_scenario_1()
+
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_event_batch_append_failure_recovers_after_report_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Recovery after a failure occurring after the final report was published."""
+
+    published: list[Path] = []
+    real_publish = runtime_module.publish_staged_report
+
+    def recording_publish(staged: Path, final: Path) -> Path:
+        result = real_publish(staged, final)
+        published.append(result)
+        return result
+
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    monkeypatch.setattr(runtime_module, "publish_staged_report", recording_publish)
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError, match="event batch append failed"):
+        runtime.run_scenario_1()
+
+    assert published, "the report must have been published before the failure"
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_recovery_preserves_earlier_nonterminal_event_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError):
+        runtime.run_scenario_1()
+
+    event_types = tuple(event.event_type for event in runtime.events)
+    assert event_types == (
+        EvaluationEventType.TASK_SUBMITTED,
+        EvaluationEventType.CONTRACT_INFERRED,
+        EvaluationEventType.RUN_STARTED,
+        EvaluationEventType.WORKSPACE_PREPARED,
+        EvaluationEventType.WORKER_ASSIGNED,
+        EvaluationEventType.WORKER_STARTED,
+        EvaluationEventType.WORKER_FINISHED,
+        EvaluationEventType.EVIDENCE_COLLECTED,
+        EvaluationEventType.CHECK_PASSED,
+    )
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_completion_retry_after_recovery_succeeds_exactly_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failing_batch(prepared: object) -> None:
+        raise OSError("event batch append failed")
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises(OSError):
+        runtime.run_scenario_1()
+    assert_clean_failure_result(runtime, tmp_path)
+
+    monkeypatch.undo()
+    record = runtime.complete_run()
+
+    assert record.state is RunState.COMPLETED
+    assert record.outcome is Outcome.COMPLETED
+    assert record.stop_reason is StopReason.ACCEPTANCE_SATISFIED
+    assert record.report_path == str(tmp_path / "report.v1.json")
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+    assert len(list(tmp_path.glob("report.v1.json"))) == 1
+    assert not staged_report_path(tmp_path).exists()
+
+
+def test_repeated_completion_after_success_is_rejected_without_mutation(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    record = runtime.run_scenario_1()
+    report_bytes = (tmp_path / "report.v1.json").read_bytes()
+    event_count = len(runtime.events)
+
+    with pytest.raises(InvalidTransitionError, match="terminal"):
+        runtime.complete_run()
+
+    assert runtime.record is record
+    assert len(runtime.events) == event_count
+    assert (tmp_path / "report.v1.json").read_bytes() == report_bytes
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+
+
+@pytest.mark.parametrize(
+    "failure",
+    ("run_completed_id", "report_generated_id", "staged_creation", "batch_append"),
+)
+def test_no_supported_failure_creates_duplicate_terminal_events(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    if failure == "run_completed_id":
+        runtime = runtime_with_id_factory(
+            tmp_path, failing_id_factory(fail_on=RUN_COMPLETED_EVENT_INDEX)
+        )
+    elif failure == "report_generated_id":
+        runtime = runtime_with_id_factory(
+            tmp_path, failing_id_factory(fail_on=REPORT_GENERATED_EVENT_INDEX)
+        )
+    elif failure == "staged_creation":
+        staged_report_path(tmp_path).mkdir(parents=True)
+        runtime = runtime_with_clock(tmp_path, StepClock())
+    else:
+        def failing_batch(prepared: object) -> None:
+            raise OSError("event batch append failed")
+
+        runtime = runtime_with_clock(tmp_path, StepClock())
+        monkeypatch.setattr(runtime._event_log, "_append_prepared_batch", failing_batch)
+
+    with pytest.raises((RuntimeError, OSError, ValidationError)):
+        runtime.run_scenario_1()
+
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
+    assert runtime.record.state is RunState.CHECKING
+
+
+# ---------------------------------------------------------------------------
+# SOL-RM02 — evidence proof timing at the completion boundary.
+# ---------------------------------------------------------------------------
+
+
+def test_artifact_unavailable_before_completion_is_rejected(tmp_path: Path) -> None:
+    """Case A: the artifact is gone before any completion preparation begins."""
+
+    holder: list[Runtime] = []
+    clock = ArtifactDeletingClock(holder, completion_call=1)
+    runtime = runtime_with_clock(tmp_path, clock)
+    holder.append(runtime)
+
+    with pytest.raises(CompletionInvariantError, match="stdout artifact"):
+        runtime.run_scenario_1()
+
+    assert clock.deleted is not None
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_artifact_unavailable_during_final_validation_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Case B: a second artifact disappears while the gate is walking the evidence."""
+
+    runtime = runtime_with_clock(tmp_path, StepClock())
+    real_artifact_file_error = state_module.artifact_file_error
+    calls: list[str] = []
+
+    def deleting_artifact_file_error(raw_path: str, label: str) -> str | None:
+        calls.append(label)
+        if len(calls) == 1:
+            # Remove a later artifact mid-walk, before the gate inspects it.
+            Path(runtime.record.observed_checks[0].stderr_path).unlink()
+        return real_artifact_file_error(raw_path, label)
+
+    monkeypatch.setattr(
+        state_module, "artifact_file_error", deleting_artifact_file_error
+    )
+
+    with pytest.raises(CompletionInvariantError, match="stderr artifact"):
+        runtime.run_scenario_1()
+
+    assert len(calls) >= 2
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+@pytest.mark.parametrize("completion_call", (1, 2, 3, 4))
+def test_artifact_lost_after_checking_but_before_final_gate_is_rejected(
+    tmp_path: Path,
+    completion_call: int,
+) -> None:
+    """Case C: every pre-commit window is still covered by the final gate.
+
+    Completion allocates four timestamps before the gate. Losing the artifact at
+    any of them previously slipped through at the report.generated_at call.
+    """
+
+    holder: list[Runtime] = []
+    clock = ArtifactDeletingClock(holder, completion_call=completion_call)
+    runtime = runtime_with_clock(tmp_path, clock)
+    holder.append(runtime)
+
+    with pytest.raises(CompletionInvariantError, match="stdout artifact"):
+        runtime.run_scenario_1()
+
+    assert clock.deleted is not None
+    assert_clean_failure_result(runtime, tmp_path)
+
+
+def test_artifact_lost_after_completion_does_not_invalidate_the_committed_run(
+    tmp_path: Path,
+) -> None:
+    """Case D: recorded behaviour. Post-completion loss is not a rejection."""
+
+    runtime = make_runtime(tmp_path)
+    record = runtime.run_scenario_1()
+
+    Path(record.observed_checks[0].stdout_path).unlink()
+
+    assert runtime.record.state is RunState.COMPLETED
+    assert runtime.record.outcome is Outcome.COMPLETED
+    assert runtime.record.report_path == str(tmp_path / "report.v1.json")
+    assert (tmp_path / "report.v1.json").is_file()
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 1
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 1
+
+
+# ---------------------------------------------------------------------------
+# SOL-RM03 — build_terminal_report() is the sole public report trust boundary.
+# ---------------------------------------------------------------------------
+
+
+def test_former_public_validated_report_builder_name_is_absent() -> None:
+    assert not hasattr(reporting_module, "build_terminal_report_from_validated_record")
+    assert hasattr(reporting_module, "_build_terminal_report_from_validated_record")
+
+
+def test_public_report_builder_rejects_copied_non_completed_record(tmp_path: Path) -> None:
+    """Sol's SOL-RM03 bypass record, now only reachable through the public gate."""
+
+    record = completed_record(tmp_path)
+    corrupted = record.model_copy(update={"state": RunState.CHECKING})
+
+    with pytest.raises(ValidationError):
+        build_terminal_report(corrupted, generated_at=StepClock()())
+
+
+def test_private_validated_report_builder_has_no_other_production_callers() -> None:
+    name = "_build_terminal_report_from_validated_record"
+    source_root = Path(reporting_module.__file__).parent
+    callers = {
+        path.relative_to(source_root).as_posix()
+        for path in source_root.rglob("*.py")
+        if name in path.read_text(encoding="utf-8")
+    }
+
+    assert callers == {"reporting.py", "runtime/runtime.py"}
+    assert name in inspect.getsource(Runtime._prepare_completion)
 
 
 def test_no_progress_is_structurally_allowed_from_attempt_two() -> None:
