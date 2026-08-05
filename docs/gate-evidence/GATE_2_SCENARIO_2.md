@@ -8,6 +8,7 @@ gate_status: APPROVED
 scenario_status: FROZEN
 product_evidence_status: PROVEN
 review_verdict: APPROVE_WITH_NON_BLOCKING_FINDINGS
+recorded_at: 2026-08-05T13:41:51+07:00
 next_gate: CLAUDE_CODE_CLI_CAPABILITY_SPIKE
 no_further_gate_2_correctness_review: true
 ```
@@ -134,10 +135,13 @@ None of these reopens or blocks Gate 2.
 ```text
 f446a59d56ef2438331523b4c2d8684f75da1786
 → 041f5f23d63f49d6b147ee032aeda7042a81ca14
-→ <THIS_GATE_EVIDENCE_COMMIT>
 ```
 
-The Gate evidence commit is not part of the reviewed implementation diff.
+The final Sol review commit (`041f5f23d63f49d6b147ee032aeda7042a81ca14`) is the
+authoritative end of the reviewed implementation lineage. The Gate evidence
+commit and this correction commit are forward-only Git history that persists
+and corrects this record; they are not part of the reviewed implementation
+diff and are not self-referenced from within this file.
 
 ## Recorded by
 
