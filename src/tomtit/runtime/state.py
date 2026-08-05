@@ -12,6 +12,7 @@ from typing import Annotated
 from pydantic import BeforeValidator, Field, model_validator
 
 from tomtit.domain.contracts import (
+    AcceptanceCriterion,
     DomainModel,
     Finding,
     RequiredCheck,
@@ -158,7 +159,10 @@ class AttemptEvidence(DomainModel):
         observed_ids = {item.check_id for item in self.observed_checks}
         if not set(self.failed_check_ids) <= observed_ids:
             raise ValueError("archived failed checks must reference archived observations")
-        evaluated_ids = {item.criterion_id for item in self.criterion_evaluations}
+        evaluated_id_list = [item.criterion_id for item in self.criterion_evaluations]
+        if len(evaluated_id_list) != len(set(evaluated_id_list)):
+            raise ValueError("archived criterion evaluations must have unique criterion IDs")
+        evaluated_ids = set(evaluated_id_list)
         if not set(self.satisfied_criterion_ids) <= evaluated_ids:
             raise ValueError("archived satisfied criteria must reference archived evaluations")
         return self
@@ -171,6 +175,90 @@ class AttemptEvidence(DomainModel):
         return tuple(ids)
 
 
+def archived_check_membership_error(
+    required_checks: tuple[RequiredCheck, ...],
+    observed_checks: tuple[ObservedCheckResult, ...],
+) -> str | None:
+    """Every observation must name one distinct canonical required check.
+
+    Membership is proven before any failure derivation. An unknown check ID must
+    never fall through to an empty expected-exit-code tuple, because that would
+    make an invented observation look like a genuine failure.
+    """
+
+    known = {check.id for check in required_checks}
+    seen_check_ids: set[str] = set()
+    seen_snapshot_ids: set[str] = set()
+    for item in observed_checks:
+        if item.check_id not in known:
+            return (
+                f"archived observation names unknown required check {item.check_id!r}; "
+                f"canonical required checks are {sorted(known)}"
+            )
+        if item.check_id in seen_check_ids:
+            return f"archived observations duplicate required check {item.check_id!r}"
+        if item.snapshot_id in seen_snapshot_ids:
+            return f"archived observations duplicate snapshot id {item.snapshot_id!r}"
+        seen_check_ids.add(item.check_id)
+        seen_snapshot_ids.add(item.snapshot_id)
+    return None
+
+
+def archived_criterion_membership_error(
+    acceptance_criteria: tuple[AcceptanceCriterion, ...],
+    criterion_evaluations: tuple[CriterionEvaluation, ...],
+) -> str | None:
+    """Every archived evaluation must name one distinct canonical criterion."""
+
+    known = {criterion.id for criterion in acceptance_criteria}
+    seen: set[str] = set()
+    for item in criterion_evaluations:
+        if item.criterion_id not in known:
+            return (
+                f"archived evaluation names unknown acceptance criterion "
+                f"{item.criterion_id!r}; canonical criteria are {sorted(known)}"
+            )
+        if item.criterion_id in seen:
+            return f"archived evaluations duplicate acceptance criterion {item.criterion_id!r}"
+        seen.add(item.criterion_id)
+    return None
+
+
+def canonical_failed_required_check_ids(
+    required_checks: tuple[RequiredCheck, ...],
+    observed_checks: tuple[ObservedCheckResult, ...],
+) -> tuple[str, ...]:
+    """Failed check IDs, derived by iterating the contract in canonical order.
+
+    Iterating the contract rather than the observations means the result can only
+    ever contain canonical IDs, cannot contain duplicates, and cannot be reordered
+    by whoever supplied the archive.
+    """
+
+    observed_by_id = {item.check_id: item for item in observed_checks}
+    failed: list[str] = []
+    for check in required_checks:
+        observed = observed_by_id.get(check.id)
+        if observed is not None and observed.exit_code not in check.expected_exit_codes:
+            failed.append(check.id)
+    return tuple(failed)
+
+
+def canonical_satisfied_criterion_ids(
+    acceptance_criteria: tuple[AcceptanceCriterion, ...],
+    criterion_evaluations: tuple[CriterionEvaluation, ...],
+) -> tuple[str, ...]:
+    """Satisfied criterion IDs, derived by iterating the contract in canonical order."""
+
+    evaluated_by_id = {item.criterion_id: item for item in criterion_evaluations}
+    satisfied: list[str] = []
+    for criterion in acceptance_criteria:
+        evaluation = evaluated_by_id.get(criterion.id)
+        if evaluation is not None and evaluation.status is CriterionStatus.SATISFIED:
+            satisfied.append(criterion.id)
+    return tuple(satisfied)
+
+
 def attempt_evidence_from_observations(
     *,
     run_id: str,
@@ -179,13 +267,22 @@ def attempt_evidence_from_observations(
     observed_checks: tuple[ObservedCheckResult, ...],
     observed_patch: ObservedPatchEvidence | None,
     criterion_evaluations: tuple[CriterionEvaluation, ...],
+    acceptance_criteria: tuple[AcceptanceCriterion, ...] | None = None,
     stop_decision: StopDecision | None = None,
     findings: tuple[Finding, ...] = (),
 ) -> AttemptEvidence:
     """Derive one attempt's archived evidence from observed results only.
 
     The canonical run ID is supplied explicitly and every observation must agree
-    with it, so a foreign-run observation cannot be archived.
+    with it, so a foreign-run observation cannot be archived. Derived tuples come
+    from iterating the canonical contract, never the supplied evidence.
+
+    `acceptance_criteria` is optional only because Runtime's writer call site
+    supplies criterion evaluations it built by iterating the contract itself, so
+    those are already canonical members in canonical order. Every record it
+    produces is still re-proven against the full contract by
+    :func:`revision_attempt_archive_error` during `RunRecord` validation, so the
+    writer can only produce a strict subset of what the validator accepts.
     """
 
     for item in observed_checks:
@@ -194,21 +291,30 @@ def attempt_evidence_from_observations(
     if observed_patch is not None and observed_patch.run_id != run_id:
         raise ValueError("observed patch must belong to the canonical run")
 
-    expected_exit_codes = {check.id: check.expected_exit_codes for check in required_checks}
-    failed = tuple(
-        sorted(
-            item.check_id
-            for item in observed_checks
-            if item.exit_code not in expected_exit_codes.get(item.check_id, ())
+    membership_error = archived_check_membership_error(required_checks, observed_checks)
+    if membership_error is not None:
+        raise ValueError(membership_error)
+    if acceptance_criteria is not None:
+        criterion_error = archived_criterion_membership_error(
+            acceptance_criteria, criterion_evaluations
         )
-    )
-    satisfied = tuple(
-        sorted(
+        if criterion_error is not None:
+            raise ValueError(criterion_error)
+
+    failed = canonical_failed_required_check_ids(required_checks, observed_checks)
+    if acceptance_criteria is None:
+        evaluated_ids = [item.criterion_id for item in criterion_evaluations]
+        if len(evaluated_ids) != len(set(evaluated_ids)):
+            raise ValueError("criterion evaluations must have unique criterion IDs")
+        satisfied = tuple(
             item.criterion_id
             for item in criterion_evaluations
             if item.status is CriterionStatus.SATISFIED
         )
-    )
+    else:
+        satisfied = canonical_satisfied_criterion_ids(
+            acceptance_criteria, criterion_evaluations
+        )
     return AttemptEvidence(
         run_id=run_id,
         attempt_number=attempt_number,
@@ -396,7 +502,28 @@ def revision_attempt_archive_error(
     ):
         return "archived patch must belong to the archived run and attempt"
 
-    # Recompute every derived tuple; exact equality, never subset.
+    # Canonical membership is proven before anything is derived, so a coordinated
+    # forgery cannot supply both an invented observation and a matching derived ID.
+    check_membership_error = archived_check_membership_error(
+        contract.required_checks, archive.observed_checks
+    )
+    if check_membership_error is not None:
+        return check_membership_error
+    observed_ids = {item.check_id for item in archive.observed_checks}
+    required_ids = {check.id for check in contract.required_checks}
+    if observed_ids != required_ids:
+        return (
+            f"archived observations must cover every required check: "
+            f"missing={sorted(required_ids - observed_ids)}"
+        )
+    criterion_membership_error = archived_criterion_membership_error(
+        contract.acceptance_criteria, archive.criterion_evaluations
+    )
+    if criterion_membership_error is not None:
+        return criterion_membership_error
+
+    # Recompute every derived tuple from the canonical contract; exact equality,
+    # never subset, and never in an archive-controlled order.
     derived = attempt_evidence_from_observations(
         run_id=run_id,
         attempt_number=archive.attempt_number,
@@ -404,6 +531,7 @@ def revision_attempt_archive_error(
         observed_checks=archive.observed_checks,
         observed_patch=archive.observed_patch,
         criterion_evaluations=archive.criterion_evaluations,
+        acceptance_criteria=contract.acceptance_criteria,
     )
     if archive.failed_check_ids != derived.failed_check_ids:
         return (
@@ -710,6 +838,7 @@ class RunRecord(DomainModel):
                     observed_checks=self.observed_checks,
                     observed_patch=observed_patch,
                     criterion_evaluations=self.criterion_evaluations,
+                    acceptance_criteria=self.task_contract.acceptance_criteria,
                 )
                 improvement_error = objective_improvement_error(
                     self.attempt_history[-1],

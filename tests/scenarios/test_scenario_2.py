@@ -50,6 +50,7 @@ from tomtit.runtime.runtime import (
 from tomtit.runtime.state import (
     TASK_CONTRACT_HASH_SCHEMA_VERSION,
     AttemptEvidence,
+    CriterionEvaluation,
     ObservedCheckResult,
     RunRecord,
     attempt_evidence_from_observations,
@@ -1788,3 +1789,469 @@ def test_archive_validation_failure_rolls_the_whole_revision_back(
     assert len(runtime.record.attempt_history) == 1
     assert event_type_count(runtime, EvaluationEventType.REVISION_REQUESTED) == 1
     assert runtime.record.attempt_count == 2
+
+
+# ---------------------------------------------------------------------------
+# G2-S2-04B — archived derivations come from canonical TaskContract members.
+#
+# The reviewed defect was a *coordinated* forgery: both the archived input and
+# the stored derived tuple were faked consistently, so comparing one against the
+# other proved nothing. Derivation now iterates the contract, so an archive can
+# only ever describe canonical members, once each, in canonical order.
+# ---------------------------------------------------------------------------
+
+
+def genuine_archive(tmp_path: Path) -> tuple[RunRecord, AttemptEvidence]:
+    record = completed_revised_record(tmp_path)
+    return record, record.attempt_history[0]
+
+
+def two_criterion_contract() -> TaskContract:
+    """A contract with two canonical criteria, for order-sensitive assertions."""
+
+    base = task_contract()
+    lint = RequiredCheck(
+        id="lint",
+        argv=["python", "-m", "ruff", "check", "src"],
+        cwd_relative=".",
+        timeout_seconds=60,
+        expected_exit_codes=[0],
+    )
+    return TaskContract(
+        **{
+            **base.model_dump(),
+            # Canonical order deliberately differs from alphabetical order.
+            "required_checks": [*base.required_checks, lint],
+            "acceptance_criteria": [
+                *base.acceptance_criteria,
+                AcceptanceCriterion(
+                    id="a-lint-clean",
+                    description="Lint is clean",
+                    verification_method=VerificationMethod.DETERMINISTIC,
+                    required_check_ids=["lint"],
+                ),
+            ],
+        }
+    )
+
+
+def test_unknown_archived_check_observation_is_rejected(tmp_path: Path) -> None:
+    record, archive = genuine_archive(tmp_path)
+    genuine = archive.observed_checks[0]
+    invented = genuine.model_copy(update={"check_id": "invented-check", "exit_code": 1})
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"observed_checks": (genuine, invented)})
+    )
+
+
+def test_unknown_archived_check_with_matching_failed_ids_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Reviewed reproduction 1: invented observation plus matching failed ID."""
+
+    record, archive = genuine_archive(tmp_path)
+    genuine = archive.observed_checks[0]
+    invented = genuine.model_copy(update={"check_id": "invented-check", "exit_code": 1})
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={
+                "observed_checks": (genuine, invented),
+                "failed_check_ids": ("invented-check", FAILING_CHECK_ID),
+            }
+        ),
+    )
+
+
+def test_unknown_archived_check_with_passing_exit_code_is_rejected(
+    tmp_path: Path,
+) -> None:
+    record, archive = genuine_archive(tmp_path)
+    genuine = archive.observed_checks[0]
+    invented = genuine.model_copy(update={"check_id": "invented-check", "exit_code": 0})
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"observed_checks": (genuine, invented)})
+    )
+
+
+def test_duplicate_archived_check_observation_is_rejected(tmp_path: Path) -> None:
+    """Reviewed reproduction 2: duplicated observation plus duplicated failed ID."""
+
+    record, archive = genuine_archive(tmp_path)
+    genuine = archive.observed_checks[0]
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={
+                "observed_checks": (genuine, genuine),
+                "failed_check_ids": (FAILING_CHECK_ID, FAILING_CHECK_ID),
+            }
+        ),
+    )
+
+
+def test_duplicate_archived_snapshot_id_is_rejected(tmp_path: Path) -> None:
+    record, archive = genuine_archive(tmp_path)
+    genuine = archive.observed_checks[0]
+    # Same snapshot identity, different stored artifact paths.
+    twin = genuine.model_copy(update={"stdout_path": genuine.stdout_path + ".copy"})
+    assert twin.snapshot_id == genuine.snapshot_id
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"observed_checks": (genuine, twin)})
+    )
+
+
+def test_missing_required_check_coverage_is_rejected(tmp_path: Path) -> None:
+    runtime = Runtime(
+        run_id="run-s2",
+        task_contract=two_criterion_contract(),
+        verification_plan=two_criterion_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(
+            artifact_directory=tmp_path / "artifacts",
+            attempt_outcomes={(1, FAILING_CHECK_ID): FakeCheckOutcome(exit_code=1)},
+        ),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=tmp_path,
+        clock=StepClock(),
+    )
+    record = runtime.run_scenario_2()
+    archive = record.attempt_history[0]
+    only_failing = tuple(
+        item for item in archive.observed_checks if item.check_id == FAILING_CHECK_ID
+    )
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"observed_checks": only_failing})
+    )
+
+
+def two_criterion_plan() -> VerificationPlan:
+    return VerificationPlan(
+        mode=VerificationMode.B,
+        criterion_assignments=[
+            CriterionAssignment(
+                criterion_id="tests-pass",
+                verification_method=VerificationMethod.DETERMINISTIC,
+                available=True,
+            ),
+            CriterionAssignment(
+                criterion_id="a-lint-clean",
+                verification_method=VerificationMethod.DETERMINISTIC,
+                available=True,
+            ),
+        ],
+    )
+
+
+def two_criterion_runtime(tmp_path: Path) -> Runtime:
+    return Runtime(
+        run_id="run-s2",
+        task_contract=two_criterion_contract(),
+        verification_plan=two_criterion_plan(),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(
+            artifact_directory=tmp_path / "artifacts",
+            attempt_outcomes={
+                (1, FAILING_CHECK_ID): FakeCheckOutcome(exit_code=1),
+                (1, "lint"): FakeCheckOutcome(exit_code=1),
+            },
+        ),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=tmp_path,
+        clock=StepClock(),
+    )
+
+
+def test_failed_ids_follow_canonical_contract_order(tmp_path: Path) -> None:
+    """Contract order is `unit-tests, lint`; alphabetical order would differ."""
+
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+
+    contract_order = tuple(check.id for check in record.task_contract.required_checks)
+    assert contract_order == (FAILING_CHECK_ID, "lint")
+    assert archive.failed_check_ids == contract_order
+    assert archive.failed_check_ids != tuple(sorted(contract_order))
+
+
+def test_archive_controlled_failed_id_ordering_is_rejected(tmp_path: Path) -> None:
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+    reordered = tuple(reversed(archive.failed_check_ids))
+    assert reordered != archive.failed_check_ids
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"failed_check_ids": reordered})
+    )
+
+
+def test_unknown_archived_criterion_evaluation_is_rejected(tmp_path: Path) -> None:
+    record, archive = genuine_archive(tmp_path)
+    foreign = CriterionEvaluation(
+        criterion_id="not-in-contract",
+        status=CriterionStatus.UNSATISFIED,
+    )
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={"criterion_evaluations": (*archive.criterion_evaluations, foreign)}
+        ),
+    )
+
+
+def test_unknown_satisfied_criterion_with_matching_tuple_is_rejected(
+    tmp_path: Path,
+) -> None:
+    """Reviewed reproduction 3: non-contract criterion plus matching satisfied ID."""
+
+    record, archive = genuine_archive(tmp_path)
+    foreign = CriterionEvaluation(
+        criterion_id="not-in-contract",
+        status=CriterionStatus.SATISFIED,
+    )
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={
+                "criterion_evaluations": (*archive.criterion_evaluations, foreign),
+                "satisfied_criterion_ids": ("not-in-contract",),
+            }
+        ),
+    )
+
+
+def test_duplicate_archived_criterion_evaluation_is_rejected(tmp_path: Path) -> None:
+    record, archive = genuine_archive(tmp_path)
+    duplicated = (*archive.criterion_evaluations, archive.criterion_evaluations[0])
+
+    # AttemptEvidence itself refuses to hold duplicate evaluations at all.
+    with pytest.raises(ValidationError, match="unique criterion IDs"):
+        archive.model_copy(update={"criterion_evaluations": duplicated}).model_validate(
+            archive.model_copy(
+                update={"criterion_evaluations": duplicated}
+            ).model_dump(mode="python")
+        )
+
+
+def three_criterion_contract() -> TaskContract:
+    """Three criteria whose canonical order deliberately differs from sorted order."""
+
+    base = task_contract()
+    extra_checks = [
+        RequiredCheck(
+            id=check_id,
+            argv=["python", "-m", "tool", check_id],
+            cwd_relative=".",
+            timeout_seconds=60,
+            expected_exit_codes=[0],
+        )
+        for check_id in ("z-lint", "a-typecheck")
+    ]
+    return TaskContract(
+        **{
+            **base.model_dump(),
+            "required_checks": [*base.required_checks, *extra_checks],
+            "acceptance_criteria": [
+                *base.acceptance_criteria,
+                AcceptanceCriterion(
+                    id="z-lint-clean",
+                    description="Lint is clean",
+                    verification_method=VerificationMethod.DETERMINISTIC,
+                    required_check_ids=["z-lint"],
+                ),
+                AcceptanceCriterion(
+                    id="a-typecheck-clean",
+                    description="Types are clean",
+                    verification_method=VerificationMethod.DETERMINISTIC,
+                    required_check_ids=["a-typecheck"],
+                ),
+            ],
+        }
+    )
+
+
+def three_criterion_runtime(tmp_path: Path) -> Runtime:
+    contract = three_criterion_contract()
+    return Runtime(
+        run_id="run-s2",
+        task_contract=contract,
+        verification_plan=VerificationPlan(
+            mode=VerificationMode.B,
+            criterion_assignments=[
+                CriterionAssignment(
+                    criterion_id=criterion.id,
+                    verification_method=VerificationMethod.DETERMINISTIC,
+                    available=True,
+                )
+                for criterion in contract.acceptance_criteria
+            ],
+        ),
+        worker=FakeWorker(worker_result()),
+        check_runner=FakeCheckRunner(
+            artifact_directory=tmp_path / "artifacts",
+            attempt_outcomes={(1, FAILING_CHECK_ID): FakeCheckOutcome(exit_code=1)},
+        ),
+        event_log=InMemoryEventLog(event_id_factory=id_factory()),
+        report_directory=tmp_path,
+        clock=StepClock(),
+    )
+
+
+def test_satisfied_ids_follow_canonical_contract_order(tmp_path: Path) -> None:
+    """Attempt 1 fails one check, so two criteria are satisfied in contract order."""
+
+    record = three_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+
+    contract_order = tuple(item.id for item in record.task_contract.acceptance_criteria)
+    assert contract_order == ("tests-pass", "z-lint-clean", "a-typecheck-clean")
+    assert archive.satisfied_criterion_ids == ("z-lint-clean", "a-typecheck-clean")
+    # Canonical order is not alphabetical order, so this genuinely proves ordering.
+    assert archive.satisfied_criterion_ids != tuple(sorted(archive.satisfied_criterion_ids))
+
+
+def test_archive_controlled_satisfied_id_ordering_is_rejected(tmp_path: Path) -> None:
+    record = three_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+    reordered = tuple(reversed(archive.satisfied_criterion_ids))
+    assert reordered != archive.satisfied_criterion_ids
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"satisfied_criterion_ids": reordered})
+    )
+
+
+def test_forged_satisfied_tuple_naming_an_unsatisfied_criterion_is_rejected(
+    tmp_path: Path,
+) -> None:
+    record, archive = genuine_archive(tmp_path)
+    assert archive.satisfied_criterion_ids == ()
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"satisfied_criterion_ids": ("tests-pass",)})
+    )
+
+
+def test_genuine_completed_scenario_2_record_remains_accepted(tmp_path: Path) -> None:
+    record, archive = genuine_archive(tmp_path)
+
+    revalidated = RunRecord.model_validate(record.model_dump(mode="python"))
+    gated = validate_completed_record(record)
+
+    assert revalidated.attempt_history[0] == archive
+    assert gated.attempt_history[0] == archive
+    assert gated.state is RunState.COMPLETED
+
+
+def test_gate_1_empty_history_record_remains_accepted(tmp_path: Path) -> None:
+    runtime = make_runtime(
+        tmp_path,
+        runner=FakeCheckRunner(artifact_directory=tmp_path / "artifacts"),
+    )
+
+    record = runtime.run_scenario_1()
+
+    assert record.attempt_history == ()
+    assert RunRecord.model_validate(record.model_dump(mode="python")).attempt_history == ()
+    assert validate_completed_record(record).attempt_history == ()
+
+
+def test_two_criterion_revision_completes_and_revalidates(tmp_path: Path) -> None:
+    """A multi-criterion contract still completes and survives both boundaries."""
+
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+
+    assert record.state is RunState.COMPLETED
+    assert record.attempt_count == 2
+    assert record.attempt_history[0].failed_check_ids == (FAILING_CHECK_ID, "lint")
+    assert record.attempt_history[0].satisfied_criterion_ids == ()
+    assert RunRecord.model_validate(record.model_dump(mode="python")).state is RunState.COMPLETED
+    assert validate_completed_record(record).state is RunState.COMPLETED
+
+
+def test_duplicate_passing_check_observation_is_rejected(tmp_path: Path) -> None:
+    """Isolates the duplicate-observation rule from coverage and derivation.
+
+    Duplicating a *passing* observation leaves both the derived failed-check
+    tuple and required-check coverage unchanged, so only the uniqueness rule can
+    reject it.
+    """
+
+    record = three_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+    passing = next(
+        item for item in archive.observed_checks if item.check_id != FAILING_CHECK_ID
+    )
+    duplicated = archive.model_copy(
+        update={"observed_checks": (*archive.observed_checks, passing)}
+    )
+
+    # Coverage and derivation are untouched by the duplication.
+    assert {item.check_id for item in duplicated.observed_checks} == {
+        check.id for check in record.task_contract.required_checks
+    }
+    assert duplicated.failed_check_ids == archive.failed_check_ids
+
+    assert_both_boundaries_reject(record, duplicated)
+
+
+def test_archive_controlled_check_ordering_is_rejected(tmp_path: Path) -> None:
+    """Reordering observations *and* the derived tuple together is still refused.
+
+    This isolates canonical-order derivation: an archive-order derivation would
+    reproduce the forged tuple exactly and accept it.
+    """
+
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+    reordered_ids = tuple(reversed(archive.failed_check_ids))
+    by_id = {item.check_id: item for item in archive.observed_checks}
+    reordered_checks = tuple(by_id[check_id] for check_id in reordered_ids)
+    assert reordered_ids != archive.failed_check_ids
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={
+                "observed_checks": reordered_checks,
+                "failed_check_ids": reordered_ids,
+            }
+        ),
+    )
+
+
+def test_archive_controlled_criterion_ordering_is_rejected(tmp_path: Path) -> None:
+    """Reordering evaluations *and* the derived satisfied tuple together is refused."""
+
+    record = three_criterion_runtime(tmp_path).run_scenario_2()
+    archive = record.attempt_history[0]
+    reordered_ids = tuple(reversed(archive.satisfied_criterion_ids))
+    assert reordered_ids != archive.satisfied_criterion_ids
+    by_id = {item.criterion_id: item for item in archive.criterion_evaluations}
+    reordered_evaluations = tuple(
+        by_id[criterion_id]
+        for criterion_id in reordered_ids
+        if criterion_id in by_id
+    ) + tuple(
+        item
+        for item in archive.criterion_evaluations
+        if item.criterion_id not in reordered_ids
+    )
+
+    assert_both_boundaries_reject(
+        record,
+        archive.model_copy(
+            update={
+                "criterion_evaluations": reordered_evaluations,
+                "satisfied_criterion_ids": reordered_ids,
+            }
+        ),
+    )
