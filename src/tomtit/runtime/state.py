@@ -9,7 +9,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Annotated
 
-from pydantic import BeforeValidator, Field, model_validator
+from pydantic import BeforeValidator, Field, ValidationInfo, model_validator
 
 from tomtit.domain.contracts import (
     AcceptanceCriterion,
@@ -574,6 +574,16 @@ def revision_attempt_archive_error(
 
 TASK_CONTRACT_HASH_SCHEMA_VERSION = "tomtit.task_contract_hash.v1"
 
+# Validation-context key carrying the trusted contract hash. The value must come
+# from Runtime authority, never from the record payload being validated.
+TRUSTED_CONTRACT_HASH_CONTEXT_KEY = "expected_task_contract_hash"
+
+
+def trusted_contract_context(expected_task_contract_hash: str) -> dict[str, str]:
+    """Build the validation context a revised record must be validated against."""
+
+    return {TRUSTED_CONTRACT_HASH_CONTEXT_KEY: expected_task_contract_hash}
+
 
 def task_contract_hash(contract: TaskContract) -> str:
     """SHA-256 over a versioned canonical envelope of the contract.
@@ -704,7 +714,7 @@ class RunRecord(DomainModel):
     completed_at: datetime | None = None
 
     @model_validator(mode="after")
-    def validate_runtime_snapshot(self) -> RunRecord:
+    def validate_runtime_snapshot(self, info: ValidationInfo) -> RunRecord:
         if self.attempt_count > self.task_contract.hard_max_attempts:
             raise ValueError("attempt_count cannot exceed the contract hard limit")
 
@@ -751,6 +761,27 @@ class RunRecord(DomainModel):
             raise ValueError("attempt history must be unique and strictly increasing")
         if archived_attempts and archived_attempts[-1] >= max(self.attempt_count, 1):
             raise ValueError("attempt history cannot contain the current or a later attempt")
+        if self.attempt_history:
+            # A revised record's own TaskContract is caller-replaceable, so the
+            # archive derivations below cannot be trusted against it alone: a
+            # reordered-but-equivalent contract plus consistently rewritten
+            # archive fields would validate. The expected hash must therefore
+            # come from outside this payload, through validation context.
+            expected_hash = (info.context or {}).get(TRUSTED_CONTRACT_HASH_CONTEXT_KEY)
+            if not expected_hash:
+                raise ValueError(
+                    "a revised run record must be validated against a trusted "
+                    f"{TRUSTED_CONTRACT_HASH_CONTEXT_KEY}; validating without one is "
+                    "refused because the embedded TaskContract is caller-replaceable"
+                )
+            embedded_hash = task_contract_hash(self.task_contract)
+            if embedded_hash != expected_hash:
+                raise ValueError(
+                    "the embedded TaskContract does not match the canonical contract "
+                    f"this run is bound to: embedded={embedded_hash}, "
+                    f"expected={expected_hash}"
+                )
+
         # Archived evidence is canonical run state, so every archived revision
         # attempt is re-proven here rather than trusted. This runs at every
         # RunRecord construction and reconstruction, which is what makes copied
@@ -849,7 +880,11 @@ class RunRecord(DomainModel):
         return self
 
 
-def validate_completed_record(record: RunRecord) -> RunRecord:
+def validate_completed_record(
+    record: RunRecord,
+    *,
+    expected_task_contract_hash: str | None = None,
+) -> RunRecord:
     """Prove every completion invariant and return the revalidated canonical record.
 
     This is the single completion gate. Runtime calls it before it commits the
@@ -860,9 +895,21 @@ def validate_completed_record(record: RunRecord) -> RunRecord:
     re-proven here by revalidating a detached dump, which defeats unsafe
     ``model_copy(update=...)`` tampering. Filesystem-backed artifact proofs cannot
     live in the model validator, so they run here against the revalidated record.
+
+    `expected_task_contract_hash` is mandatory for a revised record and must come
+    from Runtime authority — the hash captured when the run was created — never
+    from the record being validated. An unrevised Gate 1 record does not need it.
     """
 
-    validated = RunRecord.model_validate(record.model_dump(mode="python"))
+    context = (
+        trusted_contract_context(expected_task_contract_hash)
+        if expected_task_contract_hash is not None
+        else None
+    )
+    validated = RunRecord.model_validate(
+        record.model_dump(mode="python"),
+        context=context,
+    )
 
     if validated.state is not RunState.COMPLETED:
         raise CompletionInvariantError("completion requires COMPLETED state")

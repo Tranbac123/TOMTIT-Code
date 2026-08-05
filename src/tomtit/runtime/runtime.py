@@ -60,6 +60,7 @@ from tomtit.runtime.state import (
     repairable_stop_decision_error,
     required_check_coverage_error,
     task_contract_hash,
+    trusted_contract_context,
     validate_completed_record,
 )
 
@@ -180,6 +181,11 @@ class Runtime:
         self._event_log = event_log
         self._report_directory = report_directory
         self._clock = clock
+        # The canonical contract binding for this run's lifetime. It is captured
+        # from the original TaskContract before any record can be copied, and is
+        # never recomputed from self._record, whose task_contract a caller could
+        # replace on a copy.
+        self._canonical_task_contract_hash = task_contract_hash(task_contract)
         self._record = RunRecord(
             run_id=run_id,
             task_contract=task_contract,
@@ -190,6 +196,12 @@ class Runtime:
     @property
     def record(self) -> RunRecord:
         return self._record
+
+    @property
+    def canonical_task_contract_hash(self) -> str:
+        """The immutable contract hash this run is bound to."""
+
+        return self._canonical_task_contract_hash
 
     @property
     def events(self) -> tuple[EvaluationEvent, ...]:
@@ -499,8 +511,16 @@ class Runtime:
             raise RevisionNotAllowed("proposal must belong to the current run")
         if validated.attempt_number != record.attempt_count:
             raise RevisionNotAllowed("proposal must belong to the current attempt")
-        if validated.task_contract_hash != task_contract_hash(contract):
-            raise RevisionNotAllowed("proposal task_contract_hash does not match the contract")
+        if validated.task_contract_hash != self._canonical_task_contract_hash:
+            raise RevisionNotAllowed(
+                "proposal task_contract_hash does not match the canonical contract "
+                "this run is bound to"
+            )
+        if task_contract_hash(contract) != self._canonical_task_contract_hash:
+            raise RevisionNotAllowed(
+                "the record's TaskContract no longer matches the canonical contract "
+                "this run is bound to"
+            )
         if record.attempt_count + 1 > contract.max_attempts:
             raise RevisionNotAllowed(
                 f"attempt budget exhausted: {record.attempt_count} of "
@@ -742,7 +762,10 @@ class Runtime:
             stage_terminal_report(self._report_directory, rendered)
 
             # Final Runtime-controlled proof; nothing fallible follows before commit.
-            validate_completed_record(candidate)
+            validate_completed_record(
+                candidate,
+                expected_task_contract_hash=self._canonical_task_contract_hash,
+            )
         except BaseException:
             _remove_quietly(staged_report)
             raise
@@ -1026,7 +1049,13 @@ class Runtime:
             for field_name in type(self._record).model_fields
         }
         values.update(updates)
-        return RunRecord(**values)
+        # Revised records are only valid against a trusted external binding, and
+        # Runtime supplies its own captured hash rather than anything derived
+        # from the record being built.
+        return RunRecord.model_validate(
+            values,
+            context=trusted_contract_context(self._canonical_task_contract_hash),
+        )
 
     def _replace_record(self, **updates: object) -> None:
         self._record = self._build_record(**updates)

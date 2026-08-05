@@ -86,17 +86,29 @@ class TerminalReport(DomainModel):
     recommended_next_action: str = Field(min_length=1)
 
 
-def build_terminal_report(record: RunRecord, *, generated_at: datetime) -> TerminalReport:
+def build_terminal_report(
+    record: RunRecord,
+    *,
+    generated_at: datetime,
+    expected_task_contract_hash: str | None = None,
+) -> TerminalReport:
     """The sole public trust boundary for building a terminal report.
 
     The input record is reconstructed and re-proven by the shared completion gate
     before any field is read, so tampering applied through
     ``model_copy(update=...)`` cannot reach ``report.v1.json``. Every caller
     outside Runtime's own validated completion preparation must use this function.
+
+    A revised record additionally requires the caller to supply the trusted
+    contract hash the run is bound to; without it the gate refuses to treat the
+    record's own embedded TaskContract as canonical.
     """
 
     return _build_terminal_report_from_validated_record(
-        validate_completed_record(record),
+        validate_completed_record(
+            record,
+            expected_task_contract_hash=expected_task_contract_hash,
+        ),
         generated_at=generated_at,
     )
 

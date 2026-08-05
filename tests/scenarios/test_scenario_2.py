@@ -40,6 +40,7 @@ from tomtit.domain.evaluation import (
     PersistedDecisionEvent,
 )
 from tomtit.fakes import FakeCheckOutcome, FakeCheckRunner, FakeWorker
+from tomtit.reporting import build_terminal_report
 from tomtit.runtime import InMemoryEventLog, TransitionReason
 from tomtit.runtime.runtime import (
     CompletionConditionsNotMet,
@@ -51,6 +52,10 @@ from tomtit.runtime.state import (
     TASK_CONTRACT_HASH_SCHEMA_VERSION,
     AttemptEvidence,
     CriterionEvaluation,
+    canonical_failed_required_check_ids,
+    canonical_repairable_branch_finding,
+    canonical_satisfied_criterion_ids,
+    trusted_contract_context,
     ObservedCheckResult,
     RunRecord,
     attempt_evidence_from_observations,
@@ -799,11 +804,12 @@ def test_completed_record_rejects_a_revision_without_improvement(tmp_path: Path)
     values = record.model_dump(mode="python")
     values["attempt_history"] = [no_improvement.model_dump(mode="python")]
 
+    binding = trusted_hash(record)
     with pytest.raises(ValidationError, match="satisfied_criterion_ids"):
-        RunRecord.model_validate(values)
+        RunRecord.model_validate(values, context=trusted_contract_context(binding))
     corrupted = record.model_copy(update={"attempt_history": (no_improvement,)})
     with pytest.raises(ValidationError, match="satisfied_criterion_ids"):
-        validate_completed_record(corrupted)
+        validate_completed_record(corrupted, expected_task_contract_hash=binding)
 
 
 def test_completed_record_rejects_reused_attempt_evidence(tmp_path: Path) -> None:
@@ -1085,7 +1091,9 @@ def test_completed_record_rejects_foreign_run_attempt_history(tmp_path: Path) ->
     values["attempt_history"] = [foreign_run_archive(record)]
 
     with pytest.raises(ValidationError, match="must belong to the canonical run"):
-        RunRecord.model_validate(values)
+        RunRecord.model_validate(
+            values, context=trusted_contract_context(trusted_hash(record))
+        )
 
 
 def test_validate_completed_record_rejects_foreign_run_attempt_history(
@@ -1097,11 +1105,17 @@ def test_validate_completed_record_rejects_foreign_run_attempt_history(
     foreign = AttemptEvidence.model_validate(foreign_run_archive(record))
     corrupted = record.model_copy(update={"attempt_history": (foreign,)})
 
+    binding = trusted_hash(record)
     with pytest.raises(ValidationError, match="belong to the canonical run"):
-        validate_completed_record(corrupted)
+        validate_completed_record(corrupted, expected_task_contract_hash=binding)
 
     # The genuine archive is still accepted and unchanged.
-    assert validate_completed_record(record).attempt_history[0] == archived
+    assert (
+        validate_completed_record(
+            record, expected_task_contract_hash=binding
+        ).attempt_history[0]
+        == archived
+    )
 
 
 def test_evidence_helper_rejects_foreign_run_observations(tmp_path: Path) -> None:
@@ -1512,22 +1526,46 @@ def with_archive(record: RunRecord, archive: AttemptEvidence) -> RunRecord:
     return record.model_copy(update={"attempt_history": (archive,)})
 
 
-def assert_both_boundaries_reject(record: RunRecord, archive: AttemptEvidence) -> None:
+def trusted_hash(record: RunRecord) -> str:
+    """The contract hash a genuine record's run is bound to.
+
+    Tests pass this as the *trusted* binding, standing in for the value Runtime
+    captured at run creation, so a forgery is judged against the original
+    contract rather than against whatever contract the forgery embeds.
+    """
+
+    return task_contract_hash(record.task_contract)
+
+
+def assert_both_boundaries_reject(
+    record: RunRecord,
+    archive: AttemptEvidence,
+    *,
+    expected_task_contract_hash: str | None = None,
+) -> None:
     """Both the model boundary and the completion gate must refuse the archive."""
 
+    binding = expected_task_contract_hash or trusted_hash(record)
     values = record.model_dump(mode="python")
     values["attempt_history"] = [archive.model_dump(mode="python")]
     with pytest.raises(ValidationError):
-        RunRecord.model_validate(values)
+        RunRecord.model_validate(values, context=trusted_contract_context(binding))
     with pytest.raises(ValidationError):
-        validate_completed_record(with_archive(record, archive))
+        validate_completed_record(
+            with_archive(record, archive),
+            expected_task_contract_hash=binding,
+        )
 
 
 def test_genuine_completed_revised_record_is_accepted(tmp_path: Path) -> None:
     record = completed_revised_record(tmp_path)
 
-    revalidated = RunRecord.model_validate(record.model_dump(mode="python"))
-    gated = validate_completed_record(record)
+    binding = trusted_hash(record)
+    revalidated = RunRecord.model_validate(
+        record.model_dump(mode="python"),
+        context=trusted_contract_context(binding),
+    )
+    gated = validate_completed_record(record, expected_task_contract_hash=binding)
 
     assert revalidated.attempt_history == record.attempt_history
     assert gated.attempt_history == record.attempt_history
@@ -1713,7 +1751,9 @@ def test_revised_completion_requires_the_bounded_gate_2_shape(tmp_path: Path) ->
     ]
 
     with pytest.raises(ValidationError):
-        RunRecord.model_validate(values)
+        RunRecord.model_validate(
+            values, context=trusted_contract_context(trusted_hash(record))
+        )
 
 
 def test_archive_validation_also_applies_before_completion(tmp_path: Path) -> None:
@@ -1732,7 +1772,9 @@ def test_archive_validation_also_applies_before_completion(tmp_path: Path) -> No
     ]
 
     with pytest.raises(ValidationError, match="exactly one repairable finding"):
-        RunRecord.model_validate(values)
+        RunRecord.model_validate(
+            values, context=trusted_contract_context(trusted_hash(revising))
+        )
 
 
 def test_gate_1_unrevised_completion_needs_no_archive(tmp_path: Path) -> None:
@@ -2143,8 +2185,12 @@ def test_forged_satisfied_tuple_naming_an_unsatisfied_criterion_is_rejected(
 def test_genuine_completed_scenario_2_record_remains_accepted(tmp_path: Path) -> None:
     record, archive = genuine_archive(tmp_path)
 
-    revalidated = RunRecord.model_validate(record.model_dump(mode="python"))
-    gated = validate_completed_record(record)
+    binding = trusted_hash(record)
+    revalidated = RunRecord.model_validate(
+        record.model_dump(mode="python"),
+        context=trusted_contract_context(binding),
+    )
+    gated = validate_completed_record(record, expected_task_contract_hash=binding)
 
     assert revalidated.attempt_history[0] == archive
     assert gated.attempt_history[0] == archive
@@ -2173,8 +2219,18 @@ def test_two_criterion_revision_completes_and_revalidates(tmp_path: Path) -> Non
     assert record.attempt_count == 2
     assert record.attempt_history[0].failed_check_ids == (FAILING_CHECK_ID, "lint")
     assert record.attempt_history[0].satisfied_criterion_ids == ()
-    assert RunRecord.model_validate(record.model_dump(mode="python")).state is RunState.COMPLETED
-    assert validate_completed_record(record).state is RunState.COMPLETED
+    binding = trusted_hash(record)
+    assert (
+        RunRecord.model_validate(
+            record.model_dump(mode="python"),
+            context=trusted_contract_context(binding),
+        ).state
+        is RunState.COMPLETED
+    )
+    assert (
+        validate_completed_record(record, expected_task_contract_hash=binding).state
+        is RunState.COMPLETED
+    )
 
 
 def test_duplicate_passing_check_observation_is_rejected(tmp_path: Path) -> None:
@@ -2255,3 +2311,283 @@ def test_archive_controlled_criterion_ordering_is_rejected(tmp_path: Path) -> No
             }
         ),
     )
+
+
+# ---------------------------------------------------------------------------
+# G2-S2-04B — a revised record is bound to the contract its run was created with.
+#
+# The reviewed attack replaced the embedded TaskContract with a reordered but
+# equivalent one and rewrote every order-derived archive field to match. Nothing
+# inside the payload could detect that, so the expected hash must come from
+# Runtime authority instead.
+# ---------------------------------------------------------------------------
+
+
+def reordered_equivalent_contract(contract: TaskContract) -> TaskContract:
+    """The same contract with required checks and criteria reversed."""
+
+    return TaskContract(
+        **{
+            **contract.model_dump(),
+            "required_checks": list(reversed(contract.required_checks)),
+            "acceptance_criteria": list(reversed(contract.acceptance_criteria)),
+        }
+    )
+
+
+def coordinated_contract_swap(record: RunRecord) -> RunRecord:
+    """A copy whose contract is reordered and whose archive is rewritten to match.
+
+    Every order-derived archive field is recomputed against the replacement, so
+    the copy is internally consistent and only an external binding can refuse it.
+    """
+
+    archive = record.attempt_history[0]
+    swapped = reordered_equivalent_contract(record.task_contract)
+    failed = canonical_failed_required_check_ids(
+        swapped.required_checks, archive.observed_checks
+    )
+    satisfied = canonical_satisfied_criterion_ids(
+        swapped.acceptance_criteria, archive.criterion_evaluations
+    )
+    finding = canonical_repairable_branch_finding(
+        contract=swapped,
+        run_id=record.run_id,
+        attempt_number=archive.attempt_number,
+        observed_checks=archive.observed_checks,
+    )
+    assert finding is not None
+    return record.model_copy(
+        update={
+            "task_contract": swapped,
+            "attempt_history": (
+                archive.model_copy(
+                    update={
+                        "failed_check_ids": failed,
+                        "satisfied_criterion_ids": satisfied,
+                        "findings": (finding,),
+                    }
+                ),
+            ),
+        }
+    )
+
+
+def test_revised_model_validation_rejects_a_missing_trusted_binding(
+    tmp_path: Path,
+) -> None:
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+
+    with pytest.raises(ValidationError, match="trusted expected_task_contract_hash"):
+        RunRecord.model_validate(record.model_dump(mode="python"))
+
+
+def test_revised_model_validation_rejects_a_mismatched_trusted_binding(
+    tmp_path: Path,
+) -> None:
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        RunRecord.model_validate(
+            record.model_dump(mode="python"),
+            context=trusted_contract_context("0" * 64),
+        )
+
+
+def test_revised_model_validation_accepts_the_genuine_binding(tmp_path: Path) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    record = runtime.run_scenario_2()
+
+    revalidated = RunRecord.model_validate(
+        record.model_dump(mode="python"),
+        context=trusted_contract_context(runtime.canonical_task_contract_hash),
+    )
+
+    assert revalidated.state is RunState.COMPLETED
+    assert revalidated.attempt_history == record.attempt_history
+
+
+def test_reordered_contract_forgery_is_rejected_against_the_original_binding(
+    tmp_path: Path,
+) -> None:
+    """The exact reviewed attack, judged against the run's original binding."""
+
+    runtime = two_criterion_runtime(tmp_path)
+    record = runtime.run_scenario_2()
+    original_hash = runtime.canonical_task_contract_hash
+    forged = coordinated_contract_swap(record)
+
+    # The forgery is internally consistent: it only fails against the binding.
+    assert task_contract_hash(forged.task_contract) != original_hash
+    assert forged.attempt_history[0].failed_check_ids != (
+        record.attempt_history[0].failed_check_ids
+    )
+
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        RunRecord.model_validate(
+            forged.model_dump(mode="python"),
+            context=trusted_contract_context(original_hash),
+        )
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        validate_completed_record(forged, expected_task_contract_hash=original_hash)
+
+
+def test_completed_validation_rejects_a_missing_binding_for_a_revised_record(
+    tmp_path: Path,
+) -> None:
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+
+    with pytest.raises(ValidationError, match="trusted expected_task_contract_hash"):
+        validate_completed_record(record)
+
+
+def test_completed_validation_rejects_a_mismatched_binding(tmp_path: Path) -> None:
+    record = two_criterion_runtime(tmp_path).run_scenario_2()
+
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        validate_completed_record(record, expected_task_contract_hash="0" * 64)
+
+
+def test_completed_validation_accepts_the_genuine_binding(tmp_path: Path) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    record = runtime.run_scenario_2()
+
+    gated = validate_completed_record(
+        record, expected_task_contract_hash=runtime.canonical_task_contract_hash
+    )
+
+    assert gated.state is RunState.COMPLETED
+
+
+def test_report_boundary_rejects_a_reordered_contract_record(tmp_path: Path) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    record = runtime.run_scenario_2()
+    forged = coordinated_contract_swap(record)
+
+    with pytest.raises(ValidationError, match="trusted expected_task_contract_hash"):
+        build_terminal_report(forged, generated_at=StepClock()())
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        build_terminal_report(
+            forged,
+            generated_at=StepClock()(),
+            expected_task_contract_hash=runtime.canonical_task_contract_hash,
+        )
+
+
+def test_report_boundary_accepts_the_genuine_record_with_its_binding(
+    tmp_path: Path,
+) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    record = runtime.run_scenario_2()
+
+    report = build_terminal_report(
+        record,
+        generated_at=StepClock()(),
+        expected_task_contract_hash=runtime.canonical_task_contract_hash,
+    )
+
+    assert report.outcome is Outcome.COMPLETED
+    assert report.attempts == 2
+
+
+def test_runtime_canonical_binding_is_immutable_across_transitions(
+    tmp_path: Path,
+) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    original_hash = runtime.canonical_task_contract_hash
+    assert original_hash == task_contract_hash(runtime.record.task_contract)
+
+    drive_to_first_failure(runtime)
+    assert runtime.canonical_task_contract_hash == original_hash
+    runtime.commit_revision_decision(runtime.build_revision_proposal())
+    assert runtime.canonical_task_contract_hash == original_hash
+    runtime.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
+    runtime._execute_attempt()
+    runtime._decide_completion()
+
+    assert runtime.canonical_task_contract_hash == original_hash
+    assert runtime.record.state is RunState.COMPLETED
+
+
+def test_persisted_decision_hash_equals_the_runtime_binding(tmp_path: Path) -> None:
+    runtime = two_criterion_runtime(tmp_path)
+    runtime.run_scenario_2()
+
+    decision = runtime._event_log.decisions[0]
+
+    assert decision.task_contract_hash == runtime.canonical_task_contract_hash
+
+
+def test_revision_proposal_is_rejected_when_the_record_contract_was_swapped(
+    tmp_path: Path,
+) -> None:
+    """Runtime refuses a proposal once its own record no longer matches the binding."""
+
+    runtime = two_criterion_runtime(tmp_path)
+    drive_to_first_failure(runtime)
+    draft = runtime.build_revision_proposal()
+    swapped = reordered_equivalent_contract(runtime.record.task_contract)
+    runtime._record = runtime.record.model_copy(update={"task_contract": swapped})
+
+    with pytest.raises(RevisionNotAllowed, match="canonical contract"):
+        runtime.commit_revision_decision(draft)
+
+    assert runtime._event_log.decisions == ()
+    assert runtime.record.attempt_history == ()
+
+
+def test_runtime_completion_cannot_be_bound_to_a_swapped_contract(
+    tmp_path: Path,
+) -> None:
+    """Live-Runtime anti-swap: the supported completion path refuses the swap."""
+
+    runtime = two_criterion_runtime(tmp_path)
+    original_hash = runtime.canonical_task_contract_hash
+    drive_to_first_failure(runtime)
+    runtime.commit_revision_decision(runtime.build_revision_proposal())
+    runtime.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
+    runtime._execute_attempt()
+
+    record_before = runtime.record
+    events_before = runtime.events
+    swapped = reordered_equivalent_contract(runtime.record.task_contract)
+    archive = runtime.record.attempt_history[0]
+    forged_archive = archive.model_copy(
+        update={
+            "failed_check_ids": canonical_failed_required_check_ids(
+                swapped.required_checks, archive.observed_checks
+            ),
+            "satisfied_criterion_ids": canonical_satisfied_criterion_ids(
+                swapped.acceptance_criteria, archive.criterion_evaluations
+            ),
+        }
+    )
+    runtime._record = runtime.record.model_copy(
+        update={"task_contract": swapped, "attempt_history": (forged_archive,)}
+    )
+
+    with pytest.raises(ValidationError, match="does not match the canonical contract"):
+        runtime._decide_completion()
+
+    # The swap never became canonical and produced no terminal result.
+    assert runtime.canonical_task_contract_hash == original_hash
+    assert runtime.record.state is not RunState.COMPLETED
+    assert record_before.state is RunState.CHECKING
+    assert runtime.events == events_before
+    assert event_type_count(runtime, EvaluationEventType.RUN_COMPLETED) == 0
+    assert event_type_count(runtime, EvaluationEventType.REPORT_GENERATED) == 0
+    assert not (tmp_path / "report.v1.json").exists()
+
+
+def test_gate_1_unrevised_record_needs_no_contract_binding(tmp_path: Path) -> None:
+    runtime = make_runtime(
+        tmp_path,
+        runner=FakeCheckRunner(artifact_directory=tmp_path / "artifacts"),
+    )
+
+    record = runtime.run_scenario_1()
+
+    assert record.attempt_history == ()
+    assert RunRecord.model_validate(record.model_dump(mode="python")).attempt_history == ()
+    assert validate_completed_record(record).attempt_history == ()
+    assert build_terminal_report(record, generated_at=StepClock()()).attempts == 1
