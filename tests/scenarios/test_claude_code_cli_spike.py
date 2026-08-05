@@ -157,3 +157,85 @@ def test_offline_scope_violation_flow_produces_evidence_without_success(
     assert manifest["status"] == "SCOPE_VIOLATION"
     assert manifest["success"] is False
     assert manifest["unexpected_changed_paths"] == ["README.md"]
+
+
+def test_offline_spike_evidence_is_not_invalidated_by_a_delayed_descendant(
+    tmp_path: Path,
+) -> None:
+    """G3-SOL-01 at the evidence layer: persisted proof must stay true.
+
+    A worker exits 0 after the expected change but leaves a descendant that
+    would rewrite an unexpected file moments later. The persisted manifest and
+    patch must still describe the workspace accurately after that delay.
+    """
+
+    import os
+    import time
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    readme = workspace / "README.md"
+    readme.write_text("# TOMTIT Gate 3 spike fixture\n", encoding="utf-8")
+    (workspace / "result.txt").write_text("not completed\n", encoding="utf-8")
+
+    pid_file = tmp_path / "descendant.pid"
+    descendant_source = (
+        "import time, pathlib; "
+        "time.sleep(3); "
+        f"pathlib.Path({str(readme)!r}).write_text('late unexpected write')"
+    )
+    script = tmp_path / "fake-claude-delayed"
+    script.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, subprocess, sys\n"
+        f"pathlib.Path('result.txt').write_text({REQUIRED_RESULT_CONTENT!r}, encoding='utf-8')\n"
+        f"child = subprocess.Popen([sys.executable, '-c', {descendant_source!r}])\n"
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n"
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+    script.chmod(0o755)
+
+    before_contents = snapshot_workspace_contents(workspace)
+    request = ClaudeCodeCLIRequest(
+        task_id="gate3-offline-delayed",
+        run_id="run-offline-delayed",
+        attempt=1,
+        goal="Replace result.txt with the required smoke-test string",
+        prompt="Modify only result.txt.",
+        working_directory=workspace,
+        timeout_seconds=30,
+        allowed_changed_paths=("result.txt",),
+    )
+
+    result = ClaudeCodeCLIAdapter().run(request, executable_path=str(script))
+    after_contents = snapshot_workspace_contents(workspace)
+
+    descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+    try:
+        assert result.status is ClaudeCodeCLIStatus.SUCCEEDED
+        assert result.changed_paths == ("result.txt",)
+        assert result.unexpected_changed_paths == ()
+
+        output_dir = tmp_path / "evidence"
+        finalized = write_evidence(
+            result,
+            before_contents=before_contents,
+            after_contents=after_contents,
+            output_dir=output_dir,
+        )
+        manifest = json.loads(Path(finalized.evidence_manifest_path).read_text(encoding="utf-8"))
+        patch_text = Path(finalized.patch_path).read_text(encoding="utf-8")
+
+        # Wait past the descendant's intended write window, then re-verify that
+        # the persisted evidence still matches the real workspace.
+        time.sleep(4)
+        assert readme.read_text(encoding="utf-8") == "# TOMTIT Gate 3 spike fixture\n"
+        assert manifest["changed_paths"] == ["result.txt"]
+        assert manifest["unexpected_changed_paths"] == []
+        assert "README.md" not in patch_text
+    finally:
+        try:
+            os.kill(descendant_pid, 9)
+        except OSError:
+            pass

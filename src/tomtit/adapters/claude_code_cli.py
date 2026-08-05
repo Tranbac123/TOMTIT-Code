@@ -53,6 +53,10 @@ _IGNORED_SUFFIXES = frozenset({".pyc"})
 _MAX_SNAPSHOT_FILE_BYTES = 1_000_000
 _PROCESS_POLL_INTERVAL_SECONDS = 0.02
 _PROCESS_WAIT_GRACE_SECONDS = 5
+_PROCESS_CLEANUP_GRACE_SECONDS = 5.0
+_READER_JOIN_TIMEOUT_SECONDS = 5.0
+
+_EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 
 
 class ClaudeCodeCLIStatus(str, Enum):
@@ -63,6 +67,19 @@ class ClaudeCodeCLIStatus(str, Enum):
     TIMED_OUT = "TIMED_OUT"
     UNAVAILABLE = "UNAVAILABLE"
     SCOPE_VIOLATION = "SCOPE_VIOLATION"
+
+
+class _ProcessGroupCleanup(str, Enum):
+    """Outcome of bounded worker process-group cleanup.
+
+    Only QUIESCENT and CLEANED permit a successful result: both mean no member
+    of the worker group can still mutate the workspace. FAILED means quiescence
+    could not be proven, so every snapshot-derived claim is untrustworthy.
+    """
+
+    QUIESCENT = "PROCESS_GROUP_QUIESCENT"
+    CLEANED = "PROCESS_GROUP_CLEANED"
+    FAILED = "PROCESS_GROUP_CLEANUP_FAILED"
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -151,14 +168,22 @@ class ClaudeCodeCLIResult:
 def discover_claude_executable(explicit_path: str | None = None) -> str | None:
     """Locate the `claude` executable without shell interpolation.
 
-    An explicit absolute path is honored only if it is an executable file.
+    This is the single validation boundary for executables: an explicit
+    override is honored only if it resolves to an executable regular file, so
+    a caller-supplied path can never reach `subprocess.Popen` unchecked. A
+    relative override is resolved explicitly rather than left ambiguous.
     Otherwise discovery uses `shutil.which`, which never invokes a shell.
     """
 
     if explicit_path:
         candidate = Path(explicit_path)
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        if not candidate.is_absolute():
+            candidate = candidate.resolve()
+        try:
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                return str(candidate)
+        except OSError:
+            return None
         return None
     return shutil.which("claude")
 
@@ -394,24 +419,151 @@ class _StreamReader(threading.Thread):
         return self._hasher.hexdigest()
 
 
-def _terminate_process_group(proc: subprocess.Popen) -> None:
+def _signal_process_group(pgid: int, sig: int) -> bool:
+    """Signal an entire worker process group.
+
+    Returns True when the signal was delivered or the group was already gone,
+    and False when the group exists but cannot be safely controlled. Only the
+    group created by this adapter's own `start_new_session=True` child is ever
+    signalled; no unrelated system process is scanned or targeted.
+    """
+
     if os.name != "posix":
-        proc.terminate()
-        return
+        return False
     try:
-        os.killpg(proc.pid, signal.SIGTERM)
+        os.killpg(pgid, sig)
     except ProcessLookupError:
-        pass
+        return True
+    except OSError:
+        return False
+    return True
 
 
-def _kill_process_group(proc: subprocess.Popen) -> None:
+def _process_group_alive(pgid: int) -> bool | None:
+    """Probe group membership: True alive, False absent, None indeterminate.
+
+    A POSIX process group exists exactly while it still has a member, so a
+    signal-0 probe answers "can anything in this invocation still run?".
+    `PermissionError` means the group exists but is not ours to control, which
+    is treated as indeterminate rather than quiescent.
+    """
+
     if os.name != "posix":
-        proc.kill()
-        return
+        return None
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        os.killpg(pgid, 0)
     except ProcessLookupError:
-        pass
+        return False
+    except PermissionError:
+        return None
+    except OSError:
+        return None
+    return True
+
+
+def _await_process_group_absence(pgid: int, *, deadline: float) -> bool | None:
+    """Poll until the group is absent or the bounded monotonic deadline passes."""
+
+    while True:
+        alive = _process_group_alive(pgid)
+        if alive is not True:
+            return alive
+        if time.monotonic() >= deadline:
+            return True
+        time.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
+
+
+def ensure_process_group_quiescent(
+    pgid: int,
+    *,
+    grace_seconds: float | None = None,
+) -> _ProcessGroupCleanup:
+    """Prove the worker group is finished, terminating survivors if necessary.
+
+    Escalates SIGTERM, bounded grace, then SIGKILL, and verifies absence after
+    each step. Every wait is bounded by a monotonic deadline. Anything that
+    cannot be positively verified — an indeterminate probe, a group that
+    outlives SIGKILL, or a platform without process-group verification — fails
+    closed as FAILED rather than being reported as quiescent.
+    """
+
+    if grace_seconds is None:
+        grace_seconds = _PROCESS_CLEANUP_GRACE_SECONDS
+
+    if os.name != "posix":
+        return _ProcessGroupCleanup.FAILED
+    if pgid <= 1:
+        return _ProcessGroupCleanup.FAILED
+    try:
+        if pgid == os.getpgrp():
+            # Never signal TOMTIT's own process group.
+            return _ProcessGroupCleanup.FAILED
+    except OSError:
+        return _ProcessGroupCleanup.FAILED
+
+    alive = _process_group_alive(pgid)
+    if alive is False:
+        return _ProcessGroupCleanup.QUIESCENT
+    if alive is None:
+        return _ProcessGroupCleanup.FAILED
+
+    if not _signal_process_group(pgid, signal.SIGTERM):
+        return _ProcessGroupCleanup.FAILED
+    alive = _await_process_group_absence(pgid, deadline=time.monotonic() + grace_seconds)
+    if alive is False:
+        return _ProcessGroupCleanup.CLEANED
+    if alive is None:
+        return _ProcessGroupCleanup.FAILED
+
+    if not _signal_process_group(pgid, signal.SIGKILL):
+        return _ProcessGroupCleanup.FAILED
+    alive = _await_process_group_absence(pgid, deadline=time.monotonic() + grace_seconds)
+    if alive is False:
+        return _ProcessGroupCleanup.CLEANED
+    return _ProcessGroupCleanup.FAILED
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class _ExecutionOutcome:
+    """Frozen observation of one subprocess, captured after group quiescence.
+
+    Stream evidence is copied out of the reader buffers only once the readers
+    have finished, so no live thread can mutate what the result reports.
+    """
+
+    exit_code: int | None
+    timed_out: bool
+    stdout_bytes: bytes
+    stderr_bytes: bytes
+    stdout_sha256: str
+    stderr_sha256: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    cleanup: _ProcessGroupCleanup
+    readers_alive: bool
+    start_failure: tuple[ClaudeCodeCLIStatus, str, str] | None = None
+
+
+def _start_failure_outcome(
+    status: ClaudeCodeCLIStatus,
+    error_category: str,
+    error_message: str,
+) -> _ExecutionOutcome:
+    """A normalized outcome for a process that never started. Nothing to clean up."""
+
+    return _ExecutionOutcome(
+        exit_code=None,
+        timed_out=False,
+        stdout_bytes=b"",
+        stderr_bytes=b"",
+        stdout_sha256=_EMPTY_SHA256,
+        stderr_sha256=_EMPTY_SHA256,
+        stdout_truncated=False,
+        stderr_truncated=False,
+        cleanup=_ProcessGroupCleanup.QUIESCENT,
+        readers_alive=False,
+        start_failure=(status, error_category, error_message),
+    )
 
 
 def _execute(
@@ -422,18 +574,46 @@ def _execute(
     timeout_seconds: float,
     max_stdout_bytes: int,
     max_stderr_bytes: int,
-) -> tuple[int | None, bool, _StreamReader, _StreamReader]:
-    """Run one bounded subprocess. No shell, no retry, no background survivor."""
+) -> _ExecutionOutcome:
+    """Run one bounded subprocess. No shell, no retry, no background survivor.
 
-    proc = subprocess.Popen(
-        list(argv),
-        cwd=str(cwd),
-        env=dict(env),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,  # POSIX: proc.pid becomes the new process group id.
-    )
+    Returns only after the entire worker process group is proven quiescent (or
+    cleanup is reported as failed) and both readers have finished, so a caller
+    that snapshots the workspace afterwards cannot be raced by a descendant.
+    """
+
+    try:
+        proc = subprocess.Popen(
+            list(argv),
+            cwd=str(cwd),
+            env=dict(env),
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # POSIX: proc.pid becomes the new process group id.
+        )
+    except FileNotFoundError as exc:
+        return _start_failure_outcome(
+            ClaudeCodeCLIStatus.UNAVAILABLE,
+            "EXECUTABLE_UNAVAILABLE",
+            f"executable could not be started: {exc.__class__.__name__} errno={exc.errno}",
+        )
+    except PermissionError as exc:
+        return _start_failure_outcome(
+            ClaudeCodeCLIStatus.UNAVAILABLE,
+            "EXECUTABLE_NOT_EXECUTABLE",
+            f"executable could not be started: {exc.__class__.__name__} errno={exc.errno}",
+        )
+    except OSError as exc:
+        # Deliberately excludes str(exc): the message stays a fixed shape so no
+        # environment-derived text can reach persisted evidence.
+        return _start_failure_outcome(
+            ClaudeCodeCLIStatus.FAILED,
+            "PROCESS_START_FAILED",
+            f"process could not be started: {exc.__class__.__name__} errno={exc.errno}",
+        )
+
+    pgid = proc.pid
     stdout_reader = _StreamReader(proc.stdout, max_stdout_bytes)
     stderr_reader = _StreamReader(proc.stderr, max_stderr_bytes)
     stdout_reader.start()
@@ -450,20 +630,44 @@ def _execute(
         time.sleep(_PROCESS_POLL_INTERVAL_SECONDS)
 
     if timed_out:
-        _terminate_process_group(proc)
+        # Stop the group first, then reap the direct parent so its zombie
+        # cannot keep the group alive for the quiescence probe below.
+        if not _signal_process_group(pgid, signal.SIGTERM):
+            proc.terminate()
         try:
             proc.wait(timeout=_PROCESS_WAIT_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            _kill_process_group(proc)
+            if not _signal_process_group(pgid, signal.SIGKILL):
+                proc.kill()
             try:
                 proc.wait(timeout=_PROCESS_WAIT_GRACE_SECONDS)
             except subprocess.TimeoutExpired:
                 pass
 
-    stdout_reader.join(timeout=_PROCESS_WAIT_GRACE_SECONDS)
-    stderr_reader.join(timeout=_PROCESS_WAIT_GRACE_SECONDS)
+    # Every return path, normal exit included: a descendant that outlives its
+    # parent still belongs to this invocation and must not be able to write
+    # after the result is formed.
+    cleanup = ensure_process_group_quiescent(pgid)
 
-    return proc.returncode, timed_out, stdout_reader, stderr_reader
+    # Only now can the pipes reach EOF, because the group holding their write
+    # ends is gone. Joining before cleanup is what let readers survive.
+    join_timeout = _READER_JOIN_TIMEOUT_SECONDS
+    stdout_reader.join(timeout=join_timeout)
+    stderr_reader.join(timeout=join_timeout)
+    readers_alive = stdout_reader.is_alive() or stderr_reader.is_alive()
+
+    return _ExecutionOutcome(
+        exit_code=proc.returncode,
+        timed_out=timed_out,
+        stdout_bytes=bytes(stdout_reader.buffer),
+        stderr_bytes=bytes(stderr_reader.buffer),
+        stdout_sha256=stdout_reader.digest,
+        stderr_sha256=stderr_reader.digest,
+        stdout_truncated=stdout_reader.truncated,
+        stderr_truncated=stderr_reader.truncated,
+        cleanup=cleanup,
+        readers_alive=readers_alive,
+    )
 
 
 def _determine_status(
@@ -472,8 +676,29 @@ def _determine_status(
     timed_out: bool,
     unexpected_changed_paths: Sequence[str],
     expected_changed: bool,
+    cleanup: _ProcessGroupCleanup = _ProcessGroupCleanup.QUIESCENT,
+    readers_alive: bool = False,
 ) -> tuple[ClaudeCodeCLIStatus, bool, str | None, str | None]:
-    # An unexpected write is a safety-relevant condition, checked first: even a
+    # Fail closed before anything else. If the worker group or its readers
+    # cannot be proven finished, the workspace snapshot behind every check
+    # below may already be stale, so no other classification can be reported
+    # as though it were reliable. The observed paths are still returned on the
+    # result, so this ordering hides no data — only the trust claim changes.
+    if cleanup is _ProcessGroupCleanup.FAILED:
+        return (
+            ClaudeCodeCLIStatus.FAILED,
+            False,
+            "PROCESS_CLEANUP_FAILED",
+            "worker process group could not be proven quiescent before evidence capture",
+        )
+    if readers_alive:
+        return (
+            ClaudeCodeCLIStatus.FAILED,
+            False,
+            "PROCESS_CLEANUP_FAILED",
+            "a worker output reader was still running after process cleanup",
+        )
+    # An unexpected write is a safety-relevant condition, checked next: even a
     # timed-out or nonzero-exit process may already have written outside scope.
     if unexpected_changed_paths:
         return (
@@ -546,15 +771,22 @@ class ClaudeCodeCLIAdapter:
                 error_message="working_directory does not exist or is not a directory",
             )
 
-        resolved_executable = executable_path or discover_claude_executable()
+        # Explicit overrides go through the same validation boundary as
+        # discovery; an unchecked caller path must never reach Popen.
+        resolved_executable = discover_claude_executable(executable_path)
         if resolved_executable is None:
+            explicit = bool(executable_path)
             return self._early_result(
                 request,
                 started_at,
                 start_monotonic,
                 status=ClaudeCodeCLIStatus.UNAVAILABLE,
-                error_category="CLI_NOT_FOUND",
-                error_message="claude executable was not discovered",
+                error_category="EXECUTABLE_UNAVAILABLE" if explicit else "CLI_NOT_FOUND",
+                error_message=(
+                    "explicit executable_path is not an executable regular file"
+                    if explicit
+                    else "claude executable was not discovered"
+                ),
             )
 
         child_env = build_child_environment(request.environment_allowlist)
@@ -564,7 +796,7 @@ class ClaudeCodeCLIAdapter:
         before_hashes = snapshot_workspace_hashes(working_directory)
         argv = self._build_argv(resolved_executable, request)
 
-        exit_code, timed_out, stdout_reader, stderr_reader = _execute(
+        outcome = _execute(
             argv,
             cwd=working_directory,
             env=child_env,
@@ -573,25 +805,38 @@ class ClaudeCodeCLIAdapter:
             max_stderr_bytes=request.max_stderr_bytes,
         )
 
+        # Ordering invariant: `_execute` has already proven the worker group
+        # quiescent and joined both readers, so this snapshot cannot be raced
+        # by a descendant of the invocation it is meant to describe.
         after_hashes = snapshot_workspace_hashes(working_directory)
         changed_paths = _diff_changed_paths(before_hashes, after_hashes)
         allowed = set(request.allowed_changed_paths)
         unexpected_changed_paths = tuple(path for path in changed_paths if path not in allowed)
         expected_changed = bool(set(changed_paths) & allowed)
 
-        status, success, error_category, error_message = _determine_status(
-            exit_code=exit_code,
-            timed_out=timed_out,
-            unexpected_changed_paths=unexpected_changed_paths,
-            expected_changed=expected_changed,
-        )
+        status: ClaudeCodeCLIStatus
+        success: bool
+        error_category: str | None
+        error_message: str | None
+        if outcome.start_failure is not None:
+            status, error_category, error_message = outcome.start_failure
+            success = False
+        else:
+            status, success, error_category, error_message = _determine_status(
+                exit_code=outcome.exit_code,
+                timed_out=outcome.timed_out,
+                unexpected_changed_paths=unexpected_changed_paths,
+                expected_changed=expected_changed,
+                cleanup=outcome.cleanup,
+                readers_alive=outcome.readers_alive,
+            )
 
         stdout_text = _redact_home(
-            _redact(bytes(stdout_reader.buffer).decode("utf-8", errors="replace"), secret_values),
+            _redact(outcome.stdout_bytes.decode("utf-8", errors="replace"), secret_values),
             home_value,
         )
         stderr_text = _redact_home(
-            _redact(bytes(stderr_reader.buffer).decode("utf-8", errors="replace"), secret_values),
+            _redact(outcome.stderr_bytes.decode("utf-8", errors="replace"), secret_values),
             home_value,
         )
         sanitized_argv = tuple(_redact_home(_redact(arg, secret_values), home_value) for arg in argv)
@@ -612,14 +857,14 @@ class ClaudeCodeCLIAdapter:
             started_at=started_at,
             completed_at=completed_at,
             duration_ms=duration_ms,
-            exit_code=exit_code,
-            timed_out=timed_out,
+            exit_code=outcome.exit_code,
+            timed_out=outcome.timed_out,
             stdout_excerpt=stdout_text,
             stderr_excerpt=stderr_text,
-            stdout_sha256=stdout_reader.digest,
-            stderr_sha256=stderr_reader.digest,
-            stdout_truncated=stdout_reader.truncated,
-            stderr_truncated=stderr_reader.truncated,
+            stdout_sha256=outcome.stdout_sha256,
+            stderr_sha256=outcome.stderr_sha256,
+            stdout_truncated=outcome.stdout_truncated,
+            stderr_truncated=outcome.stderr_truncated,
             workspace_before_hash=workspace_hash(before_hashes),
             workspace_after_hash=workspace_hash(after_hashes),
             changed_paths=changed_paths,
@@ -657,7 +902,7 @@ class ClaudeCodeCLIAdapter:
     ) -> ClaudeCodeCLIResult:
         completed_at = datetime.now(timezone.utc)
         duration_ms = int((time.monotonic() - start_monotonic) * 1000)
-        empty_digest = hashlib.sha256(b"").hexdigest()
+        empty_digest = _EMPTY_SHA256
         return ClaudeCodeCLIResult(
             adapter_name=self.name,
             adapter_version=self.version,
