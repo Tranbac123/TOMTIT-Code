@@ -32,15 +32,15 @@ The current durable status is:
 ```text
 GATE_1_SCENARIO_1=APPROVED_AND_FROZEN
 GATE_2_SCENARIO_2=APPROVED_AND_FROZEN
+GATE_3_STATUS=APPROVED_AND_CLOSED
 GATE_3_CORRECTNESS_STATUS=APPROVED_BY_CODEX_SOL
 CLAUDE_CODE_CLI_CAPABILITY=PROVEN_WITHIN_BOUNDED_GATE_3_SCOPE
 GATE_3_EVIDENCE_PERSISTED=true
-GATE_3_MECHANICAL_EVIDENCE_REVIEW=SEE_LATEST_CODEX_TERRA_REPORT
+GATE_3_EVIDENCE_STATUS=MECHANICALLY_VERIFIED
+GATE_3_EVIDENCE_REVIEW_COMMIT=06af3d8530c194e7407dc990b9f8cb8e079a78e9
 DEVELOPMENT_STATUS=STOPPED_FOR_OWNER_MANUAL_DOGFOOD
 NO_NEXT_GATE_AUTHORIZED=true
 ```
-
-Until a final Codex Terra Gate 3 evidence-review report exists, treat Gate 3 mechanical evidence verification as pending. Do not infer mechanical approval from the immutable Gate-evidence file's pre-review `PENDING` field alone.
 
 Gate 3 proves one bounded Claude Code CLI capability and one successful real sample. It does not prove production reliability, multi-task stability, persistent Runtime integration, or general provider support.
 

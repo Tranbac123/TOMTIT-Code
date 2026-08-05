@@ -10,9 +10,9 @@ The repository has completed three bounded build gates:
 
 - **Gate 1 — Scenario 1:** atomic completion or rollback is approved and frozen.
 - **Gate 2 — Scenario 2:** one bounded deterministic revise-then-complete flow is approved and frozen.
-- **Gate 3 — Claude Code CLI capability:** correctness is approved by Codex Sol, the bounded capability is proven, and Gate 3 evidence has been persisted.
+- **Gate 3 — Claude Code CLI capability:** correctness and persisted evidence have been independently reviewed and approved; Gate 3 is mechanically verified and closed. The capability is proven only within the bounded Gate 3 scope.
 
-Gate 3 mechanical evidence status is determined by the latest Codex Terra Gate 3 evidence-review report. Until that report exists, treat the mechanical review as pending; do not infer completion from the immutable evidence file's pre-review `PENDING` marker.
+Development is stopped for Owner-led manual dogfooding. No later implementation gate is authorized.
 
 ```text
 DEVELOPMENT_STATUS=STOPPED_FOR_OWNER_MANUAL_DOGFOOD
