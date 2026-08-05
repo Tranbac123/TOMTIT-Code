@@ -12,6 +12,7 @@ import pytest
 from pydantic import ValidationError
 from tomtit.domain.contracts import (
     AcceptanceCriterion,
+    StopDecision,
     CriterionAssignment,
     RequiredCheck,
     ScopeRule,
@@ -518,7 +519,6 @@ def drive_to_exhausted_budget(tmp_path: Path) -> Runtime:
     runtime.commit_revision_decision(runtime.build_revision_proposal())
     runtime.transition(RunState.IMPLEMENTING, TransitionReason.WORKER_ASSIGNED)
     runtime._execute_attempt()
-    runtime.record_repairable_failure()
     assert runtime.record.attempt_count == 2
     return runtime
 
@@ -776,13 +776,18 @@ def test_objective_improvement_requires_a_previously_failed_check(tmp_path: Path
 
 
 def test_completed_record_rejects_a_revision_without_improvement(tmp_path: Path) -> None:
-    """The canonical validator, not just the driver, enforces improvement."""
+    """A forged satisfied-criteria claim is refused by derivation, not believed.
+
+    Claiming Attempt 1 already satisfied what Attempt 2 satisfied would defeat
+    objective improvement. The archive validator recomputes the tuple from the
+    archived evaluations first, so the forgery is caught before the improvement
+    predicate is even consulted.
+    """
 
     runtime = make_runtime(tmp_path)
     record = runtime.run_scenario_2()
     attempt_1 = record.attempt_history[0]
 
-    # Claim Attempt 1 already satisfied the same criteria Attempt 2 did.
     no_improvement = attempt_1.model_copy(
         update={
             "satisfied_criterion_ids": tuple(
@@ -793,8 +798,11 @@ def test_completed_record_rejects_a_revision_without_improvement(tmp_path: Path)
     values = record.model_dump(mode="python")
     values["attempt_history"] = [no_improvement.model_dump(mode="python")]
 
-    with pytest.raises(ValidationError, match="did not increase satisfied criteria"):
+    with pytest.raises(ValidationError, match="satisfied_criterion_ids"):
         RunRecord.model_validate(values)
+    corrupted = record.model_copy(update={"attempt_history": (no_improvement,)})
+    with pytest.raises(ValidationError, match="satisfied_criterion_ids"):
+        validate_completed_record(corrupted)
 
 
 def test_completed_record_rejects_reused_attempt_evidence(tmp_path: Path) -> None:
@@ -1075,7 +1083,7 @@ def test_completed_record_rejects_foreign_run_attempt_history(tmp_path: Path) ->
     values = record.model_dump(mode="python")
     values["attempt_history"] = [foreign_run_archive(record)]
 
-    with pytest.raises(ValidationError, match="attempt history must belong to the canonical run"):
+    with pytest.raises(ValidationError, match="must belong to the canonical run"):
         RunRecord.model_validate(values)
 
 
@@ -1182,7 +1190,7 @@ def test_revision_is_rejected_without_a_recorded_repairable_branch(
         runtime.run_scenario_1()
     draft = runtime.build_revision_proposal()
 
-    with pytest.raises(RevisionNotAllowed, match="repairable StopDecision"):
+    with pytest.raises(RevisionNotAllowed, match="requires a StopDecision"):
         runtime.commit_revision_decision(draft)
 
     assert_no_revision_committed(runtime)
@@ -1383,3 +1391,400 @@ def test_contract_hash_is_stable_and_semantically_sensitive() -> None:
     assert task_contract_hash(task_contract()) == task_contract_hash(task_contract())
     changed = task_contract().model_copy(update={"goal": "a different goal"})
     assert task_contract_hash(changed) != task_contract_hash(task_contract())
+
+
+# ---------------------------------------------------------------------------
+# G2-S2-04A — the repairable branch writer honours the canonical attempt budget.
+# ---------------------------------------------------------------------------
+
+
+def test_canonical_allowed_actions_drop_revise_at_the_budget_limit(
+    tmp_path: Path,
+) -> None:
+    runtime = drive_to_exhausted_budget(tmp_path)
+
+    metadata = runtime._canonical_revision_metadata()
+
+    assert metadata.allowed_actions == (NextAction.FAIL,)
+    assert NextAction.REVISE not in metadata.allowed_actions
+
+
+def test_record_repairable_failure_is_refused_at_the_exhausted_budget(
+    tmp_path: Path,
+) -> None:
+    """The exact reviewed defect: a REVISE branch written when policy allows FAIL."""
+
+    runtime = drive_to_exhausted_budget(tmp_path)
+    record_before = runtime.record
+    events_before = runtime.events
+    decisions_before = runtime._event_log.decisions
+
+    with pytest.raises(RevisionNotAllowed, match="canonical allowed actions"):
+        runtime.record_repairable_failure()
+
+    assert runtime.record is record_before
+    assert runtime.record == record_before
+    assert runtime.record.stop_decision is None
+    assert runtime.record.unresolved_findings == ()
+    assert runtime.record.attempt_count == 2
+    assert len(runtime.record.attempt_history) == 1
+    assert runtime.events == events_before
+    assert runtime._event_log.decisions == decisions_before
+    assert len(runtime._event_log.decisions) == 1
+    assert event_type_count(runtime, EvaluationEventType.REVISION_REQUESTED) == 1
+
+
+def test_no_revise_stop_decision_can_exist_at_the_exhausted_budget(
+    tmp_path: Path,
+) -> None:
+    runtime = drive_to_exhausted_budget(tmp_path)
+
+    with pytest.raises(RevisionNotAllowed):
+        runtime.record_repairable_failure()
+
+    assert runtime.record.stop_decision is None
+    assert runtime.record.unresolved_findings == ()
+    # A forged REVISE proposal is still refused at the commit boundary too.
+    with pytest.raises(RevisionNotAllowed, match="attempt budget exhausted"):
+        runtime.commit_revision_decision(forged_revise_draft(runtime))
+    assert runtime.record.attempt_count == 2
+    assert len(runtime._event_log.decisions) == 1
+
+
+def test_attempt_1_repairable_recording_still_succeeds(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+    with pytest.raises(CompletionConditionsNotMet):
+        runtime.run_scenario_1()
+
+    record = runtime.record_repairable_failure()
+
+    assert record.stop_decision is not None
+    assert record.stop_decision.next_action is NextAction.REVISE
+    assert len(record.unresolved_findings) == 1
+    assert record.attempt_count == 1
+    assert record.state is RunState.CHECKING
+
+
+def test_repeated_valid_repairable_recording_is_value_idempotent(
+    tmp_path: Path,
+) -> None:
+    runtime = make_runtime(tmp_path)
+    with pytest.raises(CompletionConditionsNotMet):
+        runtime.run_scenario_1()
+
+    first = runtime.record_repairable_failure()
+    events_after_first = runtime.events
+    second = runtime.record_repairable_failure()
+
+    assert second.stop_decision == first.stop_decision
+    assert second.unresolved_findings == first.unresolved_findings
+    assert len(second.unresolved_findings) == 1
+    assert runtime.events == events_after_first
+    assert runtime._event_log.decisions == ()
+    assert second.attempt_count == 1
+
+
+def test_happy_path_is_unchanged_by_the_budget_gate(tmp_path: Path) -> None:
+    runtime = make_runtime(tmp_path)
+
+    record = runtime.run_scenario_2()
+
+    assert record.state is RunState.COMPLETED
+    assert record.attempt_count == 2
+    assert len(runtime._event_log.decisions) == 1
+    assert event_type_count(runtime, EvaluationEventType.REVISION_REQUESTED) == 1
+    assert (tmp_path / "report.v1.json").is_file()
+
+
+# ---------------------------------------------------------------------------
+# G2-S2-04B — a completed archive is re-proven, never believed.
+# ---------------------------------------------------------------------------
+
+
+def completed_revised_record(tmp_path: Path) -> RunRecord:
+    return make_runtime(tmp_path).run_scenario_2()
+
+
+def with_archive(record: RunRecord, archive: AttemptEvidence) -> RunRecord:
+    """An unsafely copied completed record carrying a tampered archive."""
+
+    return record.model_copy(update={"attempt_history": (archive,)})
+
+
+def assert_both_boundaries_reject(record: RunRecord, archive: AttemptEvidence) -> None:
+    """Both the model boundary and the completion gate must refuse the archive."""
+
+    values = record.model_dump(mode="python")
+    values["attempt_history"] = [archive.model_dump(mode="python")]
+    with pytest.raises(ValidationError):
+        RunRecord.model_validate(values)
+    with pytest.raises(ValidationError):
+        validate_completed_record(with_archive(record, archive))
+
+
+def test_genuine_completed_revised_record_is_accepted(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+
+    revalidated = RunRecord.model_validate(record.model_dump(mode="python"))
+    gated = validate_completed_record(record)
+
+    assert revalidated.attempt_history == record.attempt_history
+    assert gated.attempt_history == record.attempt_history
+    assert gated.state is RunState.COMPLETED
+
+
+@pytest.mark.parametrize(
+    "decision_update",
+    (
+        None,
+        {"next_action": NextAction.FAIL},
+        {"repairable": False},
+        {"owner_input_required": True},
+    ),
+)
+def test_archived_stop_decision_is_reproven(
+    tmp_path: Path,
+    decision_update: dict[str, object] | None,
+) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    assert archive.stop_decision is not None
+    tampered_decision = (
+        None
+        if decision_update is None
+        else archive.stop_decision.model_copy(update=decision_update)
+    )
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"stop_decision": tampered_decision})
+    )
+
+
+@pytest.mark.parametrize(
+    "terminal_update",
+    (
+        {"outcome": Outcome.FAILED},
+        {"stop_reason": StopReason.VERIFICATION_FAILED},
+    ),
+)
+def test_archived_stop_decision_rejects_terminal_fields(
+    tmp_path: Path,
+    terminal_update: dict[str, object],
+) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    assert archive.stop_decision is not None
+    # StopDecision itself forbids a bare outcome without a matching action, so
+    # build the contradictory pair the archive must refuse.
+    forged = StopDecision(
+        outcome=terminal_update.get("outcome", Outcome.FAILED),
+        stop_reason=terminal_update.get("stop_reason", StopReason.VERIFICATION_FAILED),
+        repairable=True,
+        owner_input_required=False,
+        next_action=NextAction.FAIL,
+    )
+
+    assert_both_boundaries_reject(record, archive.model_copy(update={"stop_decision": forged}))
+
+
+@pytest.mark.parametrize("finding_count", (0, 2))
+def test_archived_finding_count_is_reproven(
+    tmp_path: Path,
+    finding_count: int,
+) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    canonical = archive.findings[0]
+    findings = () if finding_count == 0 else (canonical, canonical)
+
+    assert_both_boundaries_reject(record, archive.model_copy(update={"findings": findings}))
+
+
+@pytest.mark.parametrize(
+    "finding_update",
+    (
+        {"finding_id": "finding:forged"},
+        {"finding_id": "finding:foreign-run:1:unit-tests"},
+        {"finding_id": "finding:run-s2:2:unit-tests"},
+        {"evidence_refs": ("check:run-s2:2:unit-tests",)},
+        {"severity": FindingSeverity.WARNING},
+        {"acceptance_criterion_id": None},
+        {"fingerprint": "deterministic_check_failure:other-check"},
+    ),
+)
+def test_archived_finding_is_reproven_field_by_field(
+    tmp_path: Path,
+    finding_update: dict[str, object],
+) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    tampered = archive.findings[0].model_copy(update=finding_update)
+
+    assert_both_boundaries_reject(record, archive.model_copy(update={"findings": (tampered,)}))
+
+
+def test_archived_failed_check_flipped_to_passing_is_rejected(tmp_path: Path) -> None:
+    """The reviewed reproduction: exit_code changed to 0 while still named failed."""
+
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    passing = tuple(
+        item.model_copy(update={"exit_code": 0}) for item in archive.observed_checks
+    )
+
+    assert_both_boundaries_reject(record, archive.model_copy(update={"observed_checks": passing}))
+
+
+def test_forged_failed_check_ids_are_rejected(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"failed_check_ids": ("unit-tests", "unit-tests")})
+    )
+
+
+def test_missing_genuinely_failed_check_id_is_rejected(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+
+    assert_both_boundaries_reject(record, archive.model_copy(update={"failed_check_ids": ()}))
+
+
+def test_forged_satisfied_criterion_ids_are_rejected(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+
+    assert_both_boundaries_reject(
+        record, archive.model_copy(update={"satisfied_criterion_ids": ("tests-pass",)})
+    )
+
+
+def test_archive_from_another_run_is_rejected_at_both_boundaries(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    foreign = archive.model_copy(
+        update={
+            "run_id": "foreign-run",
+            "observed_checks": tuple(
+                item.model_copy(update={"run_id": "foreign-run"})
+                for item in archive.observed_checks
+            ),
+            "observed_patch": (
+                archive.observed_patch.model_copy(update={"run_id": "foreign-run"})
+                if archive.observed_patch is not None
+                else None
+            ),
+        }
+    )
+
+    assert_both_boundaries_reject(record, foreign)
+
+
+def test_archived_attempt_must_precede_the_current_attempt(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    later = archive.model_copy(
+        update={
+            "attempt_number": 2,
+            "observed_checks": tuple(
+                item.model_copy(update={"attempt_number": 2})
+                for item in archive.observed_checks
+            ),
+            "observed_patch": (
+                archive.observed_patch.model_copy(update={"attempt_number": 2})
+                if archive.observed_patch is not None
+                else None
+            ),
+        }
+    )
+
+    assert_both_boundaries_reject(record, later)
+
+
+def test_revised_completion_requires_the_bounded_gate_2_shape(tmp_path: Path) -> None:
+    record = completed_revised_record(tmp_path)
+    archive = record.attempt_history[0]
+    values = record.model_dump(mode="python")
+    values["attempt_history"] = [
+        archive.model_dump(mode="python"),
+        archive.model_dump(mode="python"),
+    ]
+
+    with pytest.raises(ValidationError):
+        RunRecord.model_validate(values)
+
+
+def test_archive_validation_also_applies_before_completion(tmp_path: Path) -> None:
+    """The archive is re-proven at REVISING too, not only at COMPLETED."""
+
+    runtime = make_runtime(tmp_path)
+    drive_to_first_failure(runtime)
+    runtime.commit_revision_decision(runtime.build_revision_proposal())
+    revising = runtime.record
+    assert revising.state is RunState.REVISING
+
+    archive = revising.attempt_history[0]
+    values = revising.model_dump(mode="python")
+    values["attempt_history"] = [
+        archive.model_copy(update={"findings": ()}).model_dump(mode="python")
+    ]
+
+    with pytest.raises(ValidationError, match="exactly one repairable finding"):
+        RunRecord.model_validate(values)
+
+
+def test_gate_1_unrevised_completion_needs_no_archive(tmp_path: Path) -> None:
+    runtime = make_runtime(
+        tmp_path,
+        runner=FakeCheckRunner(artifact_directory=tmp_path / "artifacts"),
+    )
+
+    record = runtime.run_scenario_1()
+
+    assert record.attempt_history == ()
+    assert record.attempt_count == 1
+    assert RunRecord.model_validate(record.model_dump(mode="python")).attempt_history == ()
+    assert validate_completed_record(record).attempt_history == ()
+
+
+def test_archive_validation_failure_rolls_the_whole_revision_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A rejected archive must leave no decision, no transition and no archive."""
+
+    runtime = make_runtime(tmp_path)
+    drive_to_first_failure(runtime)
+    stop_decision_before = runtime.record.stop_decision
+    findings_before = runtime.record.unresolved_findings
+    real_build = runtime._build_record
+
+    def build_with_broken_archive(**updates: object) -> RunRecord:
+        history = updates.get("attempt_history")
+        if isinstance(history, tuple) and history:
+            broken = history[-1].model_copy(update={"findings": ()})
+            updates = {**updates, "attempt_history": (*history[:-1], broken)}
+        return real_build(**updates)
+
+    monkeypatch.setattr(runtime, "_build_record", build_with_broken_archive)
+
+    with pytest.raises(ValidationError, match="exactly one repairable finding"):
+        runtime.commit_revision_decision(runtime.build_revision_proposal())
+
+    assert runtime.record.state is RunState.CHECKING
+    assert runtime.record.attempt_count == 1
+    assert runtime.record.attempt_history == ()
+    assert runtime._event_log.decisions == ()
+    assert event_type_count(runtime, EvaluationEventType.REVISION_REQUESTED) == 0
+    assert runtime.record.stop_decision == stop_decision_before
+    assert runtime.record.unresolved_findings == findings_before
+
+    monkeypatch.undo()
+    decision = runtime.commit_revision_decision(runtime.build_revision_proposal())
+
+    assert decision.append_sequence == 1
+    assert len(runtime._event_log.decisions) == 1
+    assert len(runtime.record.attempt_history) == 1
+    assert event_type_count(runtime, EvaluationEventType.REVISION_REQUESTED) == 1
+    assert runtime.record.attempt_count == 2

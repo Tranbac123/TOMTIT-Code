@@ -272,6 +272,65 @@ def first_failed_required_check(
     return None
 
 
+def acceptance_criterion_for_check(
+    contract: TaskContract,
+    check_id: str,
+) -> str | None:
+    """The first acceptance criterion that requires `check_id`, in contract order."""
+
+    return next(
+        (
+            criterion.id
+            for criterion in contract.acceptance_criteria
+            if check_id in criterion.required_check_ids
+        ),
+        None,
+    )
+
+
+def canonical_repairable_branch_finding(
+    *,
+    contract: TaskContract,
+    run_id: str,
+    attempt_number: int,
+    observed_checks: tuple[ObservedCheckResult, ...],
+) -> Finding | None:
+    """Re-derive the one repairable finding a failed attempt must carry.
+
+    This is the single derivation used both when Runtime records the branch and
+    when a trust boundary re-proves an archived branch, so an archived finding is
+    never trusted merely because Runtime once built one.
+    """
+
+    selected = first_failed_required_check(contract.required_checks, observed_checks)
+    if selected is None:
+        return None
+    check, observed = selected
+    return repairable_check_finding(
+        run_id=run_id,
+        attempt_number=attempt_number,
+        check=check,
+        observed=observed,
+        acceptance_criterion_id=acceptance_criterion_for_check(contract, check.id),
+    )
+
+
+def repairable_stop_decision_error(decision: StopDecision | None) -> str | None:
+    """Return why a StopDecision is not the policy-required repairable branch."""
+
+    if decision is None:
+        return "a repairable revision branch requires a StopDecision"
+    if decision.next_action is not NextAction.REVISE:
+        return "the repairable branch requires StopDecision.next_action=revise"
+    if not decision.repairable:
+        return "the repairable branch requires StopDecision.repairable=true"
+    if decision.owner_input_required:
+        return "the repairable branch requires owner_input_required=false"
+    if decision.outcome is not None or decision.stop_reason is not None:
+        return "a repairable branch StopDecision must not set outcome or stop reason"
+    return None
+
+
 def objective_improvement_error(
     previous: AttemptEvidence,
     current: AttemptEvidence,
@@ -303,6 +362,84 @@ def objective_improvement_error(
             f"attempt {current.attempt_number} did not increase satisfied criteria "
             f"({len(previous.satisfied_criterion_ids)} -> "
             f"{len(current.satisfied_criterion_ids)})"
+        )
+    return None
+
+
+def revision_attempt_archive_error(
+    *,
+    run_id: str,
+    current_attempt: int,
+    contract: TaskContract,
+    archive: AttemptEvidence,
+) -> str | None:
+    """Re-prove one archived revision attempt from canonical truth, or explain why not.
+
+    An archive is canonical run state, so a copied record must not be believed
+    just because its identifiers look plausible. Every derived tuple is
+    recomputed from the archived observations and the canonical contract and
+    compared for exact equality, and the branch result is re-derived rather than
+    trusted. This is the single definition used by every validation boundary.
+    """
+
+    if archive.run_id != run_id:
+        return "archived attempt must belong to the canonical run"
+    if archive.attempt_number >= current_attempt:
+        return "an archived attempt must precede the current attempt"
+
+    for item in archive.observed_checks:
+        if item.run_id != run_id or item.attempt_number != archive.attempt_number:
+            return "archived observations must belong to the archived run and attempt"
+    if archive.observed_patch is not None and (
+        archive.observed_patch.run_id != run_id
+        or archive.observed_patch.attempt_number != archive.attempt_number
+    ):
+        return "archived patch must belong to the archived run and attempt"
+
+    # Recompute every derived tuple; exact equality, never subset.
+    derived = attempt_evidence_from_observations(
+        run_id=run_id,
+        attempt_number=archive.attempt_number,
+        required_checks=contract.required_checks,
+        observed_checks=archive.observed_checks,
+        observed_patch=archive.observed_patch,
+        criterion_evaluations=archive.criterion_evaluations,
+    )
+    if archive.failed_check_ids != derived.failed_check_ids:
+        return (
+            f"archived failed_check_ids {list(archive.failed_check_ids)} do not match "
+            f"the checks derived from archived evidence {list(derived.failed_check_ids)}"
+        )
+    if archive.satisfied_criterion_ids != derived.satisfied_criterion_ids:
+        return (
+            f"archived satisfied_criterion_ids {list(archive.satisfied_criterion_ids)} "
+            f"do not match the criteria derived from archived evaluations "
+            f"{list(derived.satisfied_criterion_ids)}"
+        )
+    if not derived.failed_check_ids:
+        return "a revision source attempt must have at least one failed required check"
+
+    decision_error = repairable_stop_decision_error(archive.stop_decision)
+    if decision_error is not None:
+        return f"archived attempt {archive.attempt_number}: {decision_error}"
+
+    expected_finding = canonical_repairable_branch_finding(
+        contract=contract,
+        run_id=run_id,
+        attempt_number=archive.attempt_number,
+        observed_checks=archive.observed_checks,
+    )
+    if expected_finding is None:  # pragma: no cover - guarded by derived.failed_check_ids
+        return "a revision source attempt must have at least one failed required check"
+    if len(archive.findings) != 1:
+        return (
+            f"an archived revision attempt requires exactly one repairable finding, "
+            f"found {len(archive.findings)}"
+        )
+    if archive.findings[0] != expected_finding:
+        return (
+            "the archived finding does not match the canonical repairable finding for "
+            f"run {run_id} attempt {archive.attempt_number}"
         )
     return None
 
@@ -486,9 +623,19 @@ class RunRecord(DomainModel):
             raise ValueError("attempt history must be unique and strictly increasing")
         if archived_attempts and archived_attempts[-1] >= max(self.attempt_count, 1):
             raise ValueError("attempt history cannot contain the current or a later attempt")
-        # Archived evidence is canonical run state; it must belong to this run.
-        if any(item.run_id != self.run_id for item in self.attempt_history):
-            raise ValueError("attempt history must belong to the canonical run")
+        # Archived evidence is canonical run state, so every archived revision
+        # attempt is re-proven here rather than trusted. This runs at every
+        # RunRecord construction and reconstruction, which is what makes copied
+        # records fail at the completion and terminal-report boundaries too.
+        for archive in self.attempt_history:
+            archive_error = revision_attempt_archive_error(
+                run_id=self.run_id,
+                current_attempt=self.attempt_count,
+                contract=self.task_contract,
+                archive=archive,
+            )
+            if archive_error is not None:
+                raise ValueError(archive_error)
 
         if self.state is RunState.COMPLETED:
             if self.attempt_count < 1:
@@ -543,6 +690,17 @@ class RunRecord(DomainModel):
             ):
                 raise ValueError("COMPLETED requires all criteria satisfied")
             if self.attempt_history:
+                # Gate 2 supports exactly one revision. This bounded shape is
+                # asserted only for a revised completed record; an unrevised run
+                # keeps an empty history and is unaffected.
+                if len(self.attempt_history) != 1:
+                    raise ValueError(
+                        "a revised completed run supports exactly one archived attempt"
+                    )
+                if self.attempt_history[0].attempt_number != 1 or self.attempt_count != 2:
+                    raise ValueError(
+                        "a revised completed run must archive Attempt 1 and complete Attempt 2"
+                    )
                 # A revised run may only complete on proven objective improvement.
                 # Runs with no earlier attempt are unaffected by this rule.
                 current_evidence = attempt_evidence_from_observations(

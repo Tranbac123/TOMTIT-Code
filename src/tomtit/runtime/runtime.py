@@ -54,10 +54,10 @@ from tomtit.runtime.state import (
     TransitionReason,
     artifact_file_error,
     attempt_evidence_from_observations,
-    first_failed_required_check,
+    canonical_repairable_branch_finding,
     objective_improvement_error,
-    repairable_check_finding,
     patch_evidence_error,
+    repairable_stop_decision_error,
     required_check_coverage_error,
     task_contract_hash,
     validate_completed_record,
@@ -358,6 +358,24 @@ class Runtime:
             raise RevisionNotAllowed(
                 "a repairable failure requires at least one failed required check"
             )
+        # Canonical attempt-budget policy is decided here, before anything is
+        # written. Recording REVISE while policy allows only FAIL would leave a
+        # contradictory canonical branch result even though no Attempt 3 follows.
+        contract = record.task_contract
+        metadata = self._canonical_revision_metadata()
+        if NextAction.REVISE not in metadata.allowed_actions:
+            raise RevisionNotAllowed(
+                f"canonical allowed actions are "
+                f"{[action.value for action in metadata.allowed_actions]}; "
+                "a repairable REVISE branch cannot be recorded"
+            )
+        if record.attempt_count >= contract.max_attempts:
+            raise RevisionNotAllowed(
+                f"attempt budget exhausted: {record.attempt_count} of "
+                f"{contract.max_attempts} attempts used"
+            )
+        if record.attempt_count >= contract.hard_max_attempts:
+            raise RevisionNotAllowed("hard attempt limit reached")
         self._replace_record(
             stop_decision=StopDecision(
                 outcome=None,
@@ -371,30 +389,18 @@ class Runtime:
         return self._record
 
     def _canonical_repairable_finding(self) -> Finding | None:
-        """Derive the one repairable finding for the first failed required check."""
+        """Derive the one repairable finding for the first failed required check.
+
+        The same derivation re-proves an archived finding at the trust boundary,
+        so Runtime and validation can never disagree about what it should be.
+        """
 
         record = self._record
-        selected = first_failed_required_check(
-            record.task_contract.required_checks,
-            record.observed_checks,
-        )
-        if selected is None:
-            return None
-        check, observed = selected
-        criterion_id = next(
-            (
-                criterion.id
-                for criterion in record.task_contract.acceptance_criteria
-                if check.id in criterion.required_check_ids
-            ),
-            None,
-        )
-        return repairable_check_finding(
+        return canonical_repairable_branch_finding(
+            contract=record.task_contract,
             run_id=record.run_id,
             attempt_number=record.attempt_count,
-            check=check,
-            observed=observed,
-            acceptance_criterion_id=criterion_id,
+            observed_checks=record.observed_checks,
         )
 
     def _canonical_revision_metadata(self) -> _RevisionMetadata:
@@ -407,7 +413,9 @@ class Runtime:
 
         record = self._record
         contract = record.task_contract
-        budget_remains = record.attempt_count + 1 <= contract.max_attempts
+        budget_remains = record.attempt_count + 1 <= min(
+            contract.max_attempts, contract.hard_max_attempts
+        )
         allowed_actions = (
             (NextAction.REVISE, NextAction.FAIL) if budget_remains else (NextAction.FAIL,)
         )
@@ -522,18 +530,12 @@ class Runtime:
                 "proposal budget_snapshot does not match the canonical budget"
             )
 
-        # The policy-required repairable branch result must already exist.
+        # The policy-required repairable branch result must already exist. The
+        # same predicate re-proves an archived branch at the trust boundary.
         stop_decision = record.stop_decision
-        if stop_decision is None:
-            raise RevisionNotAllowed("REVISE requires a recorded repairable StopDecision")
-        if stop_decision.next_action is not NextAction.REVISE:
-            raise RevisionNotAllowed("REVISE requires StopDecision.next_action=revise")
-        if not stop_decision.repairable:
-            raise RevisionNotAllowed("REVISE requires StopDecision.repairable=true")
-        if stop_decision.owner_input_required:
-            raise RevisionNotAllowed("REVISE requires owner_input_required=false")
-        if stop_decision.outcome is not None or stop_decision.stop_reason is not None:
-            raise RevisionNotAllowed("a REVISE StopDecision must not set outcome or stop reason")
+        decision_error = repairable_stop_decision_error(stop_decision)
+        if decision_error is not None:
+            raise RevisionNotAllowed(decision_error)
 
         expected_finding = self._canonical_repairable_finding()
         if expected_finding is None:
