@@ -1,12 +1,196 @@
-.DS_Store
+# -----------------------------------------------------------------------------
+# TOMTIT Coordinator
+# Python + Node.js + Docker + local AI-agent/runtime artifacts
+# -----------------------------------------------------------------------------
+
+# Secrets and local environment files
+.env
+.env.*
+!.env.example
+!.env.template
+!.env.sample
+.envrc
+.direnv/
+*.secret
+*.secrets
+credentials.local.json
+token.local.json
+service-account*.json
+id_rsa
+id_rsa.*
+id_ed25519
+id_ed25519.*
+.netrc
+.pypirc
+.npmrc.local
+*.pem
+*.key
+*.p12
+*.pfx
+*.crt
+*.cer
+secrets/
+
+# Python bytecode and caches
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
+*$py.class
 .pytest_cache/
-.coverage
-htmlcov/
 .mypy_cache/
 .ruff_cache/
+.pyre/
+.pytype/
+.hypothesis/
+
+# Python virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python build and packaging artifacts
 build/
 dist/
 *.egg-info/
+.eggs/
+wheels/
+pip-wheel-metadata/
+MANIFEST
+
+# Test, coverage, and profiling artifacts
+.coverage
+.coverage.*
+coverage.xml
+coverage.json
+htmlcov/
+.pytest_cache/
+*.cover
+*.prof
+.prof/
+
+# Type-checking and lint reports
+mypy-report/
+ruff-report/
+bandit-report.*
+safety-report.*
+
+# Jupyter / notebooks
+.ipynb_checkpoints/
+.jupyter/
+
+# Node.js / frontend
+node_modules/
+web/node_modules/
+.npm/
+.pnpm-store/
+.yarn/
+.yarn-cache/
+*.tsbuildinfo
+.nyc_output/
+coverage/
+web/coverage/
+web/dist/
+web/.vite/
+web/.cache/
+.vite/
+
+# Logs and process files
+logs/
+*.log
+*.log.*
+*.pid
+*.pid.lock
+*.seed
+*.out
+
+# Local databases and runtime state
+*.db
+*.db-journal
+*.sqlite
+*.sqlite3
+*.sqlite-shm
+*.sqlite-wal
+
+# TOMTIT runtime state: deny by default
+/.tomtit/*
+
+# Explicit repository-governed TOMTIT allowlist
+!/.tomtit/CHANGE_POLICY.md
+!/.tomtit/*.example.*
+!/.tomtit/*.template.*
+
+# Temporary worker / adapter output
+.tmp/
+tmp/
+temp/
+.cache/
+artifacts/local/
+workspaces/
+
+# Claude Code / local AI tool state
+/.claude/settings.local.json
+/.claude/cache/
+/.claude/logs/
+/.claude/projects/
+/.claude/shell-snapshots/
+/.claude/session-env/
+/.claude/history.jsonl
+
+/.cursor/cache/
+/.cursor/index/
+
+# Docker local overrides and generated state
+docker-compose.override.yml
+docker-compose.local.yml
+.docker/
+
+# Local certificates and reverse-proxy runtime files
+nginx/ssl/
+certs/
+
+# IDEs and editors
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.Spotlight-V100
+.Trashes
+
+# Windows
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+
+# Linux desktop / filesystem metadata
+.directory
+.nfs*
+
+# Local backups and archives
+*.bak
+*.backup
+*.orig
+*.rej
+*.tmp
+*.temp
+*.tar
+*.tar.gz
+*.tgz
+*.zip
+
+# Generated patches and handoff files are local unless explicitly authorized
+*.patch
+*.diff
+
+# Gate 3 patch evidence is repository-governed audit evidence.
+!evidence/gate3/*.patch
+
+# Keep tracked governance and audit documents by default.
+# Do not add broad ignores such as *.md, reports/, evidence/, or docs/.
