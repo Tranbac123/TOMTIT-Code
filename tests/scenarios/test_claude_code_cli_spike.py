@@ -239,3 +239,78 @@ def test_offline_spike_evidence_is_not_invalidated_by_a_delayed_descendant(
             os.kill(descendant_pid, 9)
         except OSError:
             pass
+
+
+def test_persisted_evidence_patch_is_valid_and_applies_cleanly(tmp_path: Path) -> None:
+    """GATE_3_PATCH_RENDERING regression at the evidence-persistence layer.
+
+    The originally shipped `CLAUDE_CODE_CLI_SPIKE_DIFF.patch` was produced by
+    exactly this `write_evidence` call and failed `git apply --check`. This
+    rehearses the same real-spike shape end to end and validates the
+    persisted patch through a real Git parser in a throwaway repository, not
+    only by string inspection.
+    """
+
+    import subprocess
+
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# TOMTIT Gate 3 spike fixture\n", encoding="utf-8")
+    (workspace / "result.txt").write_text("not completed\n", encoding="utf-8")
+
+    script = write_fake_claude(tmp_path)
+    before_contents = snapshot_workspace_contents(workspace)
+
+    request = ClaudeCodeCLIRequest(
+        task_id="gate3-patch-validity",
+        run_id="run-patch-validity",
+        attempt=1,
+        goal="Replace result.txt with the required smoke-test string",
+        prompt="Modify only result.txt.",
+        working_directory=workspace,
+        timeout_seconds=5,
+        allowed_changed_paths=("result.txt",),
+    )
+    result = ClaudeCodeCLIAdapter().run(request, executable_path=str(script))
+    after_contents = snapshot_workspace_contents(workspace)
+
+    output_dir = tmp_path / "evidence"
+    finalized = write_evidence(
+        result,
+        before_contents=before_contents,
+        after_contents=after_contents,
+        output_dir=output_dir,
+    )
+    patch_path = Path(finalized.patch_path)
+
+    validation_repo = tmp_path / "validation-repo"
+    validation_repo.mkdir()
+    (validation_repo / "result.txt").write_text("not completed\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q"], cwd=str(validation_repo), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"],
+        cwd=str(validation_repo),
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "seed"],
+        cwd=str(validation_repo),
+        check=True,
+    )
+
+    check = subprocess.run(
+        ["git", "apply", "--check", str(patch_path)],
+        cwd=str(validation_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, f"persisted patch is not a valid unified diff: {check.stderr}"
+
+    apply = subprocess.run(
+        ["git", "apply", str(patch_path)],
+        cwd=str(validation_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert apply.returncode == 0, f"git apply failed: {apply.stderr}"
+    assert (validation_repo / "result.txt").read_text(encoding="utf-8") == REQUIRED_RESULT_CONTENT

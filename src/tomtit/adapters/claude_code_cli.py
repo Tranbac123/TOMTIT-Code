@@ -271,8 +271,89 @@ def _diff_changed_paths(before: Mapping[str, str], after: Mapping[str, str]) -> 
     return tuple(sorted(path for path in keys if before.get(path) != after.get(path)))
 
 
-def _decode_lines(data: bytes) -> list[str]:
-    return data.decode("utf-8", errors="replace").splitlines(keepends=True)
+_NO_NEWLINE_MARKER = "\\ No newline at end of file"
+_DIFF_CONTEXT_LINES = 3
+
+
+def _split_lines_for_diff(data: bytes) -> tuple[list[str], bool]:
+    """Decode to line content (no line-ending characters) plus a missing-final-newline flag.
+
+    `str.splitlines()` already discards a trailing newline without producing a
+    spurious empty final element, so the returned lines never carry their own
+    line terminator: each hunk line built from them gets exactly one `-`/`+`/`
+    ` prefix and nothing else, which is what keeps the rendered patch valid.
+    The separate flag preserves the one piece of information `splitlines()`
+    throws away — whether the file's last line was itself terminated — so the
+    standard `\\ No newline at end of file` marker can still be emitted.
+    """
+
+    text = data.decode("utf-8", errors="replace")
+    missing_final_newline = bool(text) and not text.endswith("\n")
+    return text.splitlines(), missing_final_newline
+
+
+def _format_range_unified(start: int, stop: int) -> str:
+    """Hunk range formatting, matching `difflib`'s own `_format_range_unified`."""
+
+    beginning = start + 1
+    length = stop - start
+    if length == 1:
+        return str(beginning)
+    if not length:
+        beginning -= 1
+    return f"{beginning},{length}"
+
+
+def _render_file_hunks(
+    before_lines: Sequence[str],
+    after_lines: Sequence[str],
+    *,
+    before_missing_newline: bool,
+    after_missing_newline: bool,
+    from_label: str,
+    to_label: str,
+) -> str:
+    """Render one file's unified-diff hunks from index-tracked opcodes.
+
+    Built directly on `difflib.SequenceMatcher` (the stdlib diff engine)
+    rather than `difflib.unified_diff`, so each emitted line can be checked
+    against the true last index of its source file before deciding whether a
+    `No newline at end of file` marker belongs after it. `difflib.unified_diff`
+    does not expose that index, which is what made the previous
+    keepends-based renderer unable to place the marker at all.
+    """
+
+    matcher = difflib.SequenceMatcher(None, before_lines, after_lines, autojunk=False)
+    groups = list(matcher.get_grouped_opcodes(n=_DIFF_CONTEXT_LINES))
+    if not groups:
+        return ""
+
+    out: list[str] = [f"--- {from_label}", f"+++ {to_label}"]
+    for group in groups:
+        a_start, a_end = group[0][1], group[-1][2]
+        b_start, b_end = group[0][3], group[-1][4]
+        out.append(
+            f"@@ -{_format_range_unified(a_start, a_end)} "
+            f"+{_format_range_unified(b_start, b_end)} @@"
+        )
+        for tag, i1, i2, j1, j2 in group:
+            if tag == "equal":
+                for idx in range(i1, i2):
+                    out.append(" " + before_lines[idx])
+                    if idx == len(before_lines) - 1 and before_missing_newline:
+                        out.append(_NO_NEWLINE_MARKER)
+                continue
+            if tag in ("replace", "delete"):
+                for idx in range(i1, i2):
+                    out.append("-" + before_lines[idx])
+                    if idx == len(before_lines) - 1 and before_missing_newline:
+                        out.append(_NO_NEWLINE_MARKER)
+            if tag in ("replace", "insert"):
+                for idx in range(j1, j2):
+                    out.append("+" + after_lines[idx])
+                    if idx == len(after_lines) - 1 and after_missing_newline:
+                        out.append(_NO_NEWLINE_MARKER)
+    return "\n".join(out) + "\n"
 
 
 def render_unified_diff(
@@ -297,15 +378,27 @@ def render_unified_diff(
             )
             continue
 
-        before_lines = _decode_lines(before_bytes) if before_present and before_bytes is not None else []
-        after_lines = _decode_lines(after_bytes) if after_present and after_bytes is not None else []
+        if before_present and before_bytes is not None:
+            before_lines, before_missing_newline = _split_lines_for_diff(before_bytes)
+        else:
+            before_lines, before_missing_newline = [], False
+        if after_present and after_bytes is not None:
+            after_lines, after_missing_newline = _split_lines_for_diff(after_bytes)
+        else:
+            after_lines, after_missing_newline = [], False
+
         from_label = f"a/{rel_path}" if before_present else "/dev/null"
         to_label = f"b/{rel_path}" if after_present else "/dev/null"
-        diff = list(
-            difflib.unified_diff(before_lines, after_lines, fromfile=from_label, tofile=to_label, lineterm="")
+        section = _render_file_hunks(
+            before_lines,
+            after_lines,
+            before_missing_newline=before_missing_newline,
+            after_missing_newline=after_missing_newline,
+            from_label=from_label,
+            to_label=to_label,
         )
-        if diff:
-            sections.append("\n".join(diff) + "\n")
+        if section:
+            sections.append(section)
     return "".join(sections)
 
 

@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import shutil
 import subprocess
 import threading
 import time
@@ -21,6 +22,7 @@ from tomtit.adapters.claude_code_cli import (
     ClaudeCodeCLIRequest,
     ClaudeCodeCLIStatus,
     render_evidence_manifest_json,
+    render_unified_diff,
 )
 
 
@@ -1363,3 +1365,301 @@ raise SystemExit(1)
 
     assert len(calls) == 1
     assert result.status is ClaudeCodeCLIStatus.FAILED
+
+
+# ===========================================================================
+# GATE_3_PATCH_RENDERING corrective regressions.
+#
+# Root cause: `_decode_lines` used `splitlines(keepends=True)`, so every
+# content line already carried its own trailing "\n". `render_unified_diff`
+# then joined lines with an *additional* "\n" via `"\n".join(diff)`, so any
+# line ending in a real newline produced a second, unprefixed blank line —
+# an invalid unified diff. The fix drops embedded newlines entirely
+# (`str.splitlines()` without keepends) and reconstructs "no newline at end
+# of file" markers explicitly, from true end-of-file index tracking rather
+# than from data embedded in the line content.
+#
+# Validity is checked through a real `git apply --check`/`git apply` in a
+# throwaway temporary repository, never only by string inspection, and never
+# against this project's own working tree.
+# ===========================================================================
+
+_GIT_AVAILABLE = shutil.which("git") is not None
+requires_git = pytest.mark.skipif(not _GIT_AVAILABLE, reason="git executable not available")
+
+
+def git_apply_check(tmp_path: Path, *, before: bytes | None, patch_text: str, rel_path: str = "result.txt") -> Path:
+    """A throwaway git repo seeded with `before`, used only to validate `patch_text`.
+
+    Never touches this project's own working tree: `repo` is a fresh
+    directory under pytest's `tmp_path`.
+    """
+
+    repo = tmp_path / "git-validation-repo"
+    repo.mkdir()
+    target = repo / rel_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if before is not None:
+        target.write_bytes(before)
+
+    subprocess.run(["git", "init", "-q"], cwd=str(repo), check=True)
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"],
+        cwd=str(repo),
+        check=True,
+    )
+    subprocess.run(
+        ["git", "-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "seed", "--allow-empty"],
+        cwd=str(repo),
+        check=True,
+    )
+
+    patch_path = tmp_path / "generated.patch"
+    patch_path.write_text(patch_text, encoding="utf-8")
+    return repo, patch_path  # type: ignore[return-value]
+
+
+def assert_patch_applies_cleanly(
+    tmp_path: Path,
+    *,
+    before: bytes | None,
+    after: bytes | None,
+    patch_text: str,
+    rel_path: str = "result.txt",
+) -> None:
+    """`git apply --check` then `git apply`, verifying exact resulting content."""
+
+    repo, patch_path = git_apply_check(tmp_path, before=before, patch_text=patch_text, rel_path=rel_path)
+
+    check = subprocess.run(
+        ["git", "apply", "--check", str(patch_path)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    assert check.returncode == 0, f"git apply --check failed: {check.stderr}"
+
+    apply = subprocess.run(
+        ["git", "apply", str(patch_path)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    )
+    assert apply.returncode == 0, f"git apply failed: {apply.stderr}"
+
+    result_path = repo / rel_path
+    if after is None:
+        assert not result_path.exists()
+    else:
+        assert result_path.read_bytes() == after
+
+
+# ---------------------------------------------------------------------------
+# 1. Reproduction of the exact malformed result.txt case.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_rendering_reproduces_gate3_result_txt_case_validly(tmp_path: Path) -> None:
+    before = {"result.txt": b"not completed\n"}
+    after_bytes = b"TOMTIT Claude Code CLI adapter smoke test passed"
+    after = {"result.txt": after_bytes}
+
+    patch = render_unified_diff(before, after, ("result.txt",))
+
+    # The exact defect: an unprefixed blank line anywhere in the patch body.
+    hunk_lines = patch.splitlines()
+    header_lines = {hunk_lines[0], hunk_lines[1]}
+    for line in hunk_lines:
+        if line in header_lines or line.startswith("@@"):
+            continue
+        assert line[:1] in (" ", "+", "-", "\\"), f"malformed unprefixed line: {line!r}"
+
+    assert_patch_applies_cleanly(
+        tmp_path,
+        before=before["result.txt"],
+        after=after_bytes,
+        patch_text=patch,
+    )
+
+
+# ---------------------------------------------------------------------------
+# 2. Generated patch passes git apply --check inside a temp repo.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_generated_patch_passes_git_apply_check(tmp_path: Path) -> None:
+    before = {"result.txt": b"line one\nline two\n"}
+    after_bytes = b"line one\nline TWO\n"
+    after = {"result.txt": after_bytes}
+
+    patch = render_unified_diff(before, after, ("result.txt",))
+
+    assert_patch_applies_cleanly(tmp_path, before=before["result.txt"], after=after_bytes, patch_text=patch)
+
+
+# ---------------------------------------------------------------------------
+# 3-6. Newline-at-end-of-file edge cases.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_both_sides_end_with_newline(tmp_path: Path) -> None:
+    before_bytes = b"alpha\n"
+    after_bytes = b"beta\n"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert "\\ No newline at end of file" not in patch
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+@requires_git
+def test_original_has_newline_replacement_has_none(tmp_path: Path) -> None:
+    before_bytes = b"alpha\n"
+    after_bytes = b"beta"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert patch.count("\\ No newline at end of file") == 1
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+@requires_git
+def test_original_has_no_newline_replacement_has_one(tmp_path: Path) -> None:
+    before_bytes = b"alpha"
+    after_bytes = b"beta\n"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert patch.count("\\ No newline at end of file") == 1
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+@requires_git
+def test_both_sides_have_no_final_newline(tmp_path: Path) -> None:
+    before_bytes = b"alpha"
+    after_bytes = b"beta"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert patch.count("\\ No newline at end of file") == 2
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+# ---------------------------------------------------------------------------
+# 7. Empty line inside file content.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_empty_line_inside_file_content(tmp_path: Path) -> None:
+    before_bytes = b"first\n\nthird\n"
+    after_bytes = b"first\n\nCHANGED\n"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+# ---------------------------------------------------------------------------
+# 8. File creation.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_file_creation_produces_valid_patch(tmp_path: Path) -> None:
+    after_bytes = b"brand new content\n"
+    patch = render_unified_diff({}, {"new_file.txt": after_bytes}, ("new_file.txt",))
+    assert "/dev/null" in patch
+    assert_patch_applies_cleanly(
+        tmp_path,
+        before=None,
+        after=after_bytes,
+        patch_text=patch,
+        rel_path="new_file.txt",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 9. File deletion.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_file_deletion_produces_valid_patch(tmp_path: Path) -> None:
+    before_bytes = b"soon to be gone\n"
+    patch = render_unified_diff({"gone.txt": before_bytes}, {}, ("gone.txt",))
+    assert "/dev/null" in patch
+    assert_patch_applies_cleanly(
+        tmp_path,
+        before=before_bytes,
+        after=None,
+        patch_text=patch,
+        rel_path="gone.txt",
+    )
+
+
+# ---------------------------------------------------------------------------
+# 10. Multiple changed lines.
+# ---------------------------------------------------------------------------
+
+
+@requires_git
+def test_multiple_changed_lines_produce_valid_patch(tmp_path: Path) -> None:
+    before_bytes = b"one\ntwo\nthree\nfour\nfive\n"
+    after_bytes = b"ONE\ntwo\nTHREE\nfour\nFIVE\n"
+    patch = render_unified_diff({"result.txt": before_bytes}, {"result.txt": after_bytes}, ("result.txt",))
+    assert_patch_applies_cleanly(tmp_path, before=before_bytes, after=after_bytes, patch_text=patch)
+
+
+# ---------------------------------------------------------------------------
+# 11. Patch remains bounded (omitted-content path unaffected by this fix).
+# ---------------------------------------------------------------------------
+
+
+def test_oversized_file_content_remains_omitted_not_malformed() -> None:
+    # `snapshot_workspace_contents` represents an over-bound or unreadable file
+    # as `None`; this is the contract `render_unified_diff` must still honor.
+    patch = render_unified_diff({"big.txt": None}, {"big.txt": None}, ("big.txt",))
+    assert "content omitted" in patch
+    assert "\\ No newline at end of file" not in patch
+
+
+# ---------------------------------------------------------------------------
+# 12. Patch touches only the expected path.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_touches_only_the_expected_path() -> None:
+    before = {"result.txt": b"a\n", "README.md": b"unchanged\n"}
+    after = {"result.txt": b"b\n", "README.md": b"unchanged\n"}
+    patch = render_unified_diff(before, after, ("result.txt",))
+    assert "result.txt" in patch
+    assert "README.md" not in patch
+
+
+# ---------------------------------------------------------------------------
+# 13. Existing real Gate 3 evidence files remain byte-for-byte unchanged.
+# ---------------------------------------------------------------------------
+
+
+def test_committed_gate3_evidence_files_unchanged_by_this_fix() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    if not (repo_root / ".git").exists():
+        pytest.skip("not a git checkout")
+
+    completed = subprocess.run(
+        ["git", "status", "--porcelain", "--", "evidence/gate3"],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert completed.returncode == 0
+    assert completed.stdout.strip() == "", (
+        f"Gate 3 evidence must not be modified by this patch: {completed.stdout!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Determinism of the renderer itself.
+# ---------------------------------------------------------------------------
+
+
+def test_patch_rendering_is_deterministic() -> None:
+    before = {"result.txt": b"not completed\n"}
+    after = {"result.txt": b"TOMTIT Claude Code CLI adapter smoke test passed"}
+    first = render_unified_diff(before, after, ("result.txt",))
+    second = render_unified_diff(before, after, ("result.txt",))
+    assert first == second
