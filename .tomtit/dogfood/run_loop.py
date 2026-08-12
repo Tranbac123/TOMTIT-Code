@@ -52,10 +52,14 @@ from tomtit.adapters.claude_code_cli import (  # noqa: E402
     AuthorizedCommandError,
     compute_authorized_command_fingerprint,
     compute_authorized_command_set_fingerprint,
+    classify_workspace_changes,
     discover_claude_executable,
     normalize_allowed_side_effect_paths,
     normalize_authorized_commands,
     render_authorized_command_display,
+    snapshot_workspace_hashes,
+    summarize_side_effect_paths,
+    workspace_hash,
 )
 
 import run_repair  # noqa: E402
@@ -147,24 +151,124 @@ def _utc_now_iso() -> str:
 
 
 def _read_json(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
+    try:
+        evidence_snapshot = run_review.read_canonical_evidence(
+            path.parent,
+            (path.name,),
+        )
+    except run_review.EvidenceIntegrityFailure:
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+        return json.loads(evidence_snapshot.file_bytes[path.name].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
         return None
 
 
 def hash_directory(path: Path) -> dict[str, str]:
-    """A deterministic per-file hash map for an entire evidence directory."""
+    """An exact lstat-based identity for an entire canonical evidence tree."""
 
-    hashes: dict[str, str] = {}
-    if not path.is_dir():
-        return hashes
-    for file_path in sorted(path.rglob("*")):
-        if file_path.is_file():
-            hashes[str(file_path.relative_to(path).as_posix())] = run_review._sha256(file_path.read_bytes())
-    return hashes
+    return run_review.snapshot_evidence_tree(path)
+
+
+def _derive_final_workspace_evidence(
+    *,
+    workspace: Path,
+    baseline_commit: str,
+    baseline_hashes: dict[str, str],
+    allowed_source_paths: tuple[str, ...],
+    allowed_side_effect_paths: tuple[str, ...],
+    baseline_git_metadata: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    """Measure the actual terminal workspace, independent of child receipts."""
+
+    final_hashes = snapshot_workspace_hashes(workspace)
+    snapshot_observation = run_review.classify_review_workspace_preservation(
+        baseline_hashes,
+        final_hashes,
+        allowed_source_paths=allowed_source_paths,
+        allowed_side_effect_paths=allowed_side_effect_paths,
+        workspace=workspace,
+    )
+    git_visible_paths = tuple(run_review.git_changed_paths(workspace, baseline_commit))
+    git_source, git_side_effects, git_unexpected = classify_workspace_changes(
+        git_visible_paths,
+        allowed_source_paths,
+        allowed_side_effect_paths,
+        workspace_root=workspace,
+    )
+    source = tuple(sorted(set(snapshot_observation.source_changed_paths) | set(git_source)))
+    unexpected = tuple(
+        sorted(set(snapshot_observation.unexpected_changed_paths) | set(git_unexpected))
+    )
+    side_effects = tuple(
+        sorted(
+            (set(snapshot_observation.authorized_side_effect_changed_paths) | set(git_side_effects))
+            - set(source)
+            - set(unexpected)
+        )
+    )
+    side_effect_counts, side_effect_sample = summarize_side_effect_paths(
+        side_effects,
+        allowed_side_effect_paths,
+    )
+    try:
+        final_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+    except run_review.EvidenceIntegrityFailure:
+        final_git_metadata = {}
+    git_metadata_changed_paths = (
+        run_review.diff_workspace_hashes(baseline_git_metadata, final_git_metadata)
+        if baseline_git_metadata is not None
+        else ()
+    )
+    git_metadata_preserved = (
+        bool(final_git_metadata)
+        and baseline_git_metadata is not None
+        and not git_metadata_changed_paths
+    )
+    final_git_entry_hash = (
+        run_review.workspace_git_entry_hash_from_snapshot(final_git_metadata)
+        if final_git_metadata
+        else None
+    )
+    baseline_git_entry_hash = (
+        run_review.workspace_git_entry_hash_from_snapshot(baseline_git_metadata)
+        if baseline_git_metadata is not None
+        else None
+    )
+    return {
+        "workspace_final_hash": workspace_hash(final_hashes),
+        "workspace_final_changed_paths": list(sorted((*source, *unexpected))),
+        "workspace_final_source_changed_paths": list(source),
+        "workspace_final_unexpected_changed_paths": list(unexpected),
+        "workspace_final_authorized_side_effect_changed_path_count": len(side_effects),
+        "workspace_final_authorized_side_effect_changed_counts_by_root": {
+            root: count for root, count in side_effect_counts
+        },
+        "workspace_final_authorized_side_effect_changed_paths_sample": list(
+            side_effect_sample
+        ),
+        "protected_git_metadata_final_hash": (
+            workspace_hash(final_git_metadata) if final_git_metadata else None
+        ),
+        "protected_git_metadata_baseline_hash": (
+            workspace_hash(baseline_git_metadata)
+            if baseline_git_metadata is not None
+            else None
+        ),
+        "protected_git_metadata_preserved": git_metadata_preserved,
+        "workspace_git_entry_final_hash": final_git_entry_hash,
+        "workspace_git_entry_baseline_hash": baseline_git_entry_hash,
+        "workspace_git_entry_preserved": (
+            final_git_entry_hash is not None
+            and final_git_entry_hash == baseline_git_entry_hash
+        ),
+        "protected_git_metadata_changed_path_count": len(
+            git_metadata_changed_paths
+        ),
+        "protected_git_metadata_changed_paths_sample": list(
+            git_metadata_changed_paths[:20]
+        ),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -195,6 +299,7 @@ class EventLog:
         attempt: int | None = None,
         child_run_id: str | None = None,
         evidence_path: str | None = None,
+        provider_invoked: bool | None = None,
         summary: str = "",
     ) -> None:
         self._sequence += 1
@@ -208,6 +313,7 @@ class EventLog:
             "attempt": attempt,
             "child_run_id": child_run_id,
             "evidence_path": evidence_path,
+            "provider_invoked": provider_invoked,
             "summary": summary,
         }
         line = json.dumps(event, sort_keys=True) + "\n"
@@ -221,6 +327,103 @@ class EventLog:
     @property
     def sequence(self) -> int:
         return self._sequence
+
+
+def _provider_invocation_observation(
+    child_outcome: dict[str, Any],
+) -> bool | None:
+    """Return TRUE/FALSE only from consistent explicit provider-boundary evidence."""
+
+    observations: list[bool] = []
+    direct = child_outcome.get("provider_invoked_observation")
+    if isinstance(direct, bool):
+        observations.append(direct)
+    receipt = child_outcome.get("receipt")
+    result = child_outcome.get("result")
+    if isinstance(receipt, dict):
+        receipt_provider = receipt.get("provider_invoked")
+        if isinstance(receipt_provider, bool):
+            observations.append(receipt_provider)
+        invocation_count = receipt.get("invocation_count")
+        if invocation_count is not None and (
+            not isinstance(invocation_count, int)
+            or isinstance(invocation_count, bool)
+            or invocation_count not in (0, 1)
+            or (isinstance(receipt_provider, bool) and bool(invocation_count) != receipt_provider)
+        ):
+            return None
+    if isinstance(result, dict):
+        result_provider = result.get("provider_invoked")
+        if isinstance(result_provider, bool):
+            observations.append(result_provider)
+    if not observations or any(value != observations[0] for value in observations[1:]):
+        return None
+    return observations[0]
+
+
+def _provider_process_summary(child_outcome: dict[str, Any]) -> str:
+    receipt = child_outcome.get("receipt")
+    result = child_outcome.get("result")
+    if isinstance(receipt, dict) and "process_exit_code" in receipt:
+        exit_code = receipt.get("process_exit_code")
+        timed_out = receipt.get("timed_out")
+    elif isinstance(result, dict):
+        exit_code = result.get("exit_code")
+        timed_out = result.get("timed_out")
+    else:
+        exit_code = None
+        timed_out = None
+    return (
+        f"provider_exit_code={exit_code}; timed_out={timed_out}; "
+        f"runner_exit_code={child_outcome['exit_code']}"
+    )
+
+
+def _record_completed_child_runner(
+    *,
+    event_log: EventLog,
+    state: str,
+    attempt: int,
+    child_outcome: dict[str, Any],
+) -> tuple[int, bool | None]:
+    """Record provider events only after child evidence proves the boundary was reached."""
+
+    child_id = str(child_outcome["child_id"])
+    provider_invoked = _provider_invocation_observation(child_outcome)
+    if provider_invoked is True:
+        event_log.append(
+            event_type="MODEL_INVOCATION_START",
+            from_state=state,
+            to_state=state,
+            attempt=attempt,
+            child_run_id=child_id,
+            provider_invoked=True,
+            summary=(
+                "retrospective provider-process start attestation from child evidence; "
+                "event timestamp is observation time"
+            ),
+        )
+        event_log.append(
+            event_type="MODEL_INVOCATION_COMPLETE",
+            from_state=state,
+            to_state=state,
+            attempt=attempt,
+            child_run_id=child_id,
+            evidence_path=str(child_outcome["run_directory"]),
+            provider_invoked=True,
+            summary=_provider_process_summary(child_outcome),
+        )
+    event_log.append(
+        event_type="RUNNER_INVOCATION_COMPLETE",
+        from_state=state,
+        to_state=state,
+        attempt=attempt,
+        child_run_id=child_id,
+        evidence_path=str(child_outcome["run_directory"]),
+        provider_invoked=provider_invoked,
+        summary=f"exit_code={child_outcome['exit_code']}",
+    )
+    return (1 if provider_invoked is True else 0, provider_invoked)
 
 
 class StateMachine:
@@ -351,13 +554,20 @@ def invoke_implementation(
         argv.extend(["--model", model])
     if claude_executable:
         argv.extend(["--executable", claude_executable])
-    exit_code = run_task.main(argv)
+    provider_observations: list[bool | None] = []
+    exit_code = run_task.main(
+        argv,
+        provider_observer=provider_observations.append,
+    )
     return {
         "child_id": child_id,
         "run_directory": run_dir,
         "exit_code": exit_code,
         "receipt": _read_json(run_dir / "receipt.json"),
         "result": _read_json(run_dir / "result.json"),
+        "provider_invoked_observation": (
+            provider_observations[-1] if provider_observations else None
+        ),
     }
 
 
@@ -410,7 +620,11 @@ def invoke_review(
         argv.extend(["--model", model])
     if codex_executable:
         argv.extend(["--codex-executable", codex_executable])
-    exit_code = run_review.main(argv)
+    provider_observations: list[bool | None] = []
+    exit_code = run_review.main(
+        argv,
+        provider_observer=provider_observations.append,
+    )
     run_dir = children_root / child_id
     return {
         "child_id": child_id,
@@ -418,6 +632,9 @@ def invoke_review(
         "exit_code": exit_code,
         "receipt": _read_json(run_dir / "review-receipt.json"),
         "result": _read_json(run_dir / "review-result.json"),
+        "provider_invoked_observation": (
+            provider_observations[-1] if provider_observations else None
+        ),
     }
 
 
@@ -475,13 +692,20 @@ def invoke_repair(
         argv.extend(["--model", model])
     if claude_executable:
         argv.extend(["--claude-executable", claude_executable])
-    exit_code = run_repair.main(argv)
+    provider_observations: list[bool | None] = []
+    exit_code = run_repair.main(
+        argv,
+        provider_observer=provider_observations.append,
+    )
     return {
         "child_id": child_id,
         "run_directory": run_dir,
         "exit_code": exit_code,
         "receipt": _read_json(run_dir / "receipt.json"),
         "result": _read_json(run_dir / "result.json"),
+        "provider_invoked_observation": (
+            provider_observations[-1] if provider_observations else None
+        ),
     }
 
 
@@ -691,10 +915,26 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
     if claude_executable is None:
         raise PreflightBlocked("CLAUDE_NOT_FOUND", "claude executable was not discovered")
 
+    capability_probe_before = _snapshot_workspace_for_review(workspace)
+    codex_contract: tuple[str, dict[str, bool], tuple[str, str]] | None = None
+    codex_contract_failure: run_review.PreflightFailure | None = None
     try:
-        codex_executable, _codex_caps, _codex_approval = run_review.resolve_codex_contract(args.codex_executable)
+        codex_contract = run_review.resolve_codex_contract(args.codex_executable)
     except run_review.PreflightFailure as exc:
-        raise PreflightBlocked(exc.category, exc.message) from None
+        codex_contract_failure = exc
+    capability_probe_after = _snapshot_workspace_for_review(workspace)
+    if capability_probe_after != capability_probe_before:
+        raise PreflightBlocked(
+            "IMMUTABILITY_VIOLATION",
+            "Codex capability probes changed workspace or repository state",
+        )
+    if codex_contract_failure is not None:
+        raise PreflightBlocked(
+            codex_contract_failure.category,
+            codex_contract_failure.message,
+        ) from None
+    assert codex_contract is not None
+    codex_executable, _codex_caps, _codex_approval = codex_contract
 
     children_root = loop_dir / "children"
     for suffix in ("-impl-1", "-review-1", "-repair-2", "-review-2"):
@@ -717,6 +957,11 @@ def _print_receipt(result: dict[str, Any]) -> None:
     print(f"STOP_REASON={result['stop_reason'] or ''}")
     print(f"ACCEPTED={str(result['accepted']).lower()}")
     print(f"IMPLEMENTATION_ATTEMPTS={result['implementation_attempts']}")
+    print(f"MODEL_INVOCATION_COUNT={result['model_invocation_count']}")
+    print(
+        "MODEL_INVOCATION_OBSERVATION_COMPLETE="
+        f"{str(result['model_invocation_observation_complete']).lower()}"
+    )
     print(f"REVIEW_ATTEMPTS={result['review_attempts']}")
     print(f"REPAIR_ROUNDS={result['repair_rounds']}")
     print(f"IMPLEMENTATION_RUN_IDS={json.dumps(result['implementation_run_ids'])}")
@@ -769,20 +1014,71 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
     event_log.append(event_type="LOOP_CREATED", from_state=None, to_state="CREATED", summary="loop initialized")
 
     evidence_snapshots: dict[str, dict[str, str]] = {}
+    baseline_commit_for_final: str | None = None
+    workspace_baseline_hashes: dict[str, str] | None = None
+    baseline_git_metadata: dict[str, str] | None = None
+    allowed_paths_for_final: tuple[str, ...] = ()
+    model_invocation_count = 0
+    provider_invocation_observations: list[dict[str, Any]] = []
+    review_workspace_observations: list[dict[str, Any]] = []
 
     def _record_child_evidence(child_id: str, run_directory: Path) -> None:
+        try:
+            run_directory.lstat()
+        except OSError:
+            # A child rejected during preflight has no canonical evidence tree
+            # to protect; absence is not fabricated into an empty snapshot.
+            return
         evidence_snapshots[child_id] = hash_directory(run_directory)
 
     def _verify_previous_evidence_unchanged() -> tuple[bool, list[str]]:
         drifted: list[str] = []
         for child_id, snapshot in evidence_snapshots.items():
-            current = hash_directory(loop_dir / "children" / child_id)
+            try:
+                current = hash_directory(loop_dir / "children" / child_id)
+            except run_review.EvidenceIntegrityFailure:
+                drifted.append(child_id)
+                continue
             if current != snapshot:
                 drifted.append(child_id)
         return (not drifted, drifted)
 
+    def _finalize_current(**kwargs: Any) -> dict[str, Any]:
+        if evidence_snapshots:
+            immutable, _drifted_child_ids = _verify_previous_evidence_unchanged()
+            kwargs["previous_evidence_immutable"] = immutable
+        return _finalize(
+            **kwargs,
+            baseline_commit=baseline_commit_for_final,
+            workspace_baseline_hashes=workspace_baseline_hashes,
+            baseline_git_metadata=baseline_git_metadata,
+            allowed_side_effect_paths=allowed_side_effect_paths,
+            model_invocation_count=model_invocation_count,
+            provider_invocation_observations=provider_invocation_observations,
+            review_workspace_observations=review_workspace_observations,
+        )
+
     try:
         machine.transition("PREFLIGHT", event_type="STATE_TRANSITION", summary="running deep preflight checks")
+        candidate_baseline = run_review.git_rev_parse(workspace, args.baseline_ref)
+        if candidate_baseline is not None:
+            baseline_commit_for_final = candidate_baseline
+            workspace_baseline_hashes = snapshot_workspace_hashes(workspace)
+            try:
+                baseline_git_metadata = run_review.protected_git_metadata_snapshot(
+                    workspace
+                )
+            except run_review.EvidenceIntegrityFailure:
+                baseline_git_metadata = None
+            try:
+                candidate_allowed_paths = run_review.normalize_allowed_paths(
+                    args.allowed_path,
+                    workspace,
+                )
+            except run_review.PreflightFailure:
+                candidate_allowed_paths = ()
+            else:
+                allowed_paths_for_final = candidate_allowed_paths
         try:
             phase_b = _deep_preflight(args, workspace, loop_dir)
         except PreflightBlocked as exc:
@@ -791,7 +1087,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                 event_type="PREFLIGHT_BLOCKED",
                 summary=f"{exc.category}: {exc.message}",
             )
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -806,7 +1102,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                 repair_rounds=0,
                 final_verdict=None,
                 finding_counts={"HIGH": 0, "MEDIUM": 0, "LOW": 0},
-                allowed_paths=(),
+                allowed_paths=allowed_paths_for_final,
                 check_commands=list(args.check_command),
                 workspace_final_changed_paths=[],
                 unexpected_changed_paths=[],
@@ -819,6 +1115,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
         allowed_paths: tuple[str, ...] = phase_b["allowed_paths"]
         baseline_commit: str = phase_b["baseline_commit"]
+        baseline_commit_for_final = baseline_commit
+        workspace_baseline_hashes = snapshot_workspace_hashes(workspace)
+        allowed_paths_for_final = allowed_paths
         claude_executable: str = phase_b["claude_executable"]
         codex_executable: str = phase_b["codex_executable"]
         children_root: Path = phase_b["children_root"]
@@ -851,7 +1150,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         machine.transition("IMPLEMENTING_ATTEMPT_1", event_type="STATE_TRANSITION", summary="starting Attempt 1")
         impl1_id = f"{loop_run_id}-impl-1"
         event_log.append(
-            event_type="MODEL_INVOCATION_START", from_state=machine.state, to_state=machine.state, attempt=1, child_run_id=impl1_id
+            event_type="RUNNER_INVOCATION_START",
+            from_state=machine.state,
+            to_state=machine.state,
+            attempt=1,
+            child_run_id=impl1_id,
         )
         impl1 = invoke_implementation(
             child_id=impl1_id,
@@ -870,14 +1173,15 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         _record_child_evidence(impl1_id, impl1["run_directory"])
         usages.append(extract_usage_from_implementation_result(impl1["result"]))
         impl1_receipt = impl1["receipt"]
-        event_log.append(
-            event_type="MODEL_INVOCATION_COMPLETE",
-            from_state=machine.state,
-            to_state=machine.state,
+        observed_count, provider_observation = _record_completed_child_runner(
+            event_log=event_log,
+            state=machine.state,
             attempt=1,
-            child_run_id=impl1_id,
-            evidence_path=str(impl1["run_directory"]),
-            summary=f"exit_code={impl1['exit_code']}",
+            child_outcome=impl1,
+        )
+        model_invocation_count += observed_count
+        provider_invocation_observations.append(
+            {"child_run_id": impl1_id, "provider_invoked": provider_observation}
         )
 
         impl1_ok = (
@@ -896,7 +1200,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                 child_run_id=impl1_id,
                 summary="implementation did not succeed" if to_state == "FAILED" else "unexpected changed paths",
             )
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -926,7 +1230,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         review1_id = f"{loop_run_id}-review-1"
         pre_review1_snapshot = _snapshot_workspace_for_review(workspace)
         event_log.append(
-            event_type="MODEL_INVOCATION_START", from_state=machine.state, to_state=machine.state, attempt=1, child_run_id=review1_id
+            event_type="RUNNER_INVOCATION_START",
+            from_state=machine.state,
+            to_state=machine.state,
+            attempt=1,
+            child_run_id=review1_id,
         )
         review1 = invoke_review(
             child_id=review1_id,
@@ -946,25 +1254,58 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         review_run_ids.append(review1_id)
         _record_child_evidence(review1_id, review1["run_directory"])
         post_review1_snapshot = _snapshot_workspace_for_review(workspace)
-        review1_preserved = pre_review1_snapshot == post_review1_snapshot
-        event_log.append(
-            event_type="MODEL_INVOCATION_COMPLETE",
-            from_state=machine.state,
-            to_state=machine.state,
+        review1_observation = _review_preservation_evidence(
             attempt=1,
-            child_run_id=review1_id,
-            evidence_path=str(review1["run_directory"]),
-            summary=f"exit_code={review1['exit_code']}",
+            workspace=workspace,
+            before=pre_review1_snapshot,
+            after=post_review1_snapshot,
+            allowed_source_paths=allowed_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
+        )
+        review_workspace_observations.append(review1_observation)
+        review1_receipt = review1.get("receipt")
+        review1_child_preserved = bool(
+            isinstance(review1_receipt, dict)
+            and review1_receipt.get("workspace_unchanged") is True
+        )
+        review1_observation["child_workspace_unchanged"] = review1_child_preserved
+        review1_observation["workspace_preserved"] = bool(
+            review1_observation["workspace_preserved"]
+            and review1_child_preserved
+        )
+        if not review1_child_preserved:
+            review1_observation["status"] = "UNEXPECTED_DRIFT"
+        review1_preserved = bool(review1_observation["workspace_preserved"])
+        observed_count, provider_observation = _record_completed_child_runner(
+            event_log=event_log,
+            state=machine.state,
+            attempt=1,
+            child_outcome=review1,
+        )
+        model_invocation_count += observed_count
+        provider_invocation_observations.append(
+            {"child_run_id": review1_id, "provider_invoked": provider_observation}
         )
 
         verdict1 = extract_validated_verdict(review1)
         workspace_preserved_during_reviews = review1_preserved
+        post_review1_state_preserved = (
+            _snapshot_workspace_for_review(workspace) == post_review1_snapshot
+        )
+        review1_observation["post_review_state_preserved"] = (
+            post_review1_state_preserved
+        )
+        if not post_review1_state_preserved:
+            review1_preserved = False
+            workspace_preserved_during_reviews = False
+            review1_observation["workspace_preserved"] = False
+            review1_observation["status"] = "UNEXPECTED_DRIFT"
 
         if verdict1 is None or not review1_preserved:
             to_state = "FAILED"
             reason = "invalid or missing review evidence" if verdict1 is None else "review mutated the workspace"
             machine.transition(to_state, event_type="REVIEW_1_OUTCOME", attempt=1, child_run_id=review1_id, summary=reason)
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -993,7 +1334,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         if verdict1["verdict"] == "APPROVE":
             machine.transition("COMPLETED", event_type="REVIEW_1_OUTCOME", attempt=1, child_run_id=review1_id, summary="APPROVE")
             immutable_ok, _drift = _verify_previous_evidence_unchanged()
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1021,7 +1362,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
         if verdict1["verdict"] == "BLOCKED":
             machine.transition("BLOCKED", event_type="REVIEW_1_OUTCOME", attempt=1, child_run_id=review1_id, summary="BLOCKED")
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1052,7 +1393,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             machine.transition(
                 "STOPPED", event_type="REVIEW_1_OUTCOME", attempt=1, child_run_id=review1_id, summary="REQUEST_CHANGES, repair not authorized"
             )
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1083,7 +1424,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         repair_rounds += 1
         repair2_id = f"{loop_run_id}-repair-2"
         event_log.append(
-            event_type="MODEL_INVOCATION_START", from_state=machine.state, to_state=machine.state, attempt=2, child_run_id=repair2_id
+            event_type="RUNNER_INVOCATION_START",
+            from_state=machine.state,
+            to_state=machine.state,
+            attempt=2,
+            child_run_id=repair2_id,
         )
         repair2 = invoke_repair(
             child_id=repair2_id,
@@ -1104,25 +1449,36 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             children_root=children_root,
         )
         implementation_run_ids.append(repair2_id)
+        outer_previous_evidence_immutable, _outer_drift = (
+            _verify_previous_evidence_unchanged()
+        )
         _record_child_evidence(repair2_id, repair2["run_directory"])
         usages.append(extract_usage_from_implementation_result(repair2["result"]))
         repair2_receipt = repair2["receipt"]
-        event_log.append(
-            event_type="MODEL_INVOCATION_COMPLETE",
-            from_state=machine.state,
-            to_state=machine.state,
+        observed_count, provider_observation = _record_completed_child_runner(
+            event_log=event_log,
+            state=machine.state,
             attempt=2,
-            child_run_id=repair2_id,
-            evidence_path=str(repair2["run_directory"]),
-            summary=f"exit_code={repair2['exit_code']}",
+            child_outcome=repair2,
+        )
+        model_invocation_count += observed_count
+        provider_invocation_observations.append(
+            {"child_run_id": repair2_id, "provider_invoked": provider_observation}
         )
 
-        repair_immutable_ok = bool(isinstance(repair2_receipt, dict) and repair2_receipt.get("previous_evidence_unchanged"))
+        repair_receipt_immutable_ok = bool(
+            isinstance(repair2_receipt, dict)
+            and repair2_receipt.get("previous_evidence_unchanged") is True
+        )
+        repair_immutable_ok = (
+            repair_receipt_immutable_ok and outer_previous_evidence_immutable
+        )
         repair_ok = (
             isinstance(repair2_receipt, dict)
             and repair2_receipt.get("success") is True
             and not repair2_receipt.get("unexpected_changed_paths")
-            and repair_immutable_ok
+            and repair_receipt_immutable_ok
+            and outer_previous_evidence_immutable
         )
         if not repair_ok:
             unexpected = repair2_receipt.get("unexpected_changed_paths", []) if isinstance(repair2_receipt, dict) else []
@@ -1130,7 +1486,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             machine.transition(
                 to_state, event_type="ATTEMPT_2_OUTCOME", attempt=2, child_run_id=repair2_id, summary="repair did not succeed"
             )
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1150,7 +1506,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
                 workspace_final_changed_paths=list(repair2_receipt.get("changed_paths", [])) if isinstance(repair2_receipt, dict) else [],
                 unexpected_changed_paths=unexpected,
                 workspace_preserved_during_reviews=workspace_preserved_during_reviews,
-                previous_evidence_immutable=repair_immutable_ok,
+                previous_evidence_immutable=outer_previous_evidence_immutable,
                 usages=usages,
             )
             _write_and_print(loop_dir, result)
@@ -1160,7 +1516,11 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         review2_id = f"{loop_run_id}-review-2"
         pre_review2_snapshot = _snapshot_workspace_for_review(workspace)
         event_log.append(
-            event_type="MODEL_INVOCATION_START", from_state=machine.state, to_state=machine.state, attempt=2, child_run_id=review2_id
+            event_type="RUNNER_INVOCATION_START",
+            from_state=machine.state,
+            to_state=machine.state,
+            attempt=2,
+            child_run_id=review2_id,
         )
         review2 = invoke_review(
             child_id=review2_id,
@@ -1180,24 +1540,57 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         review_run_ids.append(review2_id)
         _record_child_evidence(review2_id, review2["run_directory"])
         post_review2_snapshot = _snapshot_workspace_for_review(workspace)
-        review2_preserved = pre_review2_snapshot == post_review2_snapshot
-        workspace_preserved_during_reviews = workspace_preserved_during_reviews and review2_preserved
-        event_log.append(
-            event_type="MODEL_INVOCATION_COMPLETE",
-            from_state=machine.state,
-            to_state=machine.state,
+        review2_observation = _review_preservation_evidence(
             attempt=2,
-            child_run_id=review2_id,
-            evidence_path=str(review2["run_directory"]),
-            summary=f"exit_code={review2['exit_code']}",
+            workspace=workspace,
+            before=pre_review2_snapshot,
+            after=post_review2_snapshot,
+            allowed_source_paths=allowed_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
+        )
+        review_workspace_observations.append(review2_observation)
+        review2_receipt = review2.get("receipt")
+        review2_child_preserved = bool(
+            isinstance(review2_receipt, dict)
+            and review2_receipt.get("workspace_unchanged") is True
+        )
+        review2_observation["child_workspace_unchanged"] = review2_child_preserved
+        review2_observation["workspace_preserved"] = bool(
+            review2_observation["workspace_preserved"]
+            and review2_child_preserved
+        )
+        if not review2_child_preserved:
+            review2_observation["status"] = "UNEXPECTED_DRIFT"
+        review2_preserved = bool(review2_observation["workspace_preserved"])
+        workspace_preserved_during_reviews = workspace_preserved_during_reviews and review2_preserved
+        observed_count, provider_observation = _record_completed_child_runner(
+            event_log=event_log,
+            state=machine.state,
+            attempt=2,
+            child_outcome=review2,
+        )
+        model_invocation_count += observed_count
+        provider_invocation_observations.append(
+            {"child_run_id": review2_id, "provider_invoked": provider_observation}
         )
 
         verdict2 = extract_validated_verdict(review2)
+        post_review2_state_preserved = (
+            _snapshot_workspace_for_review(workspace) == post_review2_snapshot
+        )
+        review2_observation["post_review_state_preserved"] = (
+            post_review2_state_preserved
+        )
+        if not post_review2_state_preserved:
+            review2_preserved = False
+            workspace_preserved_during_reviews = False
+            review2_observation["workspace_preserved"] = False
+            review2_observation["status"] = "UNEXPECTED_DRIFT"
         if verdict2 is None or not review2_preserved:
             to_state = "FAILED"
             reason = "invalid or missing review evidence" if verdict2 is None else "review mutated the workspace"
             machine.transition(to_state, event_type="REVIEW_2_OUTCOME", attempt=2, child_run_id=review2_id, summary=reason)
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1226,7 +1619,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         if verdict2["verdict"] == "APPROVE":
             machine.transition("COMPLETED", event_type="REVIEW_2_OUTCOME", attempt=2, child_run_id=review2_id, summary="APPROVE")
             immutable_ok, _drift = _verify_previous_evidence_unchanged()
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1254,7 +1647,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
         if verdict2["verdict"] == "BLOCKED":
             machine.transition("BLOCKED", event_type="REVIEW_2_OUTCOME", attempt=2, child_run_id=review2_id, summary="BLOCKED")
-            result = _finalize(
+            result = _finalize_current(
                 loop_run_id=loop_run_id,
                 authorized_commands=authorized_commands,
                 workspace=workspace,
@@ -1284,7 +1677,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         machine.transition(
             "STOPPED", event_type="REVIEW_2_OUTCOME", attempt=2, child_run_id=review2_id, summary="REQUEST_CHANGES, repair limit reached"
         )
-        result = _finalize(
+        result = _finalize_current(
             loop_run_id=loop_run_id,
             authorized_commands=authorized_commands,
             workspace=workspace,
@@ -1320,10 +1713,110 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         return 5
 
 
-def _snapshot_workspace_for_review(workspace: Path) -> tuple[str, str]:
+def _snapshot_workspace_for_review(
+    workspace: Path,
+) -> tuple[str, dict[str, str], bool, str | None, str | None, dict[str, str]]:
     head = run_review.git_rev_parse(workspace, "HEAD") or ""
-    status = run_review.git_status_porcelain(workspace)
-    return (head, status)
+    try:
+        git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+    except run_review.EvidenceIntegrityFailure:
+        git_metadata = {}
+    return (
+        head,
+        snapshot_workspace_hashes(workspace),
+        run_review.git_index_clean(workspace),
+        run_review.git_special_state(workspace),
+        run_review.git_index_identity(workspace),
+        git_metadata,
+    )
+
+
+def _review_preservation_evidence(
+    *,
+    attempt: int,
+    workspace: Path,
+    before: tuple[str, dict[str, str], bool, str | None, str | None, dict[str, str]],
+    after: tuple[str, dict[str, str], bool, str | None, str | None, dict[str, str]],
+    allowed_source_paths: tuple[str, ...],
+    allowed_side_effect_paths: tuple[str, ...],
+) -> dict[str, Any]:
+    observation = run_review.classify_review_workspace_preservation(
+        before[1],
+        after[1],
+        allowed_source_paths=allowed_source_paths,
+        allowed_side_effect_paths=allowed_side_effect_paths,
+        workspace=workspace,
+    )
+    repository_identity_preserved = (
+        before[0] == after[0]
+        and before[2]
+        and after[2]
+        and before[3] is None
+        and after[3] is None
+        and before[4] is not None
+        and before[4] == after[4]
+        and bool(before[5])
+        and before[5] == after[5]
+    )
+    workspace_preserved = observation.workspace_preserved and repository_identity_preserved
+    side_effect_counts, side_effect_sample = summarize_side_effect_paths(
+        observation.authorized_side_effect_changed_paths,
+        allowed_side_effect_paths,
+    )
+    return {
+        "attempt": attempt,
+        "status": observation.status if repository_identity_preserved else "UNEXPECTED_DRIFT",
+        "workspace_preserved": workspace_preserved,
+        "product_state_preserved": observation.product_state_preserved,
+        "repository_identity_preserved": repository_identity_preserved,
+        "index_clean_before": before[2],
+        "index_clean_after": after[2],
+        "git_special_state_before": before[3],
+        "git_special_state_after": after[3],
+        "index_identity_before": before[4],
+        "index_identity_after": after[4],
+        "protected_git_metadata_hash_before": (
+            workspace_hash(before[5]) if before[5] else None
+        ),
+        "protected_git_metadata_hash_after": (
+            workspace_hash(after[5]) if after[5] else None
+        ),
+        "protected_git_metadata_preserved": bool(before[5]) and before[5] == after[5],
+        "workspace_git_entry_hash_before": (
+            run_review.workspace_git_entry_hash_from_snapshot(before[5])
+            if before[5]
+            else None
+        ),
+        "workspace_git_entry_hash_after": (
+            run_review.workspace_git_entry_hash_from_snapshot(after[5])
+            if after[5]
+            else None
+        ),
+        "workspace_git_entry_preserved": (
+            bool(before[5])
+            and bool(after[5])
+            and run_review.workspace_git_entry_hash_from_snapshot(before[5])
+            == run_review.workspace_git_entry_hash_from_snapshot(after[5])
+        ),
+        "protected_git_metadata_changed_path_count": len(
+            run_review.diff_workspace_hashes(before[5], after[5])
+        ),
+        "protected_git_metadata_changed_paths_sample": list(
+            run_review.diff_workspace_hashes(before[5], after[5])[:20]
+        ),
+        "authorized_side_effect_drift": observation.authorized_side_effect_drift,
+        "source_changed_paths": list(observation.source_changed_paths),
+        "unexpected_changed_paths": list(observation.unexpected_changed_paths),
+        "authorized_side_effect_changed_path_count": len(
+            observation.authorized_side_effect_changed_paths
+        ),
+        "authorized_side_effect_changed_counts_by_root": {
+            root: count for root, count in side_effect_counts
+        },
+        "authorized_side_effect_changed_paths_sample": list(side_effect_sample),
+        "workspace_full_hash_before": workspace_hash(before[1]),
+        "workspace_full_hash_after": workspace_hash(after[1]),
+    }
 
 
 def _finalize(
@@ -1349,6 +1842,13 @@ def _finalize(
     workspace_preserved_during_reviews: bool,
     previous_evidence_immutable: bool,
     usages: list[dict[str, float | int | None]],
+    baseline_commit: str | None = None,
+    workspace_baseline_hashes: dict[str, str] | None = None,
+    baseline_git_metadata: dict[str, str] | None = None,
+    allowed_side_effect_paths: tuple[str, ...] = (),
+    model_invocation_count: int = 0,
+    provider_invocation_observations: list[dict[str, Any]] | None = None,
+    review_workspace_observations: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     run_state = machine.state
     if run_state == "COMPLETED":
@@ -1367,7 +1867,90 @@ def _finalize(
     finished_at = _utc_now_iso()
     usage = aggregate_usage(usages)
     duration_ms = _elapsed_ms(started_at, finished_at)
+    try:
+        fallback_final_git_metadata = run_review.protected_git_metadata_snapshot(
+            workspace
+        )
+    except run_review.EvidenceIntegrityFailure:
+        fallback_final_git_metadata = {}
+    fallback_git_metadata_changes = (
+        run_review.diff_workspace_hashes(
+            baseline_git_metadata,
+            fallback_final_git_metadata,
+        )
+        if baseline_git_metadata is not None
+        else ()
+    )
+    fallback_final_git_entry_hash = (
+        run_review.workspace_git_entry_hash_from_snapshot(
+            fallback_final_git_metadata
+        )
+        if fallback_final_git_metadata
+        else None
+    )
+    fallback_baseline_git_entry_hash = (
+        run_review.workspace_git_entry_hash_from_snapshot(baseline_git_metadata)
+        if baseline_git_metadata is not None
+        else None
+    )
+    final_workspace = {
+        "workspace_final_hash": workspace_hash(snapshot_workspace_hashes(workspace)),
+        "workspace_final_changed_paths": list(workspace_final_changed_paths),
+        "workspace_final_source_changed_paths": list(workspace_final_changed_paths),
+        "workspace_final_unexpected_changed_paths": list(unexpected_changed_paths),
+        "workspace_final_authorized_side_effect_changed_path_count": 0,
+        "workspace_final_authorized_side_effect_changed_counts_by_root": {
+            root: 0 for root in allowed_side_effect_paths
+        },
+        "workspace_final_authorized_side_effect_changed_paths_sample": [],
+        "protected_git_metadata_final_hash": (
+            workspace_hash(fallback_final_git_metadata)
+            if fallback_final_git_metadata
+            else None
+        ),
+        "protected_git_metadata_baseline_hash": (
+            workspace_hash(baseline_git_metadata)
+            if baseline_git_metadata is not None
+            else None
+        ),
+        "protected_git_metadata_preserved": (
+            bool(fallback_final_git_metadata)
+            and baseline_git_metadata is not None
+            and not fallback_git_metadata_changes
+        ),
+        "workspace_git_entry_final_hash": fallback_final_git_entry_hash,
+        "workspace_git_entry_baseline_hash": fallback_baseline_git_entry_hash,
+        "workspace_git_entry_preserved": (
+            fallback_final_git_entry_hash is not None
+            and fallback_final_git_entry_hash
+            == fallback_baseline_git_entry_hash
+        ),
+        "protected_git_metadata_changed_path_count": len(
+            fallback_git_metadata_changes
+        ),
+        "protected_git_metadata_changed_paths_sample": list(
+            fallback_git_metadata_changes[:20]
+        ),
+    }
+    if baseline_commit is not None and workspace_baseline_hashes is not None:
+        final_workspace = _derive_final_workspace_evidence(
+            workspace=workspace,
+            baseline_commit=baseline_commit,
+            baseline_hashes=workspace_baseline_hashes,
+            allowed_source_paths=allowed_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
+            baseline_git_metadata=baseline_git_metadata,
+        )
 
+    if accepted and final_workspace["protected_git_metadata_preserved"] is not True:
+        accepted = False
+        terminal_outcome = "FAILED"
+        if error_category is None:
+            error_category = "FINAL_REPOSITORY_IDENTITY_DRIFT"
+        if error_message is None:
+            error_message = "final protected Git metadata differs from the starting repository identity"
+
+    provider_observations = list(provider_invocation_observations or [])
     return {
         "loop_run_id": loop_run_id,
         "workspace": str(workspace),
@@ -1376,6 +1959,15 @@ def _finalize(
         "stop_reason": stop_reason,
         "accepted": accepted,
         "implementation_attempts": len(implementation_run_ids),
+        "model_invocation_count": model_invocation_count,
+        "model_invocation_count_semantics": (
+            "positively observed model-execution CLI subprocess starts"
+        ),
+        "model_invocation_observation_complete": all(
+            observation.get("provider_invoked") is not None
+            for observation in provider_observations
+        ),
+        "provider_invocation_observations": provider_observations,
         "review_attempts": len(review_run_ids),
         "repair_rounds": repair_rounds,
         "implementation_run_ids": implementation_run_ids,
@@ -1392,9 +1984,49 @@ def _finalize(
             compute_authorized_command_set_fingerprint(authorized_commands) if authorized_commands else None
         ),
         "authorized_command_count": len(authorized_commands),
-        "workspace_final_changed_paths": workspace_final_changed_paths,
-        "unexpected_changed_paths": unexpected_changed_paths,
+        "workspace_final_changed_paths": final_workspace["workspace_final_changed_paths"],
+        "workspace_final_source_changed_paths": final_workspace[
+            "workspace_final_source_changed_paths"
+        ],
+        "workspace_final_hash": final_workspace["workspace_final_hash"],
+        "workspace_final_authorized_side_effect_changed_path_count": final_workspace[
+            "workspace_final_authorized_side_effect_changed_path_count"
+        ],
+        "workspace_final_authorized_side_effect_changed_counts_by_root": final_workspace[
+            "workspace_final_authorized_side_effect_changed_counts_by_root"
+        ],
+        "workspace_final_authorized_side_effect_changed_paths_sample": final_workspace[
+            "workspace_final_authorized_side_effect_changed_paths_sample"
+        ],
+        "unexpected_changed_paths": final_workspace[
+            "workspace_final_unexpected_changed_paths"
+        ],
+        "protected_git_metadata_final_hash": final_workspace[
+            "protected_git_metadata_final_hash"
+        ],
+        "protected_git_metadata_baseline_hash": final_workspace[
+            "protected_git_metadata_baseline_hash"
+        ],
+        "protected_git_metadata_preserved": final_workspace[
+            "protected_git_metadata_preserved"
+        ],
+        "workspace_git_entry_final_hash": final_workspace[
+            "workspace_git_entry_final_hash"
+        ],
+        "workspace_git_entry_baseline_hash": final_workspace[
+            "workspace_git_entry_baseline_hash"
+        ],
+        "workspace_git_entry_preserved": final_workspace[
+            "workspace_git_entry_preserved"
+        ],
+        "protected_git_metadata_changed_path_count": final_workspace[
+            "protected_git_metadata_changed_path_count"
+        ],
+        "protected_git_metadata_changed_paths_sample": final_workspace[
+            "protected_git_metadata_changed_paths_sample"
+        ],
         "workspace_preserved_during_reviews": workspace_preserved_during_reviews,
+        "review_workspace_observations": list(review_workspace_observations or []),
         "previous_evidence_immutable": previous_evidence_immutable,
         "started_at": started_at,
         "finished_at": finished_at,
@@ -1428,8 +2060,30 @@ def _write_and_print(loop_dir: Path, result: dict[str, Any]) -> None:
         "accepted": result["accepted"],
         "final_verdict": result["final_verdict"],
         "implementation_attempts": result["implementation_attempts"],
+        "model_invocation_count": result["model_invocation_count"],
+        "model_invocation_observation_complete": result[
+            "model_invocation_observation_complete"
+        ],
         "review_attempts": result["review_attempts"],
         "repair_rounds": result["repair_rounds"],
+        "protected_git_metadata_final_hash": result[
+            "protected_git_metadata_final_hash"
+        ],
+        "protected_git_metadata_preserved": result[
+            "protected_git_metadata_preserved"
+        ],
+        "workspace_git_entry_final_hash": result[
+            "workspace_git_entry_final_hash"
+        ],
+        "workspace_git_entry_preserved": result[
+            "workspace_git_entry_preserved"
+        ],
+        "protected_git_metadata_changed_path_count": result[
+            "protected_git_metadata_changed_path_count"
+        ],
+        "protected_git_metadata_changed_paths_sample": result[
+            "protected_git_metadata_changed_paths_sample"
+        ],
         "duration_ms": result["duration_ms"],
         "total_model_cost_usd": result["usage"]["total_model_cost_usd"],
         "evidence_directory": result["evidence_paths"]["loop_directory"],

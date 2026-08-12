@@ -13,8 +13,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -48,6 +50,16 @@ def make_workspace(tmp_path: Path, *, changed_content: str = "changed\n") -> Pat
     _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], ws)
     (ws / "app.txt").write_text(changed_content, encoding="utf-8")
     return ws
+
+
+def make_linked_workspace(tmp_path: Path) -> tuple[Path, Path]:
+    """A primary repository plus a linked worktree with one source change."""
+
+    primary = make_workspace(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    _git(["worktree", "add", "-q", "-b", "linked-test", str(linked), "HEAD"], primary)
+    (linked / "app.txt").write_text("changed in linked worktree\n", encoding="utf-8")
+    return primary, linked
 
 
 def make_files_workspace(
@@ -88,6 +100,7 @@ def make_implementation_run_directory(
     run_id: str = "run-1",
     attempt: int = 1,
     dir_name: str = "impl-run",
+    allowed_changed_paths: list[str] | None = None,
     allowed_side_effect_paths: list[str] | None = None,
 ) -> Path:
     run_dir = tmp_path / dir_name
@@ -104,7 +117,7 @@ def make_implementation_run_directory(
         "duration_ms": 1234,
         "changed_paths": changed_paths if changed_paths is not None else ["app.txt"],
         "unexpected_changed_paths": unexpected_changed_paths or [],
-        "allowed_changed_paths": ["app.txt"],
+        "allowed_changed_paths": list(allowed_changed_paths or ["app.txt"]),
         "allowed_side_effect_paths": list(allowed_side_effect_paths or []),
         "error_category": None,
         "error_message": None,
@@ -171,6 +184,10 @@ def write_fake_codex(
     sleep_seconds: float = 0,
     write_unexpected: str | None = None,
     write_allowed: str | None = None,
+    assume_unchanged_workspace: str | None = None,
+    help_write_path: str | None = None,
+    help_assume_unchanged_workspace: str | None = None,
+    help_background_launcher: str | None = None,
     omit_last_message: bool = False,
     top_help: str = _FAKE_CODEX_TOP_HELP,
     exec_help: str = _FAKE_CODEX_EXEC_HELP,
@@ -179,10 +196,26 @@ def write_fake_codex(
 
     script = directory / name
     body = f'''#!/usr/bin/env python3
-import sys, time, pathlib
+import sys, time, pathlib, subprocess
 
 argv = sys.argv[1:]
 if argv[:1] == ["--help"]:
+    if {help_write_path!r}:
+        pathlib.Path({help_write_path!r}).write_text("capability probe touched source\\n")
+    if {help_assume_unchanged_workspace!r}:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                {help_assume_unchanged_workspace!r},
+                "update-index",
+                "--assume-unchanged",
+                "app.txt",
+            ],
+            check=True,
+        )
+    if {help_background_launcher!r}:
+        subprocess.run([{help_background_launcher!r}], check=True)
     print({top_help!r})
     raise SystemExit(0)
 if argv[:2] == ["exec", "--help"]:
@@ -202,6 +235,18 @@ if "exec" in argv:
         pathlib.Path({write_allowed!r}).write_text("codex touched an allowed path\\n")
     if {write_unexpected!r}:
         pathlib.Path({write_unexpected!r}).write_text("codex touched an unexpected path\\n")
+    if {assume_unchanged_workspace!r}:
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                {assume_unchanged_workspace!r},
+                "update-index",
+                "--assume-unchanged",
+                "app.txt",
+            ],
+            check=True,
+        )
     content = {prose_prefix!r} + ({verdict_json!r} or "")
     if last_message_path and not {omit_last_message!r}:
         pathlib.Path(last_message_path).write_text(content)
@@ -211,6 +256,50 @@ raise SystemExit(1)
     script.write_text(body, encoding="utf-8")
     script.chmod(0o755)
     return script
+
+
+def write_background_writer_launcher(
+    directory: Path,
+    *,
+    target: Path,
+    name: str,
+    ignore_term: bool = False,
+) -> tuple[Path, Path]:
+    launcher = directory / name
+    pid_file = directory / f"{name}.child-pid"
+    child_code = (
+        "import os, pathlib, signal, time; "
+        f"pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid())); "
+        + ("signal.signal(signal.SIGTERM, signal.SIG_IGN); " if ignore_term else "")
+        + f"time.sleep(30); pathlib.Path({str(target)!r}).write_text('escaped delayed write\\n')"
+    )
+    launcher.write_text(
+        "#!/usr/bin/env python3\n"
+        "import pathlib, subprocess, sys, time\n"
+        f"pid_file = pathlib.Path({str(pid_file)!r})\n"
+        "subprocess.Popen([sys.executable, '-c', "
+        f"{child_code!r}], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
+        "stderr=subprocess.DEVNULL)\n"
+        "deadline = time.monotonic() + 2\n"
+        "while not pid_file.exists() and time.monotonic() < deadline:\n"
+        "    time.sleep(0.01)\n"
+        "raise SystemExit(0 if pid_file.exists() else 2)\n",
+        encoding="utf-8",
+    )
+    launcher.chmod(0o755)
+    return launcher, pid_file
+
+
+def assert_process_absent(pid_file: Path) -> None:
+    pid = int(pid_file.read_text(encoding="utf-8"))
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.02)
+    pytest.fail(f"delayed descendant {pid} is still present")
 
 
 def approve_verdict_json() -> str:
@@ -373,6 +462,123 @@ def test_timeout(tmp_path: Path) -> None:
     assert run_review_cli(tmp_path, ws, codex, timeout_seconds=1) == 4
 
 
+def test_provider_observer_is_false_only_when_codex_process_does_not_start(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[bool | None] = []
+
+    def fail_start(*args: object, **kwargs: object) -> object:
+        raise OSError("synthetic start failure")
+
+    monkeypatch.setattr(run_review.subprocess, "Popen", fail_start)
+    with pytest.raises(OSError):
+        run_review.execute_bounded(
+            ["fake-codex"],
+            cwd=tmp_path,
+            timeout_seconds=1,
+            provider_observer=observations.append,
+        )
+
+    assert observations == [False]
+
+
+def test_provider_observer_stays_true_after_post_start_oserror(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observations: list[bool | None] = []
+
+    class StartedProcess:
+        pid = 12345
+        returncode = None
+
+        def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+            raise OSError("synthetic communicate failure")
+
+    monkeypatch.setattr(
+        run_review.subprocess,
+        "Popen",
+        lambda *args, **kwargs: StartedProcess(),
+    )
+    monkeypatch.setattr(run_review, "_ensure_group_quiescent", lambda pgid: None)
+    with pytest.raises(OSError):
+        run_review.execute_bounded(
+            ["fake-codex"],
+            cwd=tmp_path,
+            timeout_seconds=1,
+            provider_observer=observations.append,
+        )
+
+    assert observations == [True]
+
+
+def test_capability_probe_delayed_descendant_is_quiesced(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    original = (ws / "app.txt").read_text(encoding="utf-8")
+    launcher, pid_file = write_background_writer_launcher(
+        tmp_path,
+        target=ws / "app.txt",
+        name="probe-delayed-writer",
+    )
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        help_background_launcher=str(launcher),
+    )
+
+    assert run_review_cli(tmp_path, ws, codex) == 0
+    assert_process_absent(pid_file)
+    assert (ws / "app.txt").read_text(encoding="utf-8") == original
+
+
+def test_deterministic_check_delayed_descendant_is_quiesced(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    original = (ws / "app.txt").read_text(encoding="utf-8")
+    launcher, pid_file = write_background_writer_launcher(
+        tmp_path,
+        target=ws / "app.txt",
+        name="check-delayed-writer",
+    )
+    codex = write_fake_codex(tmp_path, verdict_json=approve_verdict_json())
+
+    assert run_review_cli(tmp_path, ws, codex, check_commands=[str(launcher)]) == 0
+    assert_process_absent(pid_file)
+    assert (ws / "app.txt").read_text(encoding="utf-8") == original
+
+
+def test_descendant_ignoring_sigterm_is_killed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    target = tmp_path / "must-not-exist"
+    launcher, pid_file = write_background_writer_launcher(
+        tmp_path,
+        target=target,
+        name="ignore-term-writer",
+        ignore_term=True,
+    )
+    monkeypatch.setattr(run_review, "_PROCESS_CLEANUP_GRACE_SECONDS", 0.1)
+
+    result = run_review.run_check_command(str(launcher), tmp_path, 5)
+
+    assert result.exit_code == 0
+    assert_process_absent(pid_file)
+    assert not target.exists()
+
+
+def test_quiescence_unknown_fails_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(run_review, "_group_alive", lambda pgid: None)
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.run_check_command("/usr/bin/true", tmp_path, 5)
+
+    assert excinfo.value.category == "SUBPROCESS_QUIESCENCE_UNVERIFIED"
+
+
 # ---------------------------------------------------------------------------
 # 9-10. Codex modifies the workspace.
 # ---------------------------------------------------------------------------
@@ -392,6 +598,428 @@ def test_codex_modifies_an_unexpected_file(tmp_path: Path) -> None:
         tmp_path, verdict_json=approve_verdict_json(), write_unexpected=str(ws / "README.md")
     )
     assert run_review_cli(tmp_path, ws, codex) == 4
+
+
+def test_codex_cannot_write_authorized_ignored_side_effect(tmp_path: Path) -> None:
+    """Only deterministic checks may create declared review side effects."""
+
+    ws = make_workspace(tmp_path)
+    (ws / ".gitignore").write_text(".pytest_cache/\n", encoding="utf-8")
+    _git(["add", ".gitignore"], ws)
+    _git(
+        ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "ignore cache"],
+        ws,
+    )
+    cache = ws / ".pytest_cache"
+    cache.mkdir()
+    run_dir = make_implementation_run_directory(
+        tmp_path,
+        workspace=ws,
+        allowed_side_effect_paths=[".pytest_cache"],
+    )
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(cache / "provider-state"),
+    )
+    evidence_root = tmp_path / "reviews"
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        implementation_run_directory=run_dir,
+        review_run_id="review-provider-side-effect",
+        evidence_directory=evidence_root,
+    )
+
+    assert exit_code == 4
+    receipt = json.loads(
+        (evidence_root / "review-provider-side-effect" / "review-receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["provider_invoked"] is True
+    assert receipt["workspace_unchanged"] is False
+    assert receipt["workspace_preservation_status"] == "UNEXPECTED_DRIFT"
+    assert receipt["reviewer_modified_paths"] == [".pytest_cache/provider-state"]
+
+
+def test_codex_semantic_index_flag_drift_is_rejected(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    before_identity = run_review.git_index_identity(ws)
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        assume_unchanged_workspace=str(ws),
+    )
+    evidence_root = tmp_path / "reviews"
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        review_run_id="review-index-flag-drift",
+        evidence_directory=evidence_root,
+    )
+
+    assert exit_code == 4
+    assert run_review.git_index_clean(ws) is True
+    assert run_review.git_index_identity(ws) != before_identity
+    receipt = json.loads(
+        (evidence_root / "review-index-flag-drift" / "review-receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["workspace_unchanged"] is False
+    assert receipt["reviewer_repository_identity_preserved"] is False
+
+
+def test_codex_git_hook_mutation_is_rejected(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    hook = run_review.git_common_dir(ws) / "hooks" / "tomtit-review-hook"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(hook),
+    )
+    evidence_root = tmp_path / "reviews"
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        review_run_id="review-git-hook-drift",
+        evidence_directory=evidence_root,
+    )
+
+    assert exit_code == 4
+    receipt = json.loads(
+        (evidence_root / "review-git-hook-drift" / "review-receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert receipt["workspace_unchanged"] is False
+    assert receipt["protected_git_metadata_preserved"] is False
+    assert any(
+        path.endswith("hooks/tomtit-review-hook")
+        for path in receipt["protected_git_metadata_changed_paths_sample"]
+    )
+
+
+def test_deterministic_check_git_config_mutation_stops_before_reviewer(
+    tmp_path: Path,
+) -> None:
+    ws = make_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+    )
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        check_commands=["git config tomtit.synthetic changed"],
+    )
+
+    assert exit_code == 3
+    assert not marker.exists()
+
+
+def test_capability_probe_git_hook_mutation_is_rejected(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    hook = run_review.git_common_dir(ws) / "hooks" / "tomtit-probe-hook"
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(hook),
+        write_unexpected=str(marker),
+    )
+
+    exit_code = run_review_cli(tmp_path, ws, codex)
+
+    assert exit_code == 3
+    assert not marker.exists()
+
+
+def test_protected_git_metadata_identity_is_worktree_aware(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    _git(["worktree", "add", "-q", "-b", "linked-test", str(linked), "HEAD"], ws)
+
+    git_directory = run_review.git_dir(linked)
+    common_directory = run_review.git_common_dir(linked)
+    before = run_review.protected_git_metadata_snapshot(linked)
+
+    assert git_directory is not None
+    assert common_directory is not None
+    assert git_directory != common_directory
+    assert before["@git_dir"] == f"path:{git_directory.resolve()}"
+    assert before["@git_common_dir"] == f"path:{common_directory.resolve()}"
+    _git(["config", "tomtit.worktree", "changed"], linked)
+    assert run_review.protected_git_metadata_snapshot(linked) != before
+
+
+def test_protected_git_metadata_identity_binds_ordinary_git_directory(
+    tmp_path: Path,
+) -> None:
+    ws = make_workspace(tmp_path)
+
+    identity = run_review.protected_git_metadata_snapshot(ws)
+
+    assert (ws / ".git").is_dir()
+    assert identity["@workspace_git_entry"].startswith("dir:")
+    assert run_review.workspace_git_entry_hash_from_snapshot(identity)
+
+
+def test_linked_worktree_root_gitfile_unchanged_is_bound(tmp_path: Path) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+
+    before = run_review.protected_git_metadata_snapshot(linked)
+    after = run_review.protected_git_metadata_snapshot(linked)
+
+    assert (linked / ".git").is_file()
+    assert before["@workspace_git_entry"].startswith("file:")
+    assert before == after
+    assert (
+        run_review.workspace_git_entry_hash_from_snapshot(before)
+        == run_review.workspace_git_entry_hash_from_snapshot(after)
+    )
+
+
+def test_linked_worktree_root_gitfile_content_change_is_detected(
+    tmp_path: Path,
+) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    gitfile = linked / ".git"
+    before = run_review.protected_git_metadata_snapshot(linked)
+    resolved_git_dir = run_review.git_dir(linked)
+    assert resolved_git_dir is not None
+    relative_git_dir = os.path.relpath(resolved_git_dir, linked)
+    gitfile.write_text(f"gitdir: {relative_git_dir}\n", encoding="utf-8")
+
+    assert run_review.git_dir(linked) == resolved_git_dir
+    after = run_review.protected_git_metadata_snapshot(linked)
+    assert after != before
+    assert (
+        run_review.workspace_git_entry_hash_from_snapshot(after)
+        != run_review.workspace_git_entry_hash_from_snapshot(before)
+    )
+
+
+def test_linked_worktree_root_gitfile_mode_change_is_detected(tmp_path: Path) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    gitfile = linked / ".git"
+    before = run_review.protected_git_metadata_snapshot(linked)
+    gitfile.chmod(0o600)
+
+    after = run_review.protected_git_metadata_snapshot(linked)
+
+    assert after != before
+    assert (
+        run_review.workspace_git_entry_hash_from_snapshot(after)
+        != run_review.workspace_git_entry_hash_from_snapshot(before)
+    )
+
+
+def test_linked_worktree_root_gitfile_replacement_type_change_is_detected(
+    tmp_path: Path,
+) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    gitfile = linked / ".git"
+    before = run_review.protected_git_metadata_snapshot(linked)
+    original = gitfile.read_bytes()
+    gitfile.unlink()
+    gitfile.write_bytes(original)
+
+    replaced = run_review.protected_git_metadata_snapshot(linked)
+    assert replaced != before
+
+    gitfile.unlink()
+    gitfile.mkdir()
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(linked)
+
+
+def test_capability_probe_linked_worktree_gitfile_mutation_is_rejected(
+    tmp_path: Path,
+) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(linked / ".git"),
+        write_unexpected=str(marker),
+    )
+
+    exit_code = run_review_cli(tmp_path, linked, codex)
+
+    assert exit_code == 3
+    assert not marker.exists()
+
+
+def test_reviewer_linked_worktree_gitfile_mutation_is_rejected(
+    tmp_path: Path,
+) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(linked / ".git"),
+    )
+
+    exit_code = run_review_cli(tmp_path, linked, codex)
+
+    assert exit_code == 4
+
+
+def test_linked_worktree_review_receipt_binds_gitfile_identity(
+    tmp_path: Path,
+) -> None:
+    _, linked = make_linked_workspace(tmp_path)
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=request_changes_verdict_json(),
+    )
+    evidence_root = tmp_path / "reviews"
+
+    exit_code = run_review_cli(
+        tmp_path,
+        linked,
+        codex,
+        review_run_id="linked-review",
+        evidence_directory=evidence_root,
+    )
+
+    receipt = json.loads(
+        (evidence_root / "linked-review" / "review-receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    current = run_review.protected_git_metadata_snapshot(linked)
+    assert exit_code == 1
+    assert receipt["workspace_git_entry_preserved"] is True
+    assert receipt["reviewed_workspace_git_entry_hash"] == (
+        run_review.workspace_git_entry_hash_from_snapshot(current)
+    )
+
+
+def test_deterministic_check_repository_drift_stops_before_reviewer(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+    )
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        check_commands=["git add app.txt"],
+    )
+
+    assert exit_code == 3
+    assert not marker.exists()
+    assert run_review.git_index_clean(ws) is False
+
+
+def test_deterministic_check_semantic_index_flag_drift_stops_before_reviewer(
+    tmp_path: Path,
+) -> None:
+    ws = make_workspace(tmp_path)
+    before_identity = run_review.git_index_identity(ws)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+    )
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        check_commands=["git update-index --assume-unchanged app.txt"],
+    )
+
+    assert exit_code == 3
+    assert not marker.exists()
+    assert run_review.git_index_clean(ws) is True
+    assert run_review.git_index_identity(ws) != before_identity
+
+
+def test_codex_capability_probe_source_drift_stops_before_model_execution(
+    tmp_path: Path,
+) -> None:
+    ws = make_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+        help_write_path=str(ws / "app.txt"),
+    )
+
+    exit_code = run_review_cli(tmp_path, ws, codex)
+
+    assert exit_code == 3
+    assert not marker.exists()
+    assert (ws / "app.txt").read_text(encoding="utf-8") == (
+        "capability probe touched source\n"
+    )
+
+
+def test_failed_codex_capability_probe_still_reports_source_drift(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    ws = make_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+        help_write_path=str(ws / "app.txt"),
+        top_help="Usage: unsupported-provider\n",
+        exec_help="Usage: unsupported-provider exec\n",
+    )
+
+    exit_code = run_review_cli(tmp_path, ws, codex)
+
+    output = capsys.readouterr().out
+    assert exit_code == 3
+    assert "STATUS=PREFLIGHT_FAILURE:IMMUTABILITY_VIOLATION" in output
+    assert "UNSUPPORTED_CODEX_CLI_CONTRACT" not in output
+    assert not marker.exists()
+
+
+def test_codex_capability_probe_index_flag_drift_stops_before_model_execution(
+    tmp_path: Path,
+) -> None:
+    ws = make_workspace(tmp_path)
+    before_identity = run_review.git_index_identity(ws)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+        help_assume_unchanged_workspace=str(ws),
+    )
+
+    exit_code = run_review_cli(tmp_path, ws, codex)
+
+    assert exit_code == 3
+    assert not marker.exists()
+    assert run_review.git_index_clean(ws) is True
+    assert run_review.git_index_identity(ws) != before_identity
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +1056,29 @@ def test_invalid_allowed_path(tmp_path: Path) -> None:
     ws = make_workspace(tmp_path)
     codex = write_fake_codex(tmp_path, verdict_json=approve_verdict_json())
     assert run_review_cli(tmp_path, ws, codex, allowed_paths=["../escape.txt"]) == 3
+
+
+def test_review_evidence_directory_inside_workspace_is_rejected(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    marker = tmp_path / "reviewer-started"
+    codex = write_fake_codex(
+        tmp_path,
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(marker),
+    )
+    evidence_root = ws / ".review-evidence"
+
+    exit_code = run_review_cli(
+        tmp_path,
+        ws,
+        codex,
+        evidence_directory=evidence_root,
+        review_run_id="inside-workspace",
+    )
+
+    assert exit_code == 3
+    assert not marker.exists()
+    assert not (evidence_root / "inside-workspace").exists()
 
 
 def test_missing_task_prompt(tmp_path: Path) -> None:
@@ -630,6 +1281,117 @@ def test_workspace_hashes_identical_after_review(tmp_path: Path) -> None:
     run_review_cli(tmp_path, ws, codex)
     after = (ws / "app.txt").read_bytes(), (ws / "README.md").read_bytes()
     assert before == after
+
+
+def test_read_canonical_evidence_accepts_unchanged_regular_artifact(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    artifact = evidence / "receipt.json"
+    artifact.write_bytes(b'{"status":"ok"}')
+
+    measured = run_review.read_canonical_evidence(evidence, ("receipt.json",))
+
+    assert measured.file_bytes["receipt.json"] == b'{"status":"ok"}'
+    assert measured.identity["receipt.json"].startswith("file:")
+
+
+def test_read_canonical_evidence_rejects_same_size_mutation_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    artifact = evidence / "receipt.json"
+    original = b'{"value":"AAAA"}'
+    replacement = b'{"value":"BBBB"}'
+    assert len(original) == len(replacement)
+    artifact.write_bytes(original)
+    target_inode = artifact.lstat().st_ino
+    real_read = os.read
+    mutated = False
+
+    def racing_read(descriptor: int, count: int) -> bytes:
+        nonlocal mutated
+        data = real_read(descriptor, count)
+        if data and not mutated and os.fstat(descriptor).st_ino == target_inode:
+            mutated = True
+            artifact.write_bytes(replacement)
+            current = artifact.stat()
+            os.utime(
+                artifact,
+                ns=(current.st_atime_ns, current.st_mtime_ns + 1_000_000_000),
+            )
+        return data
+
+    monkeypatch.setattr(os, "read", racing_read)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.read_canonical_evidence(evidence, ("receipt.json",))
+
+
+def test_read_canonical_evidence_rejects_pathname_replacement_during_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    artifact = evidence / "receipt.json"
+    artifact.write_bytes(b'{"value":"original"}')
+    target_inode = artifact.lstat().st_ino
+    held_original = tmp_path / "held-original.json"
+    replacement = tmp_path / "replacement.json"
+    replacement.write_bytes(b'{"value":"replaced"}')
+    real_read = os.read
+    replaced = False
+
+    def racing_read(descriptor: int, count: int) -> bytes:
+        nonlocal replaced
+        data = real_read(descriptor, count)
+        if data and not replaced and os.fstat(descriptor).st_ino == target_inode:
+            replaced = True
+            artifact.replace(held_original)
+            replacement.replace(artifact)
+        return data
+
+    monkeypatch.setattr(os, "read", racing_read)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.read_canonical_evidence(evidence, ("receipt.json",))
+    assert held_original.exists(), "the originally opened inode remains alive by another name"
+
+
+def test_implementation_loader_parses_captured_bytes_without_path_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = make_workspace(tmp_path)
+    run_directory = make_implementation_run_directory(tmp_path, workspace=workspace)
+    receipt_path = run_directory / "receipt.json"
+    external = tmp_path / "later-receipt.json"
+    later_receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    later_receipt["run_id"] = "unrelated-later-run"
+    external.write_text(json.dumps(later_receipt), encoding="utf-8")
+    real_reader = run_review.read_canonical_evidence
+
+    def capture_then_replace(root: Path, names: tuple[str, ...]):
+        measured = real_reader(root, names)
+        receipt_path.unlink()
+        receipt_path.symlink_to(external)
+        return measured
+
+    monkeypatch.setattr(run_review, "read_canonical_evidence", capture_then_replace)
+
+    loaded = run_review.load_implementation_evidence(
+        run_directory,
+        workspace,
+        "run-1",
+        1,
+    )
+
+    assert receipt_path.is_symlink()
+    assert loaded["receipt"]["run_id"] == "run-1"
 
 
 # ---------------------------------------------------------------------------
@@ -1109,7 +1871,12 @@ def preflight_for(
 def test_authorized_nonignored_side_effect_passes_preflight(tmp_path: Path) -> None:
     ws = make_files_workspace(tmp_path, {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n"})
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     pre = preflight_for(
         tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["package.json"]
@@ -1126,7 +1893,12 @@ def test_unexpected_source_fails_closed(tmp_path: Path) -> None:
         {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n", "src/unapproved.ts": "export {};\n"},
     )
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["package.json"])
@@ -1138,7 +1910,12 @@ def test_prefix_confusion_dist_evil_denied(tmp_path: Path) -> None:
         tmp_path, {"package.json": "{}\n", "dist-evil/bundle.js": "console.log(1);\n"}
     )
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["package.json"])
@@ -1147,7 +1924,13 @@ def test_prefix_confusion_dist_evil_denied(tmp_path: Path) -> None:
 
 def test_side_effect_without_authorization_fails_closed(tmp_path: Path) -> None:
     ws = make_files_workspace(tmp_path, {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n"})
-    run_dir = make_implementation_run_directory(tmp_path, workspace=ws, run_id="impl-1", attempt=1)
+    run_dir = make_implementation_run_directory(
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+    )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["package.json"])
     assert excinfo.value.category == "CHANGED_PATH_OUT_OF_SCOPE"
@@ -1156,7 +1939,12 @@ def test_side_effect_without_authorization_fails_closed(tmp_path: Path) -> None:
 def test_source_allowlist_wins_over_overlapping_side_effect_root(tmp_path: Path) -> None:
     ws = make_files_workspace(tmp_path, {"dist/bundle.js": "console.log(1);\n"})
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["dist/bundle.js"],
+        allowed_side_effect_paths=["dist"],
     )
     pre = preflight_for(
         tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["dist/bundle.js"]
@@ -1177,7 +1965,12 @@ def test_reviewer_cannot_broaden_authorized_side_effect_roots(tmp_path: Path) ->
         tmp_path, {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n", "coverage/report.html": "<html/>\n"}
     )
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(tmp_path, ws, implementation_run_directory=run_dir, allowed_paths=["package.json"])
@@ -1188,7 +1981,12 @@ def test_reviewer_cannot_broaden_authorized_side_effect_roots(tmp_path: Path) ->
 def test_wrong_run_evidence_cannot_authorize_side_effects_end_to_end(tmp_path: Path) -> None:
     ws = make_files_workspace(tmp_path, {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n"})
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(
@@ -1205,7 +2003,12 @@ def test_wrong_run_evidence_cannot_authorize_side_effects_end_to_end(tmp_path: P
 def test_wrong_attempt_evidence_cannot_authorize_side_effects_end_to_end(tmp_path: Path) -> None:
     ws = make_files_workspace(tmp_path, {"package.json": "{}\n", "dist/bundle.js": "console.log(1);\n"})
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     with pytest.raises(run_review.PreflightFailure) as excinfo:
         preflight_for(
@@ -1226,7 +2029,12 @@ def test_source_only_reviewer_patch_excludes_authorized_side_effect(tmp_path: Pa
         committed={"package.json": ""},
     )
     run_dir = make_implementation_run_directory(
-        tmp_path, workspace=ws, run_id="impl-1", attempt=1, allowed_side_effect_paths=["dist"]
+        tmp_path,
+        workspace=ws,
+        run_id="impl-1",
+        attempt=1,
+        allowed_changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
     )
     codex = write_fake_codex(tmp_path, verdict_json=approve_verdict_json())
     evidence_directory = tmp_path / "reviews"

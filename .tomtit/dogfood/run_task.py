@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import os
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
 COORDINATOR_ROOT = Path(__file__).resolve().parents[2]
@@ -59,9 +61,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def git_output(workspace: Path, *arguments: str) -> tuple[int, str]:
     """Run a fixed Git argv list; no user input is interpolated into a shell."""
 
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     completed = subprocess.run(
         ["git", *arguments],
         cwd=workspace,
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
@@ -202,6 +207,7 @@ def persist_evidence(
         "success": finalized.success,
         "exit_code": finalized.exit_code,
         "timed_out": finalized.timed_out,
+        "provider_invoked": finalized.provider_invoked,
         "duration_ms": finalized.duration_ms,
         "changed_paths": list(finalized.changed_paths),
         "unexpected_changed_paths": list(finalized.unexpected_changed_paths),
@@ -258,7 +264,11 @@ def print_receipt(result: ClaudeCodeCLIResult, directory: Path) -> None:
     print(f"EVIDENCE_DIRECTORY={directory}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    provider_observer: Callable[[bool | None], None] | None = None,
+) -> int:
     args = parse_args(argv)
     try:
         if args.timeout_seconds <= 0:
@@ -283,6 +293,8 @@ def main(argv: list[str] | None = None) -> int:
         except AllowedSideEffectPathError as exc:
             raise ConfigurationError(f"{exc.category}: {exc.message}") from exc
     except ConfigurationError:
+        if provider_observer is not None:
+            provider_observer(False)
         print("STATUS=CONFIGURATION_FAILURE")
         return 2
 
@@ -304,8 +316,12 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = ClaudeCodeCLIAdapter().run(request, executable_path=args.executable)
     except Exception:
+        if provider_observer is not None:
+            provider_observer(None)
         print("STATUS=INTERNAL_ERROR")
         return 3
+    if provider_observer is not None:
+        provider_observer(result.provider_invoked)
     after = snapshot_workspace_contents(workspace)
     try:
         finalized = persist_evidence(

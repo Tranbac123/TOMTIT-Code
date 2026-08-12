@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -39,6 +40,8 @@ run_task = sys.modules["run_task"]
 from tomtit.adapters.claude_code_cli import (  # noqa: E402
     compute_authorized_command_fingerprint,
     compute_authorized_command_set_fingerprint,
+    snapshot_workspace_hashes,
+    workspace_hash,
 )
 
 
@@ -62,6 +65,13 @@ def make_clean_workspace(tmp_path: Path, *, name: str = "workspace") -> Path:
     _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
     _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], ws)
     return ws
+
+
+def make_linked_clean_workspace(tmp_path: Path) -> Path:
+    primary = make_clean_workspace(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    _git(["worktree", "add", "-q", "-b", "linked-test", str(linked), "HEAD"], primary)
+    return linked
 
 
 def make_task_prompt(tmp_path: Path, *, text: str = "Do the thing.\nFollow the rules.\n", name: str = "task.md") -> Path:
@@ -217,6 +227,7 @@ def run_loop_cli(
     *,
     allow_one_repair: bool = False,
     allowed_paths: list[str] | None = None,
+    allowed_side_effect_paths: list[str] | None = None,
     check_commands: list[str] | None = None,
     implementation_timeout_seconds: int = 30,
     review_timeout_seconds: int = 30,
@@ -244,6 +255,8 @@ def run_loop_cli(
     ]
     for path in allowed_paths if allowed_paths is not None else ["app.txt"]:
         argv.extend(["--allowed-path", path])
+    for path in allowed_side_effect_paths or []:
+        argv.extend(["--allowed-side-effect-path", path])
     for command in check_commands or []:
         argv.extend(["--check-command", command])
     if allow_one_repair:
@@ -893,6 +906,678 @@ def test_workspace_drift_before_repair_rejected(tmp_path: Path) -> None:
     # read back as "not successful", never fabricating a receipt of its own.
     assert repair2["receipt"] is None
     assert repair2["exit_code"] == 3
+
+
+def _add_ignored_runtime_paths(workspace: Path, *paths: str) -> None:
+    (workspace / ".gitignore").write_text("".join(f"{path}/\n" for path in paths), encoding="utf-8")
+    _git(["add", ".gitignore"], workspace)
+    _git(
+        ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "ignore runtime paths"],
+        workspace,
+    )
+
+
+def _cache_writing_check_command() -> str:
+    return (
+        f'{sys.executable} -c "from pathlib import Path; '
+        'p=Path(\'.pytest_cache/review-state\'); '
+        'p.parent.mkdir(parents=True, exist_ok=True); p.write_text(\'checked\')"'
+    )
+
+
+def test_authorized_ignored_check_side_effect_drift_allows_repair(tmp_path: Path) -> None:
+    """Real R-01 shape: a check-created ignored cache must not invalidate reviewed source."""
+
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".pytest_cache")
+    claude = _stateful_claude(tmp_path)
+    codex = _adaptive_codex_script(
+        tmp_path,
+        workspace=ws,
+        second_verdict_json=approve_verdict_json(),
+    )
+    loop_dir = tmp_path / "loops" / "loop-authorized-review-cache"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allow_one_repair=True,
+        allowed_side_effect_paths=[".pytest_cache"],
+        check_commands=[_cache_writing_check_command()],
+        loop_run_id="loop-authorized-review-cache",
+        evidence_directory=tmp_path / "loops",
+    )
+
+    assert exit_code == 0
+    result = load_result(loop_dir)
+    assert result["workspace_final_changed_paths"] == ["app.txt"]
+    assert result["unexpected_changed_paths"] == []
+    assert result["workspace_final_hash"] == workspace_hash(snapshot_workspace_hashes(ws))
+    assert result["model_invocation_count"] == 4
+    assert result["model_invocation_observation_complete"] is True
+    review1_receipt = json.loads(
+        (loop_dir / "children" / "loop-authorized-review-cache-review-1" / "review-receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert review1_receipt["workspace_unchanged"] is True
+    assert review1_receipt["workspace_preservation_status"] == "AUTHORIZED_SIDE_EFFECT_DRIFT"
+    assert review1_receipt["deterministic_check_authorized_side_effect_drift"] is True
+    repair_receipt = json.loads(
+        (loop_dir / "children" / "loop-authorized-review-cache-repair-2" / "receipt.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert repair_receipt["provider_invoked"] is True
+    repair_model_events = [
+        event
+        for event in load_events(loop_dir)
+        if event["child_run_id"] == "loop-authorized-review-cache-repair-2"
+        and event["event_type"].startswith("MODEL_INVOCATION_")
+    ]
+    assert [event["event_type"] for event in repair_model_events] == [
+        "MODEL_INVOCATION_START",
+        "MODEL_INVOCATION_COMPLETE",
+    ]
+    assert all(event["provider_invoked"] is True for event in repair_model_events)
+    assert "provider_exit_code=0" in repair_model_events[-1]["summary"]
+
+
+def test_receiptless_repair_preflight_failure_keeps_terminal_evidence_truthful(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """R-02/R-03/R-04: a consumed repair slot is not a provider call or mutation proof."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = _stateful_claude(tmp_path)
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-preflight-failure",
+        verdict_json=request_changes_verdict_json(),
+    )
+    real_invoke_repair = run_loop.invoke_repair
+
+    def invoke_with_wrong_bound_identity(**kwargs):
+        kwargs["implementation_run_id"] = "wrong-implementation-run"
+        return real_invoke_repair(**kwargs)
+
+    monkeypatch.setattr(run_loop, "invoke_repair", invoke_with_wrong_bound_identity)
+    loop_dir = tmp_path / "loops" / "loop-repair-preflight-failure"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allow_one_repair=True,
+        loop_run_id="loop-repair-preflight-failure",
+        evidence_directory=tmp_path / "loops",
+    )
+
+    assert exit_code == 3
+    result = load_result(loop_dir)
+    assert result["implementation_attempts"] == 2  # bounded attempt slot consumed
+    assert result["model_invocation_count"] == 2  # Attempt 1 + Review 1 only
+    assert result["model_invocation_observation_complete"] is True
+    assert result["previous_evidence_immutable"] is True
+    assert result["workspace_final_changed_paths"] == ["app.txt"]
+    assert result["workspace_final_hash"] == workspace_hash(snapshot_workspace_hashes(ws))
+    assert (tmp_path / "stateful-marker.txt").read_text(encoding="utf-8") == "1"
+    repair_id = "loop-repair-preflight-failure-repair-2"
+    repair_events = [event for event in load_events(loop_dir) if event["child_run_id"] == repair_id]
+    assert not [event for event in repair_events if event["event_type"].startswith("MODEL_INVOCATION_")]
+    runner_complete = [
+        event for event in repair_events if event["event_type"] == "RUNNER_INVOCATION_COMPLETE"
+    ]
+    assert len(runner_complete) == 1
+    assert runner_complete[0]["provider_invoked"] is False
+
+
+def test_missing_or_contradictory_provider_evidence_is_unknown() -> None:
+    assert run_loop._provider_invocation_observation({}) is None
+    assert (
+        run_loop._provider_invocation_observation(
+            {
+                "provider_invoked_observation": True,
+                "receipt": {"provider_invoked": False, "invocation_count": 99},
+            }
+        )
+        is None
+    )
+
+
+def test_source_mutation_during_review_is_rejected(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-review-source-mutation")
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-review-source-mutation",
+        verdict_json=approve_verdict_json(),
+        write_unexpected=str(ws / "app.txt"),
+    )
+    loop_dir = tmp_path / "loops" / "loop-review-source-mutation"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        loop_run_id="loop-review-source-mutation",
+        evidence_directory=tmp_path / "loops",
+    )
+
+    assert exit_code == 3
+    result = load_result(loop_dir)
+    assert result["workspace_preserved_during_reviews"] is False
+    assert result["review_workspace_observations"][0]["product_state_preserved"] is False
+    assert result["review_workspace_observations"][0]["source_changed_paths"] == ["app.txt"]
+
+
+def test_unauthorized_ignored_check_drift_is_rejected(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".pytest_cache")
+    claude = write_fake_claude(tmp_path, name="claude-unauthorized-cache")
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-unauthorized-cache",
+        verdict_json=approve_verdict_json(),
+    )
+    loop_dir = tmp_path / "loops" / "loop-unauthorized-cache"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        check_commands=[_cache_writing_check_command()],
+        loop_run_id="loop-unauthorized-cache",
+        evidence_directory=tmp_path / "loops",
+    )
+
+    assert exit_code == 3
+    result = load_result(loop_dir)
+    assert result["workspace_preserved_during_reviews"] is False
+    assert result["review_workspace_observations"][0]["status"] == "UNEXPECTED_DRIFT"
+    assert result["review_workspace_observations"][0]["unexpected_changed_paths"] == [
+        ".pytest_cache/review-state"
+    ]
+
+
+def test_final_workspace_evidence_no_product_change(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    before = snapshot_workspace_hashes(ws)
+    baseline_git_metadata = run_review.protected_git_metadata_snapshot(ws)
+
+    evidence = run_loop._derive_final_workspace_evidence(
+        workspace=ws,
+        baseline_commit=baseline,
+        baseline_hashes=before,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(".pytest_cache",),
+        baseline_git_metadata=baseline_git_metadata,
+    )
+
+    assert evidence["workspace_final_changed_paths"] == []
+    assert evidence["workspace_final_authorized_side_effect_changed_path_count"] == 0
+    assert evidence["protected_git_metadata_preserved"] is True
+
+
+def test_final_workspace_evidence_reports_git_metadata_drift_separately(
+    tmp_path: Path,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    before = snapshot_workspace_hashes(ws)
+    baseline_git_metadata = run_review.protected_git_metadata_snapshot(ws)
+    hook = run_review.git_common_dir(ws) / "hooks" / "terminal-drift"
+    hook.write_text("changed\n", encoding="utf-8")
+
+    evidence = run_loop._derive_final_workspace_evidence(
+        workspace=ws,
+        baseline_commit=baseline,
+        baseline_hashes=before,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+        baseline_git_metadata=baseline_git_metadata,
+    )
+
+    assert evidence["workspace_final_changed_paths"] == []
+    assert evidence["protected_git_metadata_preserved"] is False
+    assert evidence["protected_git_metadata_changed_path_count"] >= 1
+    assert any(
+        path.endswith("hooks/terminal-drift")
+        for path in evidence["protected_git_metadata_changed_paths_sample"]
+    )
+
+
+def test_terminal_evidence_reports_linked_worktree_gitfile_drift_separately(
+    tmp_path: Path,
+) -> None:
+    workspace = make_linked_clean_workspace(tmp_path)
+    baseline = run_review.git_rev_parse(workspace, "HEAD")
+    assert baseline is not None
+    before = snapshot_workspace_hashes(workspace)
+    baseline_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+    (workspace / ".git").chmod(0o600)
+
+    evidence = run_loop._derive_final_workspace_evidence(
+        workspace=workspace,
+        baseline_commit=baseline,
+        baseline_hashes=before,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+        baseline_git_metadata=baseline_git_metadata,
+    )
+
+    assert evidence["workspace_final_changed_paths"] == []
+    assert evidence["protected_git_metadata_preserved"] is False
+    assert evidence["workspace_git_entry_preserved"] is False
+    assert evidence["workspace_git_entry_final_hash"] != evidence[
+        "workspace_git_entry_baseline_hash"
+    ]
+
+
+def test_loop_review_preservation_detects_linked_worktree_gitfile_drift(
+    tmp_path: Path,
+) -> None:
+    workspace = make_linked_clean_workspace(tmp_path)
+    before = run_loop._snapshot_workspace_for_review(workspace)
+    (workspace / ".git").chmod(0o600)
+    after = run_loop._snapshot_workspace_for_review(workspace)
+
+    evidence = run_loop._review_preservation_evidence(
+        attempt=1,
+        workspace=workspace,
+        before=before,
+        after=after,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+    )
+
+    assert evidence["product_state_preserved"] is True
+    assert evidence["repository_identity_preserved"] is False
+    assert evidence["workspace_git_entry_preserved"] is False
+    assert evidence["workspace_preserved"] is False
+
+
+def test_receiptless_repair_git_metadata_drift_is_visible_terminally(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    claude = _stateful_claude(tmp_path)
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-git-metadata-preflight-failure",
+        verdict_json=request_changes_verdict_json(),
+    )
+    real_invoke_repair = run_loop.invoke_repair
+
+    def invoke_after_git_metadata_drift(**kwargs):
+        hook = run_review.git_common_dir(ws) / "hooks" / "between-review-repair"
+        hook.write_text("changed\n", encoding="utf-8")
+        return real_invoke_repair(**kwargs)
+
+    monkeypatch.setattr(run_loop, "invoke_repair", invoke_after_git_metadata_drift)
+    loop_id = "loop-git-metadata-preflight-failure"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allow_one_repair=True,
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 3
+    result = load_result(loop_root / loop_id)
+    assert result["workspace_final_changed_paths"] == ["app.txt"]
+    assert result["protected_git_metadata_preserved"] is False
+    assert any(
+        path.endswith("hooks/between-review-repair")
+        for path in result["protected_git_metadata_changed_paths_sample"]
+    )
+    assert result["model_invocation_count"] == 2
+
+
+def test_final_workspace_evidence_detects_ignored_unexpected_change(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".private")
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    before = snapshot_workspace_hashes(ws)
+    (ws / ".private").mkdir()
+    (ws / ".private" / "state").write_text("unexpected", encoding="utf-8")
+
+    evidence = run_loop._derive_final_workspace_evidence(
+        workspace=ws,
+        baseline_commit=baseline,
+        baseline_hashes=before,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(".pytest_cache",),
+    )
+
+    assert evidence["workspace_final_changed_paths"] == [".private/state"]
+    assert evidence["workspace_final_unexpected_changed_paths"] == [".private/state"]
+
+
+def test_final_workspace_evidence_separates_authorized_side_effect_only_drift(
+    tmp_path: Path,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".pytest_cache")
+    baseline = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=str(ws), capture_output=True, text=True, check=True
+    ).stdout.strip()
+    before = snapshot_workspace_hashes(ws)
+    (ws / ".pytest_cache").mkdir()
+    (ws / ".pytest_cache" / "state").write_text("authorized", encoding="utf-8")
+
+    evidence = run_loop._derive_final_workspace_evidence(
+        workspace=ws,
+        baseline_commit=baseline,
+        baseline_hashes=before,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(".pytest_cache",),
+    )
+
+    assert evidence["workspace_final_changed_paths"] == []
+    assert evidence["workspace_final_unexpected_changed_paths"] == []
+    assert evidence["workspace_final_authorized_side_effect_changed_path_count"] == 1
+    assert evidence["workspace_final_authorized_side_effect_changed_paths_sample"] == [
+        ".pytest_cache/state"
+    ]
+
+
+def test_prior_evidence_mutation_is_reported_false(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-evidence-mutation")
+    loop_id = "loop-evidence-mutation"
+    loop_root = tmp_path / "loops"
+    implementation_receipt = (
+        loop_root / loop_id / "children" / f"{loop_id}-impl-1" / "receipt.json"
+    )
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-evidence-mutation",
+        verdict_json=blocked_verdict_json(),
+        write_unexpected=str(implementation_receipt),
+    )
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["previous_evidence_immutable"] is False
+
+
+def test_evidence_tree_regular_file_content_and_missing_member_are_bound(
+    tmp_path: Path,
+) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    receipt = evidence / "receipt.json"
+    receipt.write_text('{"ok": true}\n', encoding="utf-8")
+    unchanged = run_loop.hash_directory(evidence)
+
+    assert run_loop.hash_directory(evidence) == unchanged
+    receipt.write_text('{"ok": false}\n', encoding="utf-8")
+    assert run_loop.hash_directory(evidence) != unchanged
+    receipt.unlink()
+    assert run_loop.hash_directory(evidence) != unchanged
+
+
+def test_same_content_external_symlink_substitution_is_rejected(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    receipt = evidence / "receipt.json"
+    content = '{"ok": true}\n'
+    receipt.write_text(content, encoding="utf-8")
+    run_loop.hash_directory(evidence)
+    external = tmp_path / "external-receipt.json"
+    external.write_text(content, encoding="utf-8")
+    receipt.unlink()
+    receipt.symlink_to(external)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_loop.hash_directory(evidence)
+
+    external.write_text('{"ok": false}\n', encoding="utf-8")
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_loop.hash_directory(evidence)
+
+
+def test_special_evidence_member_is_rejected(tmp_path: Path) -> None:
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    os.mkfifo(evidence / "receipt.json")
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_loop.hash_directory(evidence)
+
+
+def test_symlinked_evidence_directory_is_rejected(tmp_path: Path) -> None:
+    real_evidence = tmp_path / "real-evidence"
+    real_evidence.mkdir()
+    (real_evidence / "receipt.json").write_text("{}\n", encoding="utf-8")
+    alias = tmp_path / "evidence-alias"
+    alias.symlink_to(real_evidence, target_is_directory=True)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_loop.hash_directory(alias)
+
+
+def test_hardlinked_evidence_member_is_rejected(tmp_path: Path) -> None:
+    external = tmp_path / "external-receipt.json"
+    external.write_text("{}\n", encoding="utf-8")
+    evidence = tmp_path / "evidence"
+    evidence.mkdir()
+    os.link(external, evidence / "receipt.json")
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_loop.hash_directory(evidence)
+
+
+def test_child_json_reader_parses_captured_bytes_without_path_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence = tmp_path / "child"
+    evidence.mkdir()
+    result_path = evidence / "result.json"
+    result_path.write_text('{"status":"ORIGINAL"}', encoding="utf-8")
+    external = tmp_path / "later-result.json"
+    external.write_text('{"status":"LATER"}', encoding="utf-8")
+    real_reader = run_review.read_canonical_evidence
+
+    def capture_then_replace(root: Path, names: tuple[str, ...]):
+        measured = real_reader(root, names)
+        result_path.unlink()
+        result_path.symlink_to(external)
+        return measured
+
+    monkeypatch.setattr(run_review, "read_canonical_evidence", capture_then_replace)
+
+    loaded = run_loop._read_json(result_path)
+
+    assert result_path.is_symlink()
+    assert loaded == {"status": "ORIGINAL"}
+
+
+def test_preflight_failure_after_baseline_resolution_reports_live_paths(
+    tmp_path: Path,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    (ws / "app.txt").write_text("already dirty\n", encoding="utf-8")
+    missing_claude = tmp_path / "missing-claude"
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-preflight-live-paths",
+        verdict_json=approve_verdict_json(),
+    )
+    loop_id = "loop-preflight-live-paths"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        missing_claude,
+        codex,
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["error_category"] == "CLAUDE_NOT_FOUND"
+    assert result["workspace_final_changed_paths"] == ["app.txt"]
+    assert result["workspace_final_hash"] == workspace_hash(snapshot_workspace_hashes(ws))
+
+
+def test_invalid_allowed_path_preflight_does_not_fabricate_empty_final_paths(
+    tmp_path: Path,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    (ws / "app.txt").write_text("already dirty\n", encoding="utf-8")
+    claude = write_fake_claude(tmp_path, name="claude-invalid-path-preflight")
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-invalid-path-preflight",
+        verdict_json=approve_verdict_json(),
+    )
+    loop_id = "loop-invalid-path-preflight"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allowed_paths=["../escape.txt"],
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["error_category"] == "INVALID_ALLOWED_PATH"
+    assert result["workspace_final_changed_paths"] == ["app.txt"]
+    assert result["unexpected_changed_paths"] == ["app.txt"]
+
+
+def test_failed_repair_with_only_authorized_side_effect_has_no_product_paths(
+    tmp_path: Path,
+) -> None:
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".pytest_cache")
+    marker = tmp_path / "side-only-marker"
+    claude = tmp_path / "claude-side-only-failure"
+    claude.write_text(
+        f'''#!/usr/bin/env python3
+import pathlib
+marker = pathlib.Path({str(marker)!r})
+count = int(marker.read_text()) if marker.exists() else 0
+marker.write_text(str(count + 1))
+if count == 0:
+    pathlib.Path("app.txt").write_text("implemented\\n", encoding="utf-8")
+    raise SystemExit(0)
+pathlib.Path("app.txt").write_text("original\\n", encoding="utf-8")
+cache = pathlib.Path(".pytest_cache/state")
+cache.parent.mkdir(parents=True, exist_ok=True)
+cache.write_text("authorized\\n", encoding="utf-8")
+raise SystemExit(3)
+''',
+        encoding="utf-8",
+    )
+    claude.chmod(0o755)
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-side-only-failure",
+        verdict_json=request_changes_verdict_json(),
+    )
+    loop_id = "loop-side-only-failure"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allow_one_repair=True,
+        allowed_side_effect_paths=[".pytest_cache"],
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 3
+    result = load_result(loop_root / loop_id)
+    assert result["workspace_final_changed_paths"] == []
+    assert result["unexpected_changed_paths"] == []
+    assert result["workspace_final_authorized_side_effect_changed_path_count"] == 1
+
+
+def test_failed_repair_reports_ignored_unexpected_final_change(tmp_path: Path) -> None:
+    ws = make_clean_workspace(tmp_path)
+    _add_ignored_runtime_paths(ws, ".private")
+    marker = tmp_path / "unexpected-marker"
+    claude = tmp_path / "claude-unexpected-failure"
+    claude.write_text(
+        f'''#!/usr/bin/env python3
+import pathlib
+marker = pathlib.Path({str(marker)!r})
+count = int(marker.read_text()) if marker.exists() else 0
+marker.write_text(str(count + 1))
+pathlib.Path("app.txt").write_text("implemented\\n", encoding="utf-8")
+if count:
+    unexpected = pathlib.Path(".private/state")
+    unexpected.parent.mkdir(parents=True, exist_ok=True)
+    unexpected.write_text("unexpected\\n", encoding="utf-8")
+    raise SystemExit(3)
+raise SystemExit(0)
+''',
+        encoding="utf-8",
+    )
+    claude.chmod(0o755)
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-unexpected-failure",
+        verdict_json=request_changes_verdict_json(),
+    )
+    loop_id = "loop-unexpected-failure"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        allow_one_repair=True,
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["unexpected_changed_paths"] == [".private/state"]
+    assert result["workspace_final_changed_paths"] == [".private/state", "app.txt"]
 
 
 # ---------------------------------------------------------------------------

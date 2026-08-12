@@ -31,6 +31,7 @@ import os
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -38,12 +39,18 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from tomtit.adapters.claude_code_cli import classify_workspace_changes  # noqa: E402
+from tomtit.adapters.claude_code_cli import (  # noqa: E402
+    classify_workspace_changes,
+    snapshot_workspace_hashes,
+    summarize_side_effect_paths,
+    workspace_hash,
+)
 
 _MAX_EXCERPT_BYTES = 4000
 _HELP_PROBE_TIMEOUT_SECONDS = 15
@@ -156,6 +163,14 @@ class ReviewFailure(Exception):
         self.message = message
 
 
+class EvidenceIntegrityFailure(Exception):
+    """A canonical evidence tree cannot be safely identified without following aliases."""
+
+
+class ProcessQuiescenceFailure(Exception):
+    """A controlled subprocess group could not be positively proven absent."""
+
+
 # ---------------------------------------------------------------------------
 # Small local helpers.
 # ---------------------------------------------------------------------------
@@ -182,6 +197,267 @@ def _is_within(child: Path, parent: Path) -> bool:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _read_only_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return env
+
+
+def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
+    """Load-bearing identity for one filesystem object observation."""
+
+    return (
+        metadata.st_dev,
+        metadata.st_ino,
+        metadata.st_mode,
+        metadata.st_size,
+        metadata.st_nlink,
+        metadata.st_mtime_ns,
+        metadata.st_ctime_ns,
+    )
+
+
+def _directory_descriptor(metadata: os.stat_result) -> str:
+    return (
+        f"dir:dev={metadata.st_dev}:ino={metadata.st_ino}:"
+        f"mode={stat.S_IMODE(metadata.st_mode):04o}:size={metadata.st_size}:"
+        f"nlink={metadata.st_nlink}:mtime_ns={metadata.st_mtime_ns}:"
+        f"ctime_ns={metadata.st_ctime_ns}"
+    )
+
+
+def _regular_file_measurement(
+    path: Path,
+    metadata: os.stat_result,
+    *,
+    reject_hardlinks: bool,
+    capture_bytes: bool,
+) -> tuple[str, bytes | None]:
+    if reject_hardlinks and metadata.st_nlink != 1:
+        raise EvidenceIntegrityFailure(
+            f"regular file has unsafe link count {metadata.st_nlink}: {path.name}"
+        )
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    if hasattr(os, "O_NONBLOCK"):
+        flags |= os.O_NONBLOCK
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise EvidenceIntegrityFailure(
+            f"regular file cannot be opened safely: {path.name}: {exc.__class__.__name__}"
+        ) from None
+    try:
+        opened = os.fstat(descriptor)
+        expected_identity = _stat_identity(metadata)
+        opened_identity = _stat_identity(opened)
+        if expected_identity != opened_identity or not stat.S_ISREG(opened.st_mode):
+            raise EvidenceIntegrityFailure(f"regular file identity changed while opening: {path.name}")
+        digest = hashlib.sha256()
+        captured = bytearray() if capture_bytes else None
+        bytes_read = 0
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            bytes_read += len(chunk)
+            digest.update(chunk)
+            if captured is not None:
+                captured.extend(chunk)
+        closed_over = os.fstat(descriptor)
+        if _stat_identity(closed_over) != opened_identity:
+            raise EvidenceIntegrityFailure(f"regular file identity changed while hashing: {path.name}")
+        if bytes_read != opened.st_size:
+            raise EvidenceIntegrityFailure(
+                f"regular file byte count changed while hashing: {path.name}"
+            )
+        try:
+            pathname_after = path.lstat()
+        except OSError as exc:
+            raise EvidenceIntegrityFailure(
+                f"regular file pathname changed after reading: {path.name}: {exc.__class__.__name__}"
+            ) from None
+        if (
+            not stat.S_ISREG(pathname_after.st_mode)
+            or _stat_identity(pathname_after) != opened_identity
+        ):
+            raise EvidenceIntegrityFailure(
+                f"regular file pathname no longer names the opened object: {path.name}"
+            )
+    except OSError as exc:
+        raise EvidenceIntegrityFailure(
+            f"regular file cannot be read safely: {path.name}: {exc.__class__.__name__}"
+        ) from None
+    finally:
+        os.close(descriptor)
+    return (
+        f"file:dev={opened.st_dev}:ino={opened.st_ino}:"
+        f"mode={stat.S_IMODE(opened.st_mode):04o}:size={opened.st_size}:"
+        f"nlink={opened.st_nlink}:mtime_ns={opened.st_mtime_ns}:"
+        f"ctime_ns={opened.st_ctime_ns}:sha256={digest.hexdigest()}",
+        bytes(captured) if captured is not None else None,
+    )
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class CanonicalEvidenceSnapshot:
+    """One consistent canonical-tree measurement and its validated file bytes."""
+
+    identity: dict[str, str]
+    file_bytes: dict[str, bytes]
+
+
+def _measure_type_aware_tree(
+    root: Path,
+    *,
+    reject_symlinks: bool,
+    reject_hardlinks: bool,
+    capture_files: frozenset[str] = frozenset(),
+) -> CanonicalEvidenceSnapshot:
+    """Measure a tree without following aliases, revalidating every live path."""
+
+    try:
+        root_metadata = root.lstat()
+    except OSError as exc:
+        raise EvidenceIntegrityFailure(
+            f"identity root is unavailable: {exc.__class__.__name__}"
+        ) from None
+    if not stat.S_ISDIR(root_metadata.st_mode) or stat.S_ISLNK(root_metadata.st_mode):
+        raise EvidenceIntegrityFailure("identity root must be a real directory, not an alias")
+
+    identity: dict[str, str] = {".": _directory_descriptor(root_metadata)}
+    captured: dict[str, bytes] = {}
+
+    def visit(
+        directory: Path,
+        relative: PurePosixPath,
+        expected_directory: os.stat_result,
+    ) -> None:
+        try:
+            with os.scandir(directory) as iterator:
+                entries = sorted(iterator, key=lambda entry: entry.name)
+        except OSError as exc:
+            raise EvidenceIntegrityFailure(
+                f"identity directory is unreadable: {relative.as_posix()}: {exc.__class__.__name__}"
+            ) from None
+        for entry in entries:
+            entry_relative = relative / entry.name
+            key = entry_relative.as_posix()
+            entry_path = directory / entry.name
+            try:
+                metadata = entry.stat(follow_symlinks=False)
+            except OSError as exc:
+                raise EvidenceIntegrityFailure(
+                    f"identity member is unreadable: {key}: {exc.__class__.__name__}"
+                ) from None
+            if stat.S_ISLNK(metadata.st_mode):
+                if reject_symlinks:
+                    raise EvidenceIntegrityFailure(f"symlink identity member is forbidden: {key}")
+                try:
+                    target = os.readlink(entry_path)
+                except OSError as exc:
+                    raise EvidenceIntegrityFailure(
+                        f"symlink identity member is unreadable: {key}: {exc.__class__.__name__}"
+                    ) from None
+                identity[key] = (
+                    f"symlink:mode={stat.S_IMODE(metadata.st_mode):04o}:target={target}"
+                )
+            elif stat.S_ISDIR(metadata.st_mode):
+                identity[key] = _directory_descriptor(metadata)
+                visit(entry_path, entry_relative, metadata)
+            elif stat.S_ISREG(metadata.st_mode):
+                descriptor, content = _regular_file_measurement(
+                    entry_path,
+                    metadata,
+                    reject_hardlinks=reject_hardlinks,
+                    capture_bytes=key in capture_files,
+                )
+                identity[key] = descriptor
+                if content is not None:
+                    captured[key] = content
+            else:
+                raise EvidenceIntegrityFailure(f"special identity member is forbidden: {key}")
+
+        try:
+            directory_after = directory.lstat()
+        except OSError as exc:
+            raise EvidenceIntegrityFailure(
+                f"identity directory changed during measurement: {relative.as_posix()}: {exc.__class__.__name__}"
+            ) from None
+        if (
+            not stat.S_ISDIR(directory_after.st_mode)
+            or _stat_identity(directory_after) != _stat_identity(expected_directory)
+        ):
+            raise EvidenceIntegrityFailure(
+                f"identity directory changed during measurement: {relative.as_posix()}"
+            )
+
+    visit(root, PurePosixPath(), root_metadata)
+    return CanonicalEvidenceSnapshot(identity=identity, file_bytes=captured)
+
+
+def snapshot_type_aware_tree(
+    root: Path,
+    *,
+    reject_symlinks: bool,
+    reject_hardlinks: bool,
+) -> dict[str, str]:
+    """Return an lstat-based, non-following identity for one exact filesystem tree."""
+
+    return _measure_type_aware_tree(
+        root,
+        reject_symlinks=reject_symlinks,
+        reject_hardlinks=reject_hardlinks,
+    ).identity
+
+
+def snapshot_evidence_tree(root: Path) -> dict[str, str]:
+    """Strict canonical evidence identity: no aliases, special files, or hard links."""
+
+    return snapshot_type_aware_tree(
+        root,
+        reject_symlinks=True,
+        reject_hardlinks=True,
+    )
+
+
+def snapshot_canonical_evidence(
+    root: Path,
+    required_files: Sequence[str],
+) -> dict[str, str]:
+    """Validate a real evidence directory and every required regular member."""
+
+    return read_canonical_evidence(root, required_files).identity
+
+
+def read_canonical_evidence(
+    root: Path,
+    required_files: Sequence[str],
+) -> CanonicalEvidenceSnapshot:
+    """Return exact bytes from the same safe handles used to validate identity."""
+
+    required = frozenset(PurePosixPath(name).as_posix() for name in required_files)
+    measured = _measure_type_aware_tree(
+        root,
+        reject_symlinks=True,
+        reject_hardlinks=True,
+        capture_files=required,
+    )
+    for name in required_files:
+        key = PurePosixPath(name).as_posix()
+        descriptor = measured.identity.get(key)
+        if (
+            descriptor is None
+            or not descriptor.startswith("file:")
+            or key not in measured.file_bytes
+        ):
+            raise EvidenceIntegrityFailure(f"canonical evidence file is missing or unsafe: {name}")
+    return measured
 
 
 # ---------------------------------------------------------------------------
@@ -216,9 +492,12 @@ def normalize_allowed_paths(raw_paths: list[str], workspace: Path) -> tuple[str,
 
 
 def _run_git(args: list[str], cwd: Path, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
     return subprocess.run(
         ["git", *args],
         cwd=str(cwd),
+        env=env,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -243,6 +522,104 @@ def git_dir(cwd: Path) -> Path | None:
     return raw if raw.is_absolute() else (cwd / raw).resolve()
 
 
+def git_common_dir(cwd: Path) -> Path | None:
+    completed = _run_git(["rev-parse", "--git-common-dir"], cwd)
+    if completed.returncode != 0:
+        return None
+    raw = Path(completed.stdout.strip())
+    return raw.resolve() if raw.is_absolute() else (cwd / raw).resolve()
+
+
+_WORKSPACE_GIT_ENTRY_PATH_KEY = "@workspace_git_entry_path"
+_WORKSPACE_GIT_ENTRY_KEY = "@workspace_git_entry"
+
+
+def _workspace_git_entry_descriptor(cwd: Path) -> tuple[str, str]:
+    """Measure the worktree-root .git entry without following aliases."""
+
+    entry = cwd.resolve() / ".git"
+    try:
+        metadata = entry.lstat()
+    except OSError as exc:
+        raise EvidenceIntegrityFailure(
+            f"workspace .git entry is unavailable: {exc.__class__.__name__}"
+        ) from None
+    if stat.S_ISDIR(metadata.st_mode):
+        descriptor = _directory_descriptor(metadata)
+    elif stat.S_ISREG(metadata.st_mode):
+        descriptor, _ = _regular_file_measurement(
+            entry,
+            metadata,
+            reject_hardlinks=False,
+            capture_bytes=False,
+        )
+    else:
+        raise EvidenceIntegrityFailure(
+            "workspace .git entry must be a real directory or regular indirection file"
+        )
+    return (f"path:{entry}", descriptor)
+
+
+def workspace_git_entry_hash_from_snapshot(snapshot: Mapping[str, str]) -> str:
+    """Hash the explicit worktree-root .git component of a repository snapshot."""
+
+    try:
+        entry_path = snapshot[_WORKSPACE_GIT_ENTRY_PATH_KEY]
+        entry = snapshot[_WORKSPACE_GIT_ENTRY_KEY]
+    except KeyError as exc:
+        raise EvidenceIntegrityFailure(
+            "protected Git metadata snapshot has no workspace .git entry identity"
+        ) from exc
+    return workspace_hash(
+        {
+            _WORKSPACE_GIT_ENTRY_PATH_KEY: entry_path,
+            _WORKSPACE_GIT_ENTRY_KEY: entry,
+        }
+    )
+
+
+def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
+    """Snapshot root .git plus the actual per-worktree/common metadata trees."""
+
+    git_entry_before = _workspace_git_entry_descriptor(cwd)
+    directory = git_dir(cwd)
+    common_directory = git_common_dir(cwd)
+    if directory is None or common_directory is None:
+        raise EvidenceIntegrityFailure("Git metadata locations could not be resolved")
+    roots = (
+        ("git_dir", directory.resolve()),
+        ("git_common_dir", common_directory.resolve()),
+    )
+    identity: dict[str, str] = {
+        "@git_dir": f"path:{roots[0][1]}",
+        "@git_common_dir": f"path:{roots[1][1]}",
+        _WORKSPACE_GIT_ENTRY_PATH_KEY: git_entry_before[0],
+        _WORKSPACE_GIT_ENTRY_KEY: git_entry_before[1],
+    }
+    for role, root in roots:
+        tree = snapshot_type_aware_tree(
+            root,
+            reject_symlinks=True,
+            reject_hardlinks=False,
+        )
+        for relative, descriptor in tree.items():
+            identity[f"{role}/{relative}"] = descriptor
+    git_entry_after = _workspace_git_entry_descriptor(cwd)
+    if git_entry_after != git_entry_before:
+        raise EvidenceIntegrityFailure(
+            "workspace .git entry changed during protected metadata measurement"
+        )
+    if git_dir(cwd) != roots[0][1] or git_common_dir(cwd) != roots[1][1]:
+        raise EvidenceIntegrityFailure(
+            "resolved Git metadata locations changed during protected metadata measurement"
+        )
+    return identity
+
+
+def protected_git_metadata_hash(cwd: Path) -> str:
+    return workspace_hash(protected_git_metadata_snapshot(cwd))
+
+
 def git_special_state(cwd: Path) -> str | None:
     directory = git_dir(cwd)
     if directory is None:
@@ -256,6 +633,15 @@ def git_special_state(cwd: Path) -> str | None:
 def git_index_clean(cwd: Path) -> bool:
     completed = _run_git(["diff", "--cached", "--quiet"], cwd)
     return completed.returncode == 0
+
+
+def git_index_identity(cwd: Path) -> str | None:
+    """Hash index entries, stages, modes, blob ids, paths, and semantic flags."""
+
+    completed = _run_git(["ls-files", "--stage", "-v", "-z"], cwd)
+    if completed.returncode != 0:
+        return None
+    return _sha256(completed.stdout.encode("utf-8", errors="surrogateescape"))
 
 
 def git_status_porcelain(cwd: Path) -> str:
@@ -307,6 +693,160 @@ class WorkspaceSnapshot:
     file_hashes: tuple[tuple[str, str | None], ...]  # path -> sha256, or None if absent/deleted
 
 
+@dataclasses.dataclass(frozen=True, slots=True)
+class ReviewWorkspacePreservation:
+    """Canonical classification of filesystem drift caused during one review."""
+
+    status: str
+    workspace_preserved: bool
+    product_state_preserved: bool
+    authorized_side_effect_drift: bool
+    changed_paths: tuple[str, ...]
+    source_changed_paths: tuple[str, ...]
+    authorized_side_effect_changed_paths: tuple[str, ...]
+    unexpected_changed_paths: tuple[str, ...]
+
+
+def diff_workspace_hashes(before: Mapping[str, str], after: Mapping[str, str]) -> tuple[str, ...]:
+    """Return every whole-workspace entry whose presence or identity changed."""
+
+    paths = set(before) | set(after)
+    return tuple(sorted(path for path in paths if before.get(path) != after.get(path)))
+
+
+def reviewed_workspace_integrity_hash(
+    file_hashes: Mapping[str, str],
+    allowed_source_paths: Sequence[str],
+    allowed_side_effect_paths: Sequence[str],
+) -> str:
+    """Hash product and unexpected state while excluding authorized side effects.
+
+    The adapter's full snapshot still observes every non-runtime-cache entry.
+    Only regular entries beneath an explicit Owner-authorized side-effect root
+    are removed from this identity. Source paths win over an overlapping root,
+    and symlinks remain protected so lexical authorization cannot hide a
+    retargeted alias.
+    """
+
+    product, _, unexpected = partition_reviewed_workspace_state(
+        file_hashes,
+        allowed_source_paths,
+        allowed_side_effect_paths,
+    )
+    protected = {**product, **unexpected}
+    return workspace_hash(protected)
+
+
+def partition_reviewed_workspace_state(
+    file_hashes: Mapping[str, str],
+    allowed_source_paths: Sequence[str],
+    allowed_side_effect_paths: Sequence[str],
+) -> tuple[dict[str, str], dict[str, str], dict[str, str]]:
+    """Partition one snapshot into product, authorized-side-effect, and other state."""
+
+    source_paths, side_effect_paths, unexpected_paths = classify_workspace_changes(
+        tuple(sorted(file_hashes)),
+        allowed_source_paths,
+        allowed_side_effect_paths,
+    )
+    source = {path: file_hashes[path] for path in source_paths}
+    side_effects: dict[str, str] = {}
+    unexpected = {path: file_hashes[path] for path in unexpected_paths}
+    for path in side_effect_paths:
+        digest = str(file_hashes[path])
+        if digest.startswith("symlink:") and not digest.startswith("symlink:internal:"):
+            unexpected[path] = file_hashes[path]
+        else:
+            side_effects[path] = file_hashes[path]
+    return source, side_effects, unexpected
+
+
+def classify_review_workspace_preservation(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    *,
+    allowed_source_paths: Sequence[str],
+    allowed_side_effect_paths: Sequence[str],
+    workspace: Path,
+) -> ReviewWorkspacePreservation:
+    """Classify review-time drift with the adapter's canonical scope semantics."""
+
+    changed_paths = diff_workspace_hashes(before, after)
+    source, side_effects, unexpected = classify_workspace_changes(
+        changed_paths,
+        allowed_source_paths,
+        allowed_side_effect_paths,
+        workspace_root=workspace,
+    )
+
+    # A removed or retargeted symlink may no longer be inspectable through the
+    # live workspace. Keep all symlink identity drift in the protected class,
+    # even when its lexical path sits under an authorized side-effect root.
+    unsafe_symlink_drift = {
+        path
+        for path in side_effects
+        if (
+            str(before.get(path, "")).startswith("symlink:")
+            and not str(before.get(path, "")).startswith("symlink:internal:")
+        )
+        or (
+            str(after.get(path, "")).startswith("symlink:")
+            and not str(after.get(path, "")).startswith("symlink:internal:")
+        )
+    }
+    if unsafe_symlink_drift:
+        side_effects = tuple(path for path in side_effects if path not in unsafe_symlink_drift)
+        unexpected = tuple(sorted((*unexpected, *unsafe_symlink_drift)))
+
+    product_state_preserved = not source
+    workspace_preserved = product_state_preserved and not unexpected
+    if unexpected:
+        status = "UNEXPECTED_DRIFT"
+    elif source:
+        status = "PRODUCT_STATE_DRIFT"
+    elif side_effects:
+        status = "AUTHORIZED_SIDE_EFFECT_DRIFT"
+    else:
+        status = "PRODUCT_STATE_PRESERVED"
+    return ReviewWorkspacePreservation(
+        status=status,
+        workspace_preserved=workspace_preserved,
+        product_state_preserved=product_state_preserved,
+        authorized_side_effect_drift=bool(side_effects),
+        changed_paths=changed_paths,
+        source_changed_paths=source,
+        authorized_side_effect_changed_paths=side_effects,
+        unexpected_changed_paths=unexpected,
+    )
+
+
+def review_repository_identity_preserved(
+    workspace: Path,
+    *,
+    baseline_ref: str,
+    baseline_commit: str,
+    expected_head: str,
+    expected_index_identity: str,
+    expected_git_metadata_hash: str,
+    actual_git_metadata_hash: str | None = None,
+) -> bool:
+    """Require the complete repository identity used by review/repair preflight."""
+
+    if actual_git_metadata_hash is None:
+        try:
+            actual_git_metadata_hash = protected_git_metadata_hash(workspace)
+        except EvidenceIntegrityFailure:
+            return False
+    return (
+        (git_rev_parse(workspace, "HEAD") or "") == expected_head
+        and git_index_clean(workspace)
+        and git_index_identity(workspace) == expected_index_identity
+        and git_special_state(workspace) is None
+        and git_rev_parse(workspace, baseline_ref) == baseline_commit
+        and actual_git_metadata_hash == expected_git_metadata_hash
+    )
+
+
 def snapshot_workspace(workspace: Path, baseline_commit: str) -> WorkspaceSnapshot:
     head = git_rev_parse(workspace, "HEAD") or ""
     changed = git_changed_paths(workspace, baseline_commit)
@@ -354,27 +894,35 @@ def load_implementation_evidence(
     expected_implementation_run_id: str | None = None,
     expected_implementation_attempt: int | None = None,
 ) -> dict[str, Any]:
-    if not run_directory.is_dir():
-        raise PreflightFailure("MISSING_IMPLEMENTATION_EVIDENCE", "implementation run directory does not exist")
-
-    receipt_path = run_directory / "receipt.json"
-    result_path = run_directory / "result.json"
-    patch_path = run_directory / "diff.patch"
-    for path in (receipt_path, result_path, patch_path):
-        if not path.is_file():
-            raise PreflightFailure("MISSING_IMPLEMENTATION_EVIDENCE", f"required evidence file missing: {path.name}")
+    try:
+        run_directory.lstat()
+    except OSError:
+        raise PreflightFailure(
+            "MISSING_IMPLEMENTATION_EVIDENCE",
+            "implementation run directory does not exist",
+        ) from None
+    try:
+        evidence_snapshot = read_canonical_evidence(
+            run_directory,
+            ("receipt.json", "result.json", "diff.patch"),
+        )
+    except EvidenceIntegrityFailure as exc:
+        raise PreflightFailure(
+            "INVALID_IMPLEMENTATION_EVIDENCE",
+            f"implementation evidence identity is unsafe: {exc}",
+        ) from None
 
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
-        result = json.loads(result_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        receipt = json.loads(evidence_snapshot.file_bytes["receipt.json"].decode("utf-8"))
+        result = json.loads(evidence_snapshot.file_bytes["result.json"].decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise PreflightFailure(
             "INVALID_IMPLEMENTATION_EVIDENCE", f"evidence file is not readable/valid JSON: {exc.__class__.__name__}"
         ) from None
 
     try:
-        patch_text = patch_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        patch_text = evidence_snapshot.file_bytes["diff.patch"].decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise PreflightFailure(
             "INVALID_IMPLEMENTATION_EVIDENCE", f"diff.patch is not readable: {exc.__class__.__name__}"
         ) from None
@@ -508,41 +1056,28 @@ def run_check_command(text: str, cwd: Path, timeout_seconds: int) -> CheckResult
     argv = validate_check_command_text(text)
     start = time.monotonic()
     try:
-        completed = subprocess.run(
+        completed = execute_bounded(
             argv,
             cwd=str(cwd),
-            shell=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=timeout_seconds,
-            check=False,
+            timeout_seconds=float(timeout_seconds),
+            env=_read_only_subprocess_env(),
         )
         duration_ms = int((time.monotonic() - start) * 1000)
         return CheckResult(
             command=text,
-            exit_code=completed.returncode,
-            timed_out=False,
+            exit_code=completed.exit_code,
+            timed_out=completed.timed_out,
             duration_ms=duration_ms,
             stdout_excerpt=_excerpt(completed.stdout),
             stderr_excerpt=_excerpt(completed.stderr),
             stdout_sha256=_sha256(completed.stdout),
             stderr_sha256=_sha256(completed.stderr),
         )
-    except subprocess.TimeoutExpired as exc:
-        duration_ms = int((time.monotonic() - start) * 1000)
-        out = exc.stdout if isinstance(exc.stdout, (bytes, bytearray)) else b""
-        err = exc.stderr if isinstance(exc.stderr, (bytes, bytearray)) else b""
-        return CheckResult(
-            command=text,
-            exit_code=None,
-            timed_out=True,
-            duration_ms=duration_ms,
-            stdout_excerpt=_excerpt(out),
-            stderr_excerpt=_excerpt(err),
-            stdout_sha256=_sha256(out),
-            stderr_sha256=_sha256(err),
-        )
+    except ProcessQuiescenceFailure as exc:
+        raise PreflightFailure(
+            "SUBPROCESS_QUIESCENCE_UNVERIFIED",
+            f"deterministic check process group was not proven quiescent: {exc}",
+        ) from None
     except OSError as exc:
         duration_ms = int((time.monotonic() - start) * 1000)
         message = f"{exc.__class__.__name__} errno={getattr(exc, 'errno', None)}"
@@ -582,15 +1117,18 @@ def discover_codex_executable(explicit_path: str | None) -> str | None:
 
 def probe_help_text(executable: str, argv_tail: list[str]) -> str:
     try:
-        completed = subprocess.run(
+        completed = execute_bounded(
             [executable, *argv_tail],
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=_HELP_PROBE_TIMEOUT_SECONDS,
-            check=False,
+            cwd=Path.cwd(),
+            timeout_seconds=_HELP_PROBE_TIMEOUT_SECONDS,
+            env=_read_only_subprocess_env(),
         )
-    except (OSError, subprocess.TimeoutExpired):
+    except ProcessQuiescenceFailure as exc:
+        raise PreflightFailure(
+            "SUBPROCESS_QUIESCENCE_UNVERIFIED",
+            f"Codex capability probe process group was not proven quiescent: {exc}",
+        ) from None
+    except OSError:
         return ""
     return completed.stdout.decode("utf-8", errors="replace") + "\n" + completed.stderr.decode("utf-8", errors="replace")
 
@@ -694,16 +1232,41 @@ def _await_group_absence(pgid: int, deadline: float) -> bool | None:
 
 def _ensure_group_quiescent(pgid: int) -> None:
     if os.name != "posix" or pgid <= 1:
-        return
+        raise ProcessQuiescenceFailure("process-group verification is unavailable")
+    try:
+        if pgid == os.getpgrp():
+            raise ProcessQuiescenceFailure("refusing to inspect TOMTIT's own process group")
+    except OSError as exc:
+        raise ProcessQuiescenceFailure(
+            f"process-group identity is unavailable: {exc.__class__.__name__}"
+        ) from None
     alive = _group_alive(pgid)
-    if alive is not True:
+    if alive is False:
         return
-    if _signal_group(pgid, signal.SIGTERM):
-        alive = _await_group_absence(pgid, time.monotonic() + _PROCESS_CLEANUP_GRACE_SECONDS)
-        if alive is False:
+    if alive is None:
+        raise ProcessQuiescenceFailure("process group state is indeterminate")
+    if not _signal_group(pgid, signal.SIGTERM):
+        if _group_alive(pgid) is False:
             return
-    _signal_group(pgid, signal.SIGKILL)
-    _await_group_absence(pgid, time.monotonic() + _PROCESS_CLEANUP_GRACE_SECONDS)
+        raise ProcessQuiescenceFailure("process group could not be controlled with SIGTERM")
+    alive = _await_group_absence(
+        pgid,
+        time.monotonic() + _PROCESS_CLEANUP_GRACE_SECONDS,
+    )
+    if alive is False:
+        return
+    if alive is None:
+        raise ProcessQuiescenceFailure("process group state became indeterminate")
+    if not _signal_group(pgid, signal.SIGKILL):
+        if _group_alive(pgid) is False:
+            return
+        raise ProcessQuiescenceFailure("process group could not be controlled with SIGKILL")
+    alive = _await_group_absence(
+        pgid,
+        time.monotonic() + _PROCESS_CLEANUP_GRACE_SECONDS,
+    )
+    if alive is not False:
+        raise ProcessQuiescenceFailure("process group remained present after SIGKILL")
 
 
 @dataclasses.dataclass(frozen=True, slots=True)
@@ -715,30 +1278,59 @@ class ProcessOutcome:
     duration_ms: int
 
 
-def execute_bounded(argv: list[str], *, cwd: Path, timeout_seconds: float) -> ProcessOutcome:
+def execute_bounded(
+    argv: list[str],
+    *,
+    cwd: Path | str,
+    timeout_seconds: float,
+    provider_observer: Callable[[bool | None], None] | None = None,
+    env: Mapping[str, str] | None = None,
+) -> ProcessOutcome:
     start = time.monotonic()
-    proc = subprocess.Popen(
-        argv,
-        cwd=str(cwd),
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    try:
+        proc = subprocess.Popen(
+            argv,
+            cwd=str(cwd),
+            env=dict(env) if env is not None else None,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
+    except OSError:
+        if provider_observer is not None:
+            provider_observer(False)
+        raise
+    if provider_observer is not None:
+        provider_observer(True)
     pgid = proc.pid
-    deadline = start + timeout_seconds
     timed_out = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout_seconds)
     except subprocess.TimeoutExpired:
         timed_out = True
-        _ensure_group_quiescent(pgid)
+        _signal_group(pgid, signal.SIGTERM)
         try:
             stdout, stderr = proc.communicate(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
         except subprocess.TimeoutExpired:
-            stdout, stderr = b"", b""
-    else:
+            _signal_group(pgid, signal.SIGKILL)
+            try:
+                stdout, stderr = proc.communicate(
+                    timeout=_PROCESS_CLEANUP_GRACE_SECONDS
+                )
+            except subprocess.TimeoutExpired:
+                stdout, stderr = b"", b""
+    except OSError:
+        _signal_group(pgid, signal.SIGTERM)
+        wait = getattr(proc, "wait", None)
+        if callable(wait):
+            try:
+                wait(timeout=_PROCESS_CLEANUP_GRACE_SECONDS)
+            except (OSError, subprocess.TimeoutExpired):
+                _signal_group(pgid, signal.SIGKILL)
         _ensure_group_quiescent(pgid)
+        raise
+    _ensure_group_quiescent(pgid)
     duration_ms = int((time.monotonic() - start) * 1000)
     return ProcessOutcome(
         exit_code=proc.returncode if not timed_out else None,
@@ -916,13 +1508,22 @@ def finding_counts(obj: dict[str, Any]) -> dict[str, int]:
 # ---------------------------------------------------------------------------
 
 
-def resolve_evidence_directory(evidence_directory_arg: str | None, review_run_id: str) -> Path:
+def resolve_evidence_directory(
+    evidence_directory_arg: str | None,
+    review_run_id: str,
+    workspace: Path,
+) -> Path:
     root = Path(evidence_directory_arg).expanduser() if evidence_directory_arg else (REPO_ROOT / ".tomtit" / "dogfood" / "reviews")
     if not root.is_absolute():
         root = (Path.cwd() / root).resolve(strict=False)
     else:
         root = root.resolve(strict=False)
     directory = root / review_run_id
+    if _is_within(directory, workspace):
+        raise PreflightFailure(
+            "EVIDENCE_DIRECTORY_INSIDE_WORKSPACE",
+            "review evidence directory must be outside the target workspace",
+        )
     if directory.exists():
         if not directory.is_dir():
             raise PreflightFailure("EVIDENCE_DIRECTORY_COLLISION", "review evidence directory path is not a directory")
@@ -1052,6 +1653,29 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     )
 
     receipt_data = evidence["receipt"]
+    raw_implementation_allowed_paths = receipt_data.get("allowed_changed_paths")
+    if not isinstance(raw_implementation_allowed_paths, list) or not all(
+        isinstance(path, str) for path in raw_implementation_allowed_paths
+    ):
+        raise PreflightFailure(
+            "INVALID_IMPLEMENTATION_EVIDENCE",
+            "implementation receipt allowed_changed_paths is malformed",
+        )
+    try:
+        implementation_allowed_paths = normalize_allowed_paths(
+            raw_implementation_allowed_paths,
+            workspace,
+        )
+    except PreflightFailure as exc:
+        raise PreflightFailure(
+            "INVALID_IMPLEMENTATION_EVIDENCE",
+            f"implementation receipt allowed_changed_paths is invalid: {exc.category}",
+        ) from None
+    if implementation_allowed_paths != allowed_paths:
+        raise PreflightFailure(
+            "ALLOWED_PATH_CONTRACT_MISMATCH",
+            "review allowed paths do not exactly match the bound implementation contract",
+        )
     raw_side_effect_paths = receipt_data.get("allowed_side_effect_paths")
     if raw_side_effect_paths is None:
         # Missing legacy field -- no side-effect authorization, fail closed.
@@ -1081,7 +1705,11 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     if not review_run_id or "/" in review_run_id or "\\" in review_run_id or review_run_id in (".", ".."):
         raise PreflightFailure("INVALID_REVIEW_RUN_ID", "review run id must be a simple non-empty identifier")
 
-    evidence_directory = resolve_evidence_directory(args.evidence_directory, review_run_id)
+    evidence_directory = resolve_evidence_directory(
+        args.evidence_directory,
+        review_run_id,
+        workspace,
+    )
 
     return {
         "workspace": workspace,
@@ -1093,6 +1721,7 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
         "source_changed_paths": source_changed_paths,
         "authorized_side_effect_changed_paths": authorized_side_effect_changed_paths,
         "unexpected_changed_paths": unexpected_changed_paths,
+        "allowed_side_effect_paths": allowed_side_effect_paths,
         "implementation_evidence": evidence,
         "task_prompt": task_prompt,
         "review_run_id": review_run_id,
@@ -1197,12 +1826,18 @@ def _print_summary(
     print(f"EVIDENCE_DIRECTORY={evidence_directory}")
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    provider_observer: Callable[[bool | None], None] | None = None,
+) -> int:
     args = parse_args(argv)
 
     try:
         pre = run_preflight(args)
     except PreflightFailure as exc:
+        if provider_observer is not None:
+            provider_observer(False)
         print(f"STATUS=PREFLIGHT_FAILURE:{exc.category}")
         print(f"MESSAGE={exc.message}")
         return 3
@@ -1210,23 +1845,129 @@ def main(argv: list[str] | None = None) -> int:
     workspace: Path = pre["workspace"]
     baseline_commit: str = pre["baseline_commit"]
     allowed_paths: tuple[str, ...] = pre["allowed_paths"]
+    allowed_side_effect_paths: tuple[str, ...] = pre["allowed_side_effect_paths"]
     evidence: dict[str, Any] = pre["implementation_evidence"]
     task_prompt: str = pre["task_prompt"]
     review_run_id: str = pre["review_run_id"]
     evidence_directory: Path = pre["evidence_directory"]
 
+    # Establish the reviewed workspace identity before even the Codex
+    # capability/help probes. Those probes are subprocesses of the configured
+    # executable and therefore must be treated as untrusted: unlike
+    # Owner-authorized deterministic checks, they may not change any workspace
+    # or repository state at all.
+    review_entry_hashes = snapshot_workspace_hashes(workspace)
+    review_entry_head = git_rev_parse(workspace, "HEAD") or ""
+    review_entry_index_identity = git_index_identity(workspace) or ""
     try:
-        codex_executable, codex_caps, codex_approval = resolve_codex_contract(args.codex_executable)
-    except PreflightFailure as exc:
-        print(f"STATUS=PREFLIGHT_FAILURE:{exc.category}")
-        print(f"MESSAGE={exc.message}")
+        review_entry_git_metadata = protected_git_metadata_snapshot(workspace)
+    except EvidenceIntegrityFailure as exc:
+        if provider_observer is not None:
+            provider_observer(False)
+        print("STATUS=PREFLIGHT_FAILURE:GIT_METADATA_IDENTITY_UNAVAILABLE")
+        print(f"MESSAGE={exc}")
         return 3
+    review_entry_git_metadata_hash = workspace_hash(review_entry_git_metadata)
+    review_entry_git_entry_hash = workspace_git_entry_hash_from_snapshot(
+        review_entry_git_metadata
+    )
+
+    resolved_codex_contract: tuple[
+        str,
+        dict[str, bool],
+        tuple[str, str],
+    ] | None = None
+    codex_contract_failure: PreflightFailure | None = None
+    try:
+        resolved_codex_contract = resolve_codex_contract(args.codex_executable)
+    except PreflightFailure as exc:
+        # Defer this return until the untrusted probe interval has been
+        # measured. A probe that both mutates the workspace and advertises an
+        # invalid contract is still first and foremost an immutability breach.
+        codex_contract_failure = exc
+
+    capability_probe_hashes = snapshot_workspace_hashes(workspace)
+    try:
+        capability_probe_git_metadata = protected_git_metadata_snapshot(workspace)
+    except EvidenceIntegrityFailure:
+        capability_probe_git_metadata = {}
+    capability_probe_git_metadata_hash = workspace_hash(capability_probe_git_metadata)
+    capability_probe_git_entry_hash = (
+        workspace_git_entry_hash_from_snapshot(capability_probe_git_metadata)
+        if capability_probe_git_metadata
+        else ""
+    )
+    capability_probe_repository_identity_preserved = (
+        review_repository_identity_preserved(
+            workspace,
+            baseline_ref=args.baseline_ref,
+            baseline_commit=baseline_commit,
+            expected_head=review_entry_head,
+            expected_index_identity=review_entry_index_identity,
+            expected_git_metadata_hash=review_entry_git_metadata_hash,
+            actual_git_metadata_hash=capability_probe_git_metadata_hash,
+        )
+    )
+    if (
+        capability_probe_hashes != review_entry_hashes
+        or not capability_probe_repository_identity_preserved
+    ):
+        if provider_observer is not None:
+            provider_observer(False)
+        print("STATUS=PREFLIGHT_FAILURE:IMMUTABILITY_VIOLATION")
+        print("MESSAGE=Codex capability probes changed workspace or repository state")
+        return 3
+    if codex_contract_failure is not None:
+        if provider_observer is not None:
+            provider_observer(False)
+        print(f"STATUS=PREFLIGHT_FAILURE:{codex_contract_failure.category}")
+        print(f"MESSAGE={codex_contract_failure.message}")
+        return 3
+    assert resolved_codex_contract is not None
+    codex_executable, codex_caps, codex_approval = resolved_codex_contract
 
     try:
         check_results = run_deterministic_checks(args.check_command, workspace, args.timeout_seconds)
     except PreflightFailure as exc:
+        if provider_observer is not None:
+            provider_observer(False)
         print(f"STATUS=PREFLIGHT_FAILURE:{exc.category}")
         print(f"MESSAGE={exc.message}")
+        return 3
+    post_check_hashes = snapshot_workspace_hashes(workspace)
+    post_check_head = git_rev_parse(workspace, "HEAD") or ""
+    post_check_index_identity = git_index_identity(workspace) or ""
+    try:
+        post_check_git_metadata = protected_git_metadata_snapshot(workspace)
+    except EvidenceIntegrityFailure:
+        post_check_git_metadata = {}
+    post_check_git_metadata_hash = workspace_hash(post_check_git_metadata)
+    post_check_git_entry_hash = (
+        workspace_git_entry_hash_from_snapshot(post_check_git_metadata)
+        if post_check_git_metadata
+        else ""
+    )
+    check_preservation = classify_review_workspace_preservation(
+        review_entry_hashes,
+        post_check_hashes,
+        allowed_source_paths=allowed_paths,
+        allowed_side_effect_paths=allowed_side_effect_paths,
+        workspace=workspace,
+    )
+    check_repository_identity_preserved = review_repository_identity_preserved(
+        workspace,
+        baseline_ref=args.baseline_ref,
+        baseline_commit=baseline_commit,
+        expected_head=review_entry_head,
+        expected_index_identity=review_entry_index_identity,
+        expected_git_metadata_hash=review_entry_git_metadata_hash,
+        actual_git_metadata_hash=post_check_git_metadata_hash,
+    )
+    if not check_repository_identity_preserved or not check_preservation.workspace_preserved:
+        if provider_observer is not None:
+            provider_observer(False)
+        print("STATUS=REVIEW_FAILURE:IMMUTABILITY_VIOLATION")
+        print("MESSAGE=deterministic checks changed product, unexpected, or repository state")
         return 3
 
     changed_paths_for_prompt = list(pre["changed_paths"])
@@ -1272,18 +2013,135 @@ def main(argv: list[str] | None = None) -> int:
             approval=codex_approval,
         )
         invocation_count += 1
-        outcome = execute_bounded(argv, cwd=Path(tmp_dir), timeout_seconds=float(args.timeout_seconds))
+        try:
+            outcome = execute_bounded(
+                argv,
+                cwd=Path(tmp_dir),
+                timeout_seconds=float(args.timeout_seconds),
+                provider_observer=provider_observer,
+                env=_read_only_subprocess_env(),
+            )
+        except (OSError, ProcessQuiescenceFailure):
+            print("STATUS=PREFLIGHT_FAILURE:CODEX_PROCESS_EXECUTION_FAILED")
+            return 3
         codex_exit_code = outcome.exit_code
         timed_out = outcome.timed_out
         duration_ms = outcome.duration_ms
 
         after_snapshot = snapshot_workspace(workspace, baseline_commit)
         modified_paths = diff_snapshots(before_snapshot, after_snapshot)
-        workspace_unchanged = not modified_paths
+        review_exit_hashes = snapshot_workspace_hashes(workspace)
+        review_exit_head = git_rev_parse(workspace, "HEAD") or ""
+        try:
+            review_exit_git_metadata = protected_git_metadata_snapshot(workspace)
+        except EvidenceIntegrityFailure:
+            review_exit_git_metadata = {}
+        review_exit_git_metadata_hash = workspace_hash(review_exit_git_metadata)
+        review_exit_git_entry_hash = (
+            workspace_git_entry_hash_from_snapshot(review_exit_git_metadata)
+            if review_exit_git_metadata
+            else ""
+        )
+        reviewer_modified_paths = diff_workspace_hashes(
+            post_check_hashes,
+            review_exit_hashes,
+        )
+        preservation = classify_review_workspace_preservation(
+            review_entry_hashes,
+            review_exit_hashes,
+            allowed_source_paths=allowed_paths,
+            allowed_side_effect_paths=allowed_side_effect_paths,
+            workspace=workspace,
+        )
+        reviewer_repository_identity_preserved = review_repository_identity_preserved(
+            workspace,
+            baseline_ref=args.baseline_ref,
+            baseline_commit=baseline_commit,
+            expected_head=post_check_head,
+            expected_index_identity=post_check_index_identity,
+            expected_git_metadata_hash=post_check_git_metadata_hash,
+            actual_git_metadata_hash=review_exit_git_metadata_hash,
+        )
+        repository_identity_preserved = review_repository_identity_preserved(
+            workspace,
+            baseline_ref=args.baseline_ref,
+            baseline_commit=baseline_commit,
+            expected_head=review_entry_head,
+            expected_index_identity=review_entry_index_identity,
+            expected_git_metadata_hash=review_entry_git_metadata_hash,
+            actual_git_metadata_hash=review_exit_git_metadata_hash,
+        )
+        workspace_unchanged = (
+            preservation.workspace_preserved
+            and repository_identity_preserved
+            and not reviewer_modified_paths
+            and reviewer_repository_identity_preserved
+        )
+        preservation_status = (
+            preservation.status
+            if (
+                repository_identity_preserved
+                and not reviewer_modified_paths
+                and reviewer_repository_identity_preserved
+            )
+            else "UNEXPECTED_DRIFT"
+        )
+        reviewed_integrity_hash = reviewed_workspace_integrity_hash(
+            review_exit_hashes,
+            allowed_paths,
+            allowed_side_effect_paths,
+        )
+        reviewed_product_state, reviewed_side_effect_state, reviewed_unexpected_state = (
+            partition_reviewed_workspace_state(
+                review_exit_hashes,
+                allowed_paths,
+                allowed_side_effect_paths,
+            )
+        )
+        side_effect_counts, side_effect_sample = summarize_side_effect_paths(
+            preservation.authorized_side_effect_changed_paths,
+            allowed_side_effect_paths,
+        )
+        capability_probe_git_metadata_changed_paths = diff_workspace_hashes(
+            review_entry_git_metadata,
+            capability_probe_git_metadata,
+        )
+        deterministic_check_git_metadata_changed_paths = diff_workspace_hashes(
+            review_entry_git_metadata,
+            post_check_git_metadata,
+        )
+        reviewer_git_metadata_changed_paths = diff_workspace_hashes(
+            post_check_git_metadata,
+            review_exit_git_metadata,
+        )
+        overall_git_metadata_changed_paths = diff_workspace_hashes(
+            review_entry_git_metadata,
+            review_exit_git_metadata,
+        )
 
         try:
+            if reviewer_modified_paths or not reviewer_repository_identity_preserved:
+                raise ReviewFailure(
+                    "IMMUTABILITY_VIOLATION",
+                    "Codex changed workspace or repository state during read-only review",
+                )
             if modified_paths:
                 raise ReviewFailure("IMMUTABILITY_VIOLATION", f"Codex modified workspace paths: {modified_paths}")
+            if not repository_identity_preserved:
+                raise ReviewFailure(
+                    "IMMUTABILITY_VIOLATION",
+                    "review checks or reviewer changed the workspace repository identity",
+                )
+            if not preservation.workspace_preserved:
+                changed = tuple(
+                    sorted(
+                        (*preservation.source_changed_paths, *preservation.unexpected_changed_paths)
+                    )
+                )
+                raise ReviewFailure(
+                    "IMMUTABILITY_VIOLATION",
+                    f"review changed product or unexpected workspace paths: {list(changed)}",
+                )
             if timed_out:
                 raise ReviewFailure("TIMEOUT", "codex process exceeded the configured timeout")
             if codex_exit_code != 0:
@@ -1314,6 +2172,7 @@ def main(argv: list[str] | None = None) -> int:
         "codex_approval_flag": codex_approval[0],
         "codex_approval_scope": codex_approval[1],
         "invocation_count": invocation_count,
+        "provider_invoked": invocation_count > 0,
         "process_exit_code": codex_exit_code,
         "timed_out": timed_out,
         "duration_ms": duration_ms,
@@ -1325,6 +2184,93 @@ def main(argv: list[str] | None = None) -> int:
         "deterministic_checks": [c.to_dict() for c in check_results],
         "workspace_unchanged": workspace_unchanged,
         "modified_paths": modified_paths,
+        "reviewer_workspace_unchanged": (
+            not reviewer_modified_paths and reviewer_repository_identity_preserved
+        ),
+        "reviewer_modified_paths": list(reviewer_modified_paths),
+        "reviewer_repository_identity_preserved": (
+            reviewer_repository_identity_preserved
+        ),
+        "workspace_preservation_status": preservation_status,
+        "product_state_preserved": preservation.product_state_preserved,
+        "repository_identity_preserved": repository_identity_preserved,
+        "protected_git_metadata_preserved": not overall_git_metadata_changed_paths,
+        "workspace_git_entry_preserved": (
+            bool(review_exit_git_entry_hash)
+            and review_exit_git_entry_hash == review_entry_git_entry_hash
+        ),
+        "protected_git_metadata_changed_path_count": len(
+            overall_git_metadata_changed_paths
+        ),
+        "protected_git_metadata_changed_paths_sample": list(
+            overall_git_metadata_changed_paths[:20]
+        ),
+        "capability_probe_protected_git_metadata_preserved": (
+            not capability_probe_git_metadata_changed_paths
+        ),
+        "capability_probe_workspace_git_entry_preserved": (
+            bool(capability_probe_git_entry_hash)
+            and capability_probe_git_entry_hash == review_entry_git_entry_hash
+        ),
+        "deterministic_check_protected_git_metadata_preserved": (
+            not deterministic_check_git_metadata_changed_paths
+        ),
+        "deterministic_check_workspace_git_entry_preserved": (
+            bool(post_check_git_entry_hash)
+            and post_check_git_entry_hash == review_entry_git_entry_hash
+        ),
+        "reviewer_protected_git_metadata_preserved": (
+            not reviewer_git_metadata_changed_paths
+        ),
+        "reviewer_workspace_git_entry_preserved": (
+            bool(review_exit_git_entry_hash)
+            and review_exit_git_entry_hash == post_check_git_entry_hash
+        ),
+        "authorized_side_effect_drift": preservation.authorized_side_effect_drift,
+        "review_source_changed_paths": list(preservation.source_changed_paths),
+        "review_unexpected_changed_paths": list(preservation.unexpected_changed_paths),
+        "review_authorized_side_effect_changed_path_count": len(
+            preservation.authorized_side_effect_changed_paths
+        ),
+        "review_authorized_side_effect_changed_counts_by_root": {
+            root: count for root, count in side_effect_counts
+        },
+        "review_authorized_side_effect_changed_paths_sample": list(side_effect_sample),
+        "deterministic_check_workspace_preservation_status": (
+            check_preservation.status
+            if check_repository_identity_preserved
+            else "UNEXPECTED_DRIFT"
+        ),
+        "deterministic_check_product_state_preserved": (
+            check_preservation.product_state_preserved
+        ),
+        "deterministic_check_repository_identity_preserved": (
+            check_repository_identity_preserved
+        ),
+        "deterministic_check_authorized_side_effect_drift": (
+            check_preservation.authorized_side_effect_drift
+        ),
+        "deterministic_check_source_changed_paths": list(
+            check_preservation.source_changed_paths
+        ),
+        "deterministic_check_unexpected_changed_paths": list(
+            check_preservation.unexpected_changed_paths
+        ),
+        "reviewed_head": review_exit_head,
+        "reviewed_index_clean": git_index_clean(workspace),
+        "reviewed_index_identity": git_index_identity(workspace),
+        "reviewed_protected_git_metadata_hash": review_exit_git_metadata_hash,
+        "reviewed_workspace_git_entry_hash": review_exit_git_entry_hash,
+        "reviewed_git_special_state": git_special_state(workspace),
+        "reviewed_baseline_commit": git_rev_parse(workspace, args.baseline_ref),
+        "reviewed_allowed_source_paths": list(allowed_paths),
+        "reviewed_workspace_integrity_hash": reviewed_integrity_hash,
+        "reviewed_product_state_hash": workspace_hash(reviewed_product_state),
+        "reviewed_authorized_side_effect_state_hash": workspace_hash(
+            reviewed_side_effect_state
+        ),
+        "reviewed_unexpected_state_hash": workspace_hash(reviewed_unexpected_state),
+        "reviewed_workspace_full_hash": workspace_hash(review_exit_hashes),
         "evidence_paths": {
             "review_prompt": str(evidence_directory / "review-prompt.txt"),
             "review_result": str(evidence_directory / "review-result.json"),

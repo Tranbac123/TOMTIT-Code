@@ -1255,6 +1255,11 @@ class ClaudeCodeCLIResult:
     # installed for this invocation. Never carries the hook's raw decisions
     # or the raw command it evaluated -- only this boolean.
     exact_bash_guard_enabled: bool = False
+    # True only when subprocess creation succeeded and the provider process
+    # boundary was actually reached. Adapter preflight/guard failures and
+    # Popen start failures remain False; nonzero exits and timeouts after a
+    # successful start remain True.
+    provider_invoked: bool = False
     # Provider-output persistence boundary (M-1 / M-2). When True,
     # `stdout_excerpt`/`stderr_excerpt` carry a fixed placeholder instead of
     # provider-controlled text, and the `provider_*` fields below carry the
@@ -1376,6 +1381,11 @@ def _iter_workspace_relative_paths(root: Path) -> Iterator[str]:
 
         for name in sorted(filenames) + sorted(symlinked_dirs):
             path = current / name
+            # In a linked worktree, the root `.git` entry is a regular
+            # indirection file. It is protected repository metadata, not
+            # product/worktree content; dogfood Runtime binds it separately.
+            if not rel_parts and name == ".git":
+                continue
             if name in _IGNORED_FILE_NAMES:
                 continue
             # Suffix filtering must not hide a symlink: an alias named
@@ -1863,6 +1873,7 @@ def build_evidence_manifest(result: ClaudeCodeCLIResult) -> dict[str, object]:
         "authorized_command_count": result.authorized_command_count,
         "authorized_command_cli_rules": list(result.authorized_command_cli_rules),
         "exact_bash_guard_enabled": result.exact_bash_guard_enabled,
+        "provider_invoked": result.provider_invoked,
         # Persist-safe provider-output summary (M-1 / M-2). `stdout_excerpt`
         # and `stderr_excerpt` above already carry only a fixed placeholder
         # whenever `provider_output_withheld` is True.
@@ -2052,6 +2063,12 @@ def ensure_process_group_quiescent(
         return _ProcessGroupCleanup.FAILED
 
     if not _signal_process_group(pgid, signal.SIGTERM):
+        # The last member may exit between the positive liveness probe and
+        # killpg().  Re-probe before failing so an already-absent group is
+        # accepted as positively quiescent, while indeterminate/live states
+        # remain fail-closed.
+        if _process_group_alive(pgid) is False:
+            return _ProcessGroupCleanup.CLEANED
         return _ProcessGroupCleanup.FAILED
     alive = _await_process_group_absence(pgid, deadline=time.monotonic() + grace_seconds)
     if alive is False:
@@ -2060,6 +2077,8 @@ def ensure_process_group_quiescent(
         return _ProcessGroupCleanup.FAILED
 
     if not _signal_process_group(pgid, signal.SIGKILL):
+        if _process_group_alive(pgid) is False:
+            return _ProcessGroupCleanup.CLEANED
         return _ProcessGroupCleanup.FAILED
     alive = _await_process_group_absence(pgid, deadline=time.monotonic() + grace_seconds)
     if alive is False:
@@ -2574,6 +2593,7 @@ class ClaudeCodeCLIAdapter:
                 exact_bash_guard_artifacts is not None
                 and exact_bash_guard_artifacts.fingerprints_path is not None
             ),
+            provider_invoked=outcome.start_failure is None,
             provider_output_withheld=provider_summary is not None,
             provider_stdout_bytes=provider_summary.stdout_bytes if provider_summary else None,
             provider_stderr_bytes=provider_summary.stderr_bytes if provider_summary else None,

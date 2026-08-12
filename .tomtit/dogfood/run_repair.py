@@ -34,9 +34,12 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
+import re
+import stat
 import subprocess
 import sys
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -105,14 +108,12 @@ class IntegrityFailure(Exception):
 # ---------------------------------------------------------------------------
 
 
-def _read_json_file(path: Path, category: str) -> Any:
-    if not path.is_file():
-        raise PreflightFailure(category, f"required evidence file missing: {path.name}")
+def _parse_json_bytes(data: bytes, name: str) -> Any:
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+        return json.loads(data.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise IntegrityFailure(
-            "EVIDENCE_PARSE_FAILURE", f"{path.name} is not readable/valid JSON: {exc.__class__.__name__}"
+            "EVIDENCE_PARSE_FAILURE", f"{name} is not readable/valid JSON: {exc.__class__.__name__}"
         ) from None
 
 
@@ -143,19 +144,39 @@ def load_previous_implementation_evidence(
 
 
 def load_review_evidence(review_directory: Path) -> dict[str, Any]:
-    if not review_directory.is_dir():
-        raise PreflightFailure("MISSING_REVIEW_EVIDENCE", "review run directory does not exist")
-
-    result = _read_json_file(review_directory / "review-result.json", "MISSING_REVIEW_EVIDENCE")
-    receipt = _read_json_file(review_directory / "review-receipt.json", "MISSING_REVIEW_EVIDENCE")
-    checks_path = review_directory / "checks.json"
-    prompt_path = review_directory / "review-prompt.txt"
-    if not checks_path.is_file() or not prompt_path.is_file():
-        raise PreflightFailure("MISSING_REVIEW_EVIDENCE", "review-prompt.txt or checks.json is missing")
-    checks = _read_json_file(checks_path, "MISSING_REVIEW_EVIDENCE")
     try:
-        prompt_text = prompt_path.read_text(encoding="utf-8")
-    except OSError as exc:
+        review_directory.lstat()
+    except OSError:
+        raise PreflightFailure(
+            "MISSING_REVIEW_EVIDENCE",
+            "review run directory does not exist",
+        ) from None
+    try:
+        evidence_snapshot = run_review.read_canonical_evidence(
+            review_directory,
+            REVIEW_EVIDENCE_FILES,
+        )
+    except run_review.EvidenceIntegrityFailure as exc:
+        raise IntegrityFailure(
+            "UNSAFE_REVIEW_EVIDENCE_IDENTITY",
+            f"review evidence identity is unsafe: {exc}",
+        ) from None
+
+    result = _parse_json_bytes(
+        evidence_snapshot.file_bytes["review-result.json"],
+        "review-result.json",
+    )
+    receipt = _parse_json_bytes(
+        evidence_snapshot.file_bytes["review-receipt.json"],
+        "review-receipt.json",
+    )
+    checks = _parse_json_bytes(
+        evidence_snapshot.file_bytes["checks.json"],
+        "checks.json",
+    )
+    try:
+        prompt_text = evidence_snapshot.file_bytes["review-prompt.txt"].decode("utf-8")
+    except UnicodeDecodeError as exc:
         raise IntegrityFailure(
             "EVIDENCE_PARSE_FAILURE", f"review-prompt.txt is not readable: {exc.__class__.__name__}"
         ) from None
@@ -232,6 +253,7 @@ def _commit_object_exists(workspace: Path, commit: str) -> bool:
     completed = subprocess.run(
         ["git", "cat-file", "-e", f"{commit}^{{commit}}"],
         cwd=str(workspace),
+        env=run_review._read_only_subprocess_env(),
         stdin=subprocess.DEVNULL,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
@@ -288,6 +310,15 @@ def bind_review_to_implementation(
         raise IntegrityFailure(
             "REVIEW_BASELINE_MISMATCH", "review evidence baseline commit does not exist in this workspace's history"
         )
+    baseline_ref = review_receipt.get("baseline_ref")
+    if not isinstance(baseline_ref, str) or not baseline_ref:
+        raise IntegrityFailure("REVIEW_BASELINE_MISSING", "review evidence does not record a baseline ref")
+    live_baseline_commit = run_review.git_rev_parse(workspace, baseline_ref)
+    if live_baseline_commit != baseline_commit:
+        raise IntegrityFailure(
+            "REVIEW_BASELINE_MISMATCH",
+            "the review baseline ref no longer resolves to the reviewed baseline commit",
+        )
     return str(baseline_commit)
 
 
@@ -314,6 +345,25 @@ class WorkspaceFingerprint:
     tracked_diff_sha256: str
     workspace_after_hash_expected: str
     workspace_after_hash_actual: str
+    reviewed_head_expected: str | None
+    reviewed_head_actual: str
+    reviewed_index_identity_expected: str | None
+    reviewed_index_identity_actual: str
+    reviewed_protected_git_metadata_hash_expected: str | None
+    reviewed_protected_git_metadata_hash_actual: str
+    reviewed_workspace_git_entry_hash_expected: str | None
+    reviewed_workspace_git_entry_hash_actual: str
+    reviewed_workspace_integrity_hash_expected: str | None
+    reviewed_workspace_integrity_hash_actual: str
+    reviewed_product_state_hash_expected: str | None
+    reviewed_product_state_hash_actual: str
+    reviewed_authorized_side_effect_state_hash_expected: str | None
+    reviewed_authorized_side_effect_state_hash_actual: str
+    reviewed_unexpected_state_hash_expected: str | None
+    reviewed_unexpected_state_hash_actual: str
+    reviewed_workspace_full_hash_expected: str | None
+    reviewed_workspace_full_hash_actual: str
+    authorized_side_effect_drift: bool
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -329,7 +379,81 @@ class WorkspaceFingerprint:
             "tracked_diff_sha256": self.tracked_diff_sha256,
             "workspace_after_hash_expected": self.workspace_after_hash_expected,
             "workspace_after_hash_actual": self.workspace_after_hash_actual,
+            "reviewed_head_expected": self.reviewed_head_expected,
+            "reviewed_head_actual": self.reviewed_head_actual,
+            "reviewed_index_identity_expected": self.reviewed_index_identity_expected,
+            "reviewed_index_identity_actual": self.reviewed_index_identity_actual,
+            "reviewed_protected_git_metadata_hash_expected": (
+                self.reviewed_protected_git_metadata_hash_expected
+            ),
+            "reviewed_protected_git_metadata_hash_actual": (
+                self.reviewed_protected_git_metadata_hash_actual
+            ),
+            "reviewed_workspace_git_entry_hash_expected": (
+                self.reviewed_workspace_git_entry_hash_expected
+            ),
+            "reviewed_workspace_git_entry_hash_actual": (
+                self.reviewed_workspace_git_entry_hash_actual
+            ),
+            "reviewed_workspace_integrity_hash_expected": (
+                self.reviewed_workspace_integrity_hash_expected
+            ),
+            "reviewed_workspace_integrity_hash_actual": (
+                self.reviewed_workspace_integrity_hash_actual
+            ),
+            "reviewed_product_state_hash_expected": self.reviewed_product_state_hash_expected,
+            "reviewed_product_state_hash_actual": self.reviewed_product_state_hash_actual,
+            "reviewed_authorized_side_effect_state_hash_expected": (
+                self.reviewed_authorized_side_effect_state_hash_expected
+            ),
+            "reviewed_authorized_side_effect_state_hash_actual": (
+                self.reviewed_authorized_side_effect_state_hash_actual
+            ),
+            "reviewed_unexpected_state_hash_expected": (
+                self.reviewed_unexpected_state_hash_expected
+            ),
+            "reviewed_unexpected_state_hash_actual": self.reviewed_unexpected_state_hash_actual,
+            "reviewed_workspace_full_hash_expected": (
+                self.reviewed_workspace_full_hash_expected
+            ),
+            "reviewed_workspace_full_hash_actual": (
+                self.reviewed_workspace_full_hash_actual
+            ),
+            "authorized_side_effect_drift": self.authorized_side_effect_drift,
         }
+
+
+def _is_sha256(value: object) -> bool:
+    return isinstance(value, str) and re.fullmatch(r"[0-9a-f]{64}", value) is not None
+
+
+def _legacy_workspace_hash_with_root_gitfile(
+    workspace: Path,
+    current_hashes: dict[str, str],
+) -> str:
+    """Reproduce the historical linked-worktree hash for strict legacy evidence."""
+
+    git_entry = workspace / ".git"
+    try:
+        metadata = git_entry.lstat()
+    except OSError:
+        return workspace_hash(current_hashes)
+    if not stat.S_ISREG(metadata.st_mode):
+        return workspace_hash(current_hashes)
+    _, content = run_review._regular_file_measurement(
+        git_entry,
+        metadata,
+        reject_hardlinks=False,
+        capture_bytes=True,
+    )
+    if content is None:
+        raise IntegrityFailure(
+            "WORKSPACE_STATE_MISMATCH",
+            "legacy linked-worktree .git identity could not be measured",
+        )
+    historical_hashes = dict(current_hashes)
+    historical_hashes[".git"] = run_review._sha256(content)
+    return workspace_hash(historical_hashes)
 
 
 def prove_reviewed_state(
@@ -338,6 +462,7 @@ def prove_reviewed_state(
     baseline_commit: str,
     previous_result: dict[str, Any],
     previous_receipt: dict[str, Any],
+    review_receipt: dict[str, Any],
     allowed_source_paths: tuple[str, ...],
     allowed_side_effect_paths: tuple[str, ...],
 ) -> WorkspaceFingerprint:
@@ -345,15 +470,11 @@ def prove_reviewed_state(
 
     Two independent proofs, both required:
 
-    1. An independently recomputed whole-workspace hash, using the adapter's
-       own snapshot/hash functions, must equal the hash the adapter itself
-       persisted immediately after the implementation run. This is strictly
-       stronger than trusting a stored `workspace_unchanged` boolean -- it is
-       a fresh, byte-exact recomputation against the workspace as it exists
-       right now. This check is load-bearing and is never weakened or
-       bypassed by the classification below: even an authorized generated
-       path (e.g. dist/bundle.js) drifting in *content* after Review 1 is
-       caught here, before classification is ever reached.
+    1. New review evidence binds separate product, authorized-side-effect,
+       and protected-other identities. Product and protected-other identity
+       must match; authorized side effects are measured but may drift. Legacy
+       review receipts without those identities retain the previous strict
+       whole-workspace-hash fallback.
 
     2. The live Git-visible changed paths, split via the canonical
        `classify_workspace_changes()` into SOURCE / AUTHORIZED_SIDE_EFFECT /
@@ -367,17 +488,140 @@ def prove_reviewed_state(
     """
 
     expected_hash = previous_result.get("workspace_after_hash")
-    if not expected_hash:
+    if not isinstance(expected_hash, str) or not expected_hash:
         raise IntegrityFailure(
             "PREVIOUS_EVIDENCE_INCOMPLETE", "previous implementation result.json has no workspace_after_hash"
         )
-    actual_hash = workspace_hash(snapshot_workspace_hashes(workspace))
-    if actual_hash != expected_hash:
-        raise IntegrityFailure(
-            "WORKSPACE_STATE_MISMATCH",
-            "the current workspace no longer matches the state Codex reviewed "
-            "(whole-workspace content hash differs from the implementation evidence)",
+    current_hashes = snapshot_workspace_hashes(workspace)
+    actual_hash = workspace_hash(current_hashes)
+    current_product, current_side_effects, current_unexpected = (
+        run_review.partition_reviewed_workspace_state(
+            current_hashes,
+            allowed_source_paths,
+            allowed_side_effect_paths,
         )
+    )
+    actual_product_hash = workspace_hash(current_product)
+    actual_side_effect_hash = workspace_hash(current_side_effects)
+    actual_unexpected_hash = workspace_hash(current_unexpected)
+    actual_integrity_hash = run_review.reviewed_workspace_integrity_hash(
+        current_hashes,
+        allowed_source_paths,
+        allowed_side_effect_paths,
+    )
+    expected_head = review_receipt.get("reviewed_head")
+    actual_head = run_review.git_rev_parse(workspace, "HEAD") or ""
+    expected_index_clean = review_receipt.get("reviewed_index_clean")
+    expected_index_identity = review_receipt.get("reviewed_index_identity")
+    actual_index_identity = run_review.git_index_identity(workspace) or ""
+    expected_git_metadata_hash = review_receipt.get(
+        "reviewed_protected_git_metadata_hash"
+    )
+    expected_git_entry_hash = review_receipt.get(
+        "reviewed_workspace_git_entry_hash"
+    )
+    try:
+        actual_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+        actual_git_metadata_hash = workspace_hash(actual_git_metadata)
+        actual_git_entry_hash = run_review.workspace_git_entry_hash_from_snapshot(
+            actual_git_metadata
+        )
+    except run_review.EvidenceIntegrityFailure:
+        actual_git_metadata_hash = ""
+        actual_git_entry_hash = ""
+    expected_git_special_state = review_receipt.get("reviewed_git_special_state")
+    expected_baseline_commit = review_receipt.get("reviewed_baseline_commit")
+    expected_allowed_source_paths = review_receipt.get(
+        "reviewed_allowed_source_paths"
+    )
+    expected_integrity_hash = review_receipt.get("reviewed_workspace_integrity_hash")
+    expected_product_hash = review_receipt.get("reviewed_product_state_hash")
+    expected_side_effect_hash = review_receipt.get(
+        "reviewed_authorized_side_effect_state_hash"
+    )
+    expected_unexpected_hash = review_receipt.get("reviewed_unexpected_state_hash")
+    expected_full_hash = review_receipt.get("reviewed_workspace_full_hash")
+    partitioned_identity_fields = (
+        "reviewed_head",
+        "reviewed_index_clean",
+        "reviewed_index_identity",
+        "reviewed_protected_git_metadata_hash",
+        "reviewed_workspace_git_entry_hash",
+        "reviewed_git_special_state",
+        "reviewed_baseline_commit",
+        "reviewed_allowed_source_paths",
+        "reviewed_workspace_integrity_hash",
+        "reviewed_product_state_hash",
+        "reviewed_authorized_side_effect_state_hash",
+        "reviewed_unexpected_state_hash",
+        "reviewed_workspace_full_hash",
+    )
+    partitioned_identity_present = any(
+        key in review_receipt for key in partitioned_identity_fields
+    )
+    partitioned_identity_available = (
+        all(key in review_receipt for key in partitioned_identity_fields)
+        and isinstance(expected_head, str)
+        and bool(expected_head)
+        and expected_index_clean is True
+        and _is_sha256(expected_index_identity)
+        and _is_sha256(expected_git_metadata_hash)
+        and _is_sha256(expected_git_entry_hash)
+        and expected_git_special_state is None
+        and isinstance(expected_baseline_commit, str)
+        and expected_baseline_commit == baseline_commit
+        and isinstance(expected_allowed_source_paths, list)
+        and all(isinstance(path, str) for path in expected_allowed_source_paths)
+        and tuple(expected_allowed_source_paths) == allowed_source_paths
+        and all(
+            _is_sha256(value)
+            for value in (
+                expected_integrity_hash,
+                expected_product_hash,
+                expected_side_effect_hash,
+                expected_unexpected_hash,
+                expected_full_hash,
+            )
+        )
+    )
+    if partitioned_identity_present and not partitioned_identity_available:
+        raise IntegrityFailure(
+            "PREVIOUS_EVIDENCE_INCOMPLETE",
+            "review evidence contains an incomplete or malformed partitioned workspace identity",
+        )
+    if partitioned_identity_available:
+        if (
+            actual_head != expected_head
+            or actual_index_identity != expected_index_identity
+            or actual_git_metadata_hash != expected_git_metadata_hash
+            or actual_git_entry_hash != expected_git_entry_hash
+        ):
+            raise IntegrityFailure(
+                "WORKSPACE_STATE_MISMATCH",
+                "the current repository identity differs from the reviewed repository state",
+            )
+        if (
+            actual_integrity_hash != expected_integrity_hash
+            or actual_product_hash != expected_product_hash
+            or actual_unexpected_hash != expected_unexpected_hash
+        ):
+            raise IntegrityFailure(
+                "WORKSPACE_STATE_MISMATCH",
+                "the current product or unexpected workspace state differs from the reviewed state",
+            )
+    elif actual_hash != expected_hash:
+        try:
+            legacy_actual_hash = _legacy_workspace_hash_with_root_gitfile(
+                workspace,
+                current_hashes,
+            )
+        except run_review.EvidenceIntegrityFailure:
+            legacy_actual_hash = ""
+        if legacy_actual_hash != expected_hash:
+            raise IntegrityFailure(
+                "WORKSPACE_STATE_MISMATCH",
+                "legacy review evidence requires an exact whole-workspace content hash match",
+            )
 
     live_changed_paths = tuple(run_review.git_changed_paths(workspace, baseline_commit))
     source_changed_paths, authorized_side_effect_changed_paths, unexpected_changed_paths = classify_workspace_changes(
@@ -424,6 +668,56 @@ def prove_reviewed_state(
         tracked_diff_sha256=run_review._sha256(tracked_diff.encode("utf-8")),
         workspace_after_hash_expected=str(expected_hash),
         workspace_after_hash_actual=actual_hash,
+        reviewed_head_expected=(str(expected_head) if isinstance(expected_head, str) else None),
+        reviewed_head_actual=actual_head,
+        reviewed_index_identity_expected=(
+            str(expected_index_identity)
+            if isinstance(expected_index_identity, str)
+            else None
+        ),
+        reviewed_index_identity_actual=actual_index_identity,
+        reviewed_protected_git_metadata_hash_expected=(
+            str(expected_git_metadata_hash)
+            if isinstance(expected_git_metadata_hash, str)
+            else None
+        ),
+        reviewed_protected_git_metadata_hash_actual=actual_git_metadata_hash,
+        reviewed_workspace_git_entry_hash_expected=(
+            str(expected_git_entry_hash)
+            if isinstance(expected_git_entry_hash, str)
+            else None
+        ),
+        reviewed_workspace_git_entry_hash_actual=actual_git_entry_hash,
+        reviewed_workspace_integrity_hash_expected=(
+            str(expected_integrity_hash)
+            if isinstance(expected_integrity_hash, str)
+            else None
+        ),
+        reviewed_workspace_integrity_hash_actual=actual_integrity_hash,
+        reviewed_product_state_hash_expected=(
+            str(expected_product_hash) if isinstance(expected_product_hash, str) else None
+        ),
+        reviewed_product_state_hash_actual=actual_product_hash,
+        reviewed_authorized_side_effect_state_hash_expected=(
+            str(expected_side_effect_hash)
+            if isinstance(expected_side_effect_hash, str)
+            else None
+        ),
+        reviewed_authorized_side_effect_state_hash_actual=actual_side_effect_hash,
+        reviewed_unexpected_state_hash_expected=(
+            str(expected_unexpected_hash)
+            if isinstance(expected_unexpected_hash, str)
+            else None
+        ),
+        reviewed_unexpected_state_hash_actual=actual_unexpected_hash,
+        reviewed_workspace_full_hash_expected=(
+            str(expected_full_hash) if isinstance(expected_full_hash, str) else None
+        ),
+        reviewed_workspace_full_hash_actual=actual_hash,
+        authorized_side_effect_drift=(
+            isinstance(expected_side_effect_hash, str)
+            and actual_side_effect_hash != expected_side_effect_hash
+        ),
     )
 
 
@@ -601,12 +895,8 @@ def _read_original_task_prompt(path_arg: str) -> str:
     return text
 
 
-def _hash_evidence_files(directory: Path, filenames: tuple[str, ...]) -> dict[str, str | None]:
-    hashes: dict[str, str | None] = {}
-    for name in filenames:
-        path = directory / name
-        hashes[name] = run_review._sha256(path.read_bytes()) if path.is_file() else None
-    return hashes
+def _hash_evidence_files(directory: Path, filenames: tuple[str, ...]) -> dict[str, str]:
+    return run_review.snapshot_canonical_evidence(directory, filenames)
 
 
 def _utc_now_iso() -> str:
@@ -711,6 +1001,43 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     bind_review_to_original_task(review_evidence["prompt_text"], original_task_prompt)
 
     allowed_paths = normalize_allowed_paths(args.allowed_path, workspace)
+    raw_original_allowed_paths = previous_evidence["receipt"].get(
+        "allowed_changed_paths"
+    )
+    if not isinstance(raw_original_allowed_paths, list) or not all(
+        isinstance(path, str) for path in raw_original_allowed_paths
+    ):
+        raise IntegrityFailure(
+            "ALLOWED_PATH_EVIDENCE_INVALID",
+            "previous implementation evidence allowed_changed_paths is malformed",
+        )
+    try:
+        original_allowed_paths = normalize_allowed_paths(
+            raw_original_allowed_paths,
+            workspace,
+        )
+    except PreflightFailure as exc:
+        raise IntegrityFailure(
+            "ALLOWED_PATH_EVIDENCE_INVALID",
+            f"previous implementation evidence allowed_changed_paths is invalid: {exc.category}",
+        ) from None
+    if allowed_paths != original_allowed_paths:
+        raise IntegrityFailure(
+            "ALLOWED_PATH_CONTRACT_MISMATCH",
+            "repair allowed paths do not exactly match the bound implementation contract",
+        )
+    reviewed_allowed_paths = review_evidence["receipt"].get(
+        "reviewed_allowed_source_paths"
+    )
+    if reviewed_allowed_paths is not None and (
+        not isinstance(reviewed_allowed_paths, list)
+        or not all(isinstance(path, str) for path in reviewed_allowed_paths)
+        or tuple(reviewed_allowed_paths) != allowed_paths
+    ):
+        raise IntegrityFailure(
+            "ALLOWED_PATH_CONTRACT_MISMATCH",
+            "repair allowed paths do not match the review identity classification contract",
+        )
     allowed_set = set(allowed_paths)
     previous_changed = set(previous_evidence["receipt"].get("changed_paths", []))
     if not previous_changed.issubset(allowed_set):
@@ -741,6 +1068,7 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
         baseline_commit=baseline_commit,
         previous_result=previous_evidence["result"],
         previous_receipt=previous_evidence["receipt"],
+        review_receipt=review_evidence["receipt"],
         allowed_source_paths=allowed_paths,
         allowed_side_effect_paths=original_allowed_side_effect_paths,
     )
@@ -855,20 +1183,30 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     }
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(
+    argv: list[str] | None = None,
+    *,
+    provider_observer: Callable[[bool | None], None] | None = None,
+) -> int:
     args = parse_args(argv)
 
     try:
         pre = run_preflight(args)
     except PreflightFailure as exc:
+        if provider_observer is not None:
+            provider_observer(False)
         print(f"STATUS=PREFLIGHT_FAILURE:{exc.category}")
         print(f"MESSAGE={exc.message}")
         return 2
     except IntegrityFailure as exc:
+        if provider_observer is not None:
+            provider_observer(False)
         print(f"STATUS=INTEGRITY_FAILURE:{exc.category}")
         print(f"MESSAGE={exc.message}")
         return 3
     except Exception as exc:  # noqa: BLE001
+        if provider_observer is not None:
+            provider_observer(False)
         print(f"STATUS=INTERNAL_ERROR:{exc.__class__.__name__}")
         return 3
 
@@ -921,11 +1259,23 @@ def main(argv: list[str] | None = None) -> int:
     try:
         result = ClaudeCodeCLIAdapter().run(request, executable_path=args.claude_executable)
     except Exception as exc:  # noqa: BLE001
+        if provider_observer is not None:
+            provider_observer(None)
         print(f"STATUS=INTERNAL_ERROR:{exc.__class__.__name__}")
         return 3
+    if provider_observer is not None:
+        provider_observer(result.provider_invoked)
     after_contents = snapshot_workspace_contents(workspace)
 
-    check_results = [run_review.run_check_command(c, workspace, args.timeout_seconds) for c in check_commands]
+    try:
+        check_results = [
+            run_review.run_check_command(c, workspace, args.timeout_seconds)
+            for c in check_commands
+        ]
+    except run_review.PreflightFailure as exc:
+        print(f"STATUS=CHECK_EXECUTION_FAILURE:{exc.category}")
+        print(f"MESSAGE={exc.message}")
+        return 3
 
     try:
         finalized = write_evidence(
@@ -1009,6 +1359,7 @@ def main(argv: list[str] | None = None) -> int:
         "success": success,
         "exit_code": finalized.exit_code,
         "timed_out": finalized.timed_out,
+        "provider_invoked": finalized.provider_invoked,
         "duration_ms": finalized.duration_ms,
         "changed_paths": list(finalized.changed_paths),
         "unexpected_changed_paths": list(finalized.unexpected_changed_paths),

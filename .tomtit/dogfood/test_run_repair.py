@@ -76,6 +76,18 @@ def make_reviewed_workspace(tmp_path: Path, *, changed_content: str = "changed\n
     return ws, baseline_commit, after_hash
 
 
+def make_linked_reviewed_workspace(tmp_path: Path) -> tuple[Path, str, str]:
+    primary, baseline_commit, _ = make_reviewed_workspace(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    _git(["worktree", "add", "-q", "-b", "linked-test", str(linked), "HEAD"], primary)
+    (linked / "app.txt").write_text("changed\n", encoding="utf-8")
+    return (
+        linked,
+        baseline_commit,
+        workspace_hash(snapshot_workspace_hashes(linked)),
+    )
+
+
 def make_implementation_evidence(
     tmp_path: Path,
     *,
@@ -181,6 +193,9 @@ def make_review_evidence(
     implementation_run_id_override: str | None = None,
     implementation_attempt: Any = 1,
     omit_implementation_attempt: bool = False,
+    partitioned_identity: bool = False,
+    allowed_paths: list[str] | None = None,
+    allowed_side_effect_paths: list[str] | None = None,
     name: str = "review-run",
 ) -> Path:
     review_dir = tmp_path / name
@@ -216,6 +231,50 @@ def make_review_evidence(
     }
     if not omit_implementation_attempt:
         receipt["implementation_attempt"] = implementation_attempt
+    if partitioned_identity:
+        source_paths = tuple(allowed_paths or ["app.txt"])
+        side_effect_paths = tuple(allowed_side_effect_paths or [])
+        hashes = snapshot_workspace_hashes(workspace)
+        product, side_effects, unexpected = run_review.partition_reviewed_workspace_state(
+            hashes,
+            source_paths,
+            side_effect_paths,
+        )
+        receipt.update(
+            {
+                "reviewed_head": subprocess.run(
+                    ["git", "rev-parse", "HEAD"],
+                    cwd=str(workspace),
+                    capture_output=True,
+                    text=True,
+                    check=True,
+                ).stdout.strip(),
+                "reviewed_index_clean": True,
+                "reviewed_index_identity": run_review.git_index_identity(workspace),
+                "reviewed_protected_git_metadata_hash": (
+                    run_review.protected_git_metadata_hash(workspace)
+                ),
+                "reviewed_workspace_git_entry_hash": (
+                    run_review.workspace_git_entry_hash_from_snapshot(
+                        run_review.protected_git_metadata_snapshot(workspace)
+                    )
+                ),
+                "reviewed_git_special_state": None,
+                "reviewed_baseline_commit": baseline_commit,
+                "reviewed_allowed_source_paths": list(source_paths),
+                "reviewed_workspace_integrity_hash": (
+                    run_review.reviewed_workspace_integrity_hash(
+                        hashes,
+                        source_paths,
+                        side_effect_paths,
+                    )
+                ),
+                "reviewed_product_state_hash": workspace_hash(product),
+                "reviewed_authorized_side_effect_state_hash": workspace_hash(side_effects),
+                "reviewed_unexpected_state_hash": workspace_hash(unexpected),
+                "reviewed_workspace_full_hash": workspace_hash(hashes),
+            }
+        )
     (review_dir / "review-receipt.json").write_text(json.dumps(receipt, indent=2), encoding="utf-8")
     (review_dir / "review-prompt.txt").write_text(
         make_review_prompt_text(task_prompt_text, baseline_commit_override or baseline_commit), encoding="utf-8"
@@ -609,7 +668,7 @@ def test_changed_path_outside_allowed_scope(tmp_path: Path) -> None:
         review_run_directory=ctx["review_dir"],
         allowed_paths=["README.md"],
     )
-    assert exit_code == 2
+    assert exit_code == 3
 
 
 def test_invalid_allowed_path_rejected(tmp_path: Path) -> None:
@@ -1717,10 +1776,8 @@ def test_unexpected_mutation_after_review_fails_reconciliation(tmp_path: Path) -
     assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
 
 
-def test_authorized_generated_file_content_drift_fails_workspace_hash(tmp_path: Path) -> None:
-    """The workspace hash remains authoritative: content drift on an
-    already-authorized generated file must be caught by the hash check, not
-    silently waved through by classification succeeding."""
+def test_legacy_review_evidence_keeps_strict_whole_workspace_hash(tmp_path: Path) -> None:
+    """Historical receipts without partitioned identities retain strict fallback."""
 
     ws, baseline_commit, after_hash = make_reviewed_workspace_multi(
         tmp_path, {"package.json": '{"a": 1}\n', "dist/bundle.js": "v1\n"}
@@ -1749,6 +1806,406 @@ def test_authorized_generated_file_content_drift_fails_workspace_hash(tmp_path: 
         )
     assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
     assert "hash" in excinfo.value.message
+
+
+def test_partitioned_review_identity_allows_authorized_side_effect_drift(
+    tmp_path: Path,
+) -> None:
+    ws, baseline_commit, after_hash = make_reviewed_workspace_multi(
+        tmp_path, {"package.json": '{"a": 1}\n', "dist/bundle.js": "v1\n"}
+    )
+    impl_dir = make_implementation_evidence(
+        tmp_path,
+        workspace=ws,
+        after_hash=after_hash,
+        changed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
+    )
+    review_dir = make_review_evidence(
+        tmp_path,
+        workspace=ws,
+        baseline_commit=baseline_commit,
+        partitioned_identity=True,
+        allowed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
+    )
+    (ws / "dist" / "bundle.js").write_text("v2 after deterministic review check\n", encoding="utf-8")
+
+    pre = preflight_for(
+        tmp_path,
+        ws,
+        implementation_run_directory=impl_dir,
+        review_run_directory=review_dir,
+        allowed_paths=["package.json"],
+        allowed_side_effect_paths=["dist"],
+    )
+
+    assert pre["fingerprint"].authorized_side_effect_drift is True
+    assert (
+        pre["fingerprint"].reviewed_product_state_hash_actual
+        == pre["fingerprint"].reviewed_product_state_hash_expected
+    )
+    assert (
+        pre["fingerprint"].reviewed_unexpected_state_hash_actual
+        == pre["fingerprint"].reviewed_unexpected_state_hash_expected
+    )
+
+
+def test_partitioned_review_identity_rejects_source_drift(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    (ctx["ws"] / "app.txt").write_text("source changed after review\n", encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
+
+
+def test_partitioned_review_identity_rejects_ignored_unexpected_drift(
+    tmp_path: Path,
+) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    git_exclude = ctx["ws"] / ".git" / "info" / "exclude"
+    git_exclude.write_text(".private/\n", encoding="utf-8")
+    (ctx["ws"] / ".private").mkdir()
+    (ctx["ws"] / ".private" / "state").write_text("unexpected\n", encoding="utf-8")
+    assert ".private/state" not in run_review.git_changed_paths(
+        ctx["ws"], ctx["baseline_commit"]
+    )
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
+
+
+def test_repair_rejects_reviewed_head_and_baseline_ref_drift(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    _git(
+        [
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t.invalid",
+            "commit",
+            "--allow-empty",
+            "-q",
+            "-m",
+            "move head",
+        ],
+        ctx["ws"],
+    )
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEW_BASELINE_MISMATCH"
+
+
+def test_repair_cannot_widen_bound_source_allowlist_with_absent_path(
+    tmp_path: Path,
+) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt", "future.txt"],
+        )
+
+    assert excinfo.value.category == "ALLOWED_PATH_CONTRACT_MISMATCH"
+
+
+def test_partial_partitioned_review_identity_fails_closed(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["reviewed_head"] = ctx["baseline_commit"]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("reviewed_workspace_full_hash", "0" * 64),
+        ("reviewed_index_clean", True),
+        ("reviewed_git_special_state", None),
+        ("reviewed_allowed_source_paths", ["app.txt"]),
+    ],
+)
+def test_any_lone_current_review_identity_field_fails_closed(
+    tmp_path: Path,
+    field: str,
+    value: object,
+) -> None:
+    ctx = standard_setup(tmp_path)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt[field] = value
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+def test_malformed_partitioned_review_hash_fails_closed(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["reviewed_authorized_side_effect_state_hash"] = "not-a-sha256"
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+def test_repair_rejects_semantic_index_flag_drift(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    before_identity = run_review.git_index_identity(ctx["ws"])
+    _git(["update-index", "--assume-unchanged", "app.txt"], ctx["ws"])
+
+    assert run_review.git_index_clean(ctx["ws"]) is True
+    assert run_review.git_index_identity(ctx["ws"]) != before_identity
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
+
+
+def test_repair_rejects_git_config_drift_after_review(tmp_path: Path) -> None:
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    _git(["config", "tomtit.synthetic", "changed"], ctx["ws"])
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
+
+
+def test_lone_git_metadata_identity_field_cannot_downgrade_to_legacy(
+    tmp_path: Path,
+) -> None:
+    ctx = standard_setup(tmp_path)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["reviewed_protected_git_metadata_hash"] = (
+        run_review.protected_git_metadata_hash(ctx["ws"])
+    )
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+def test_same_content_receipt_symlink_substitution_is_rejected(
+    tmp_path: Path,
+) -> None:
+    ctx = standard_setup(tmp_path)
+    receipt_path = ctx["impl_dir"] / "receipt.json"
+    external = tmp_path / "external-receipt.json"
+    external.write_bytes(receipt_path.read_bytes())
+    receipt_path.unlink()
+    receipt_path.symlink_to(external)
+
+    with pytest.raises(run_repair.PreflightFailure) as excinfo:
+        run_repair.load_previous_implementation_evidence(
+            ctx["impl_dir"],
+            ctx["ws"],
+            "impl-1",
+            1,
+        )
+
+    assert excinfo.value.category == "INVALID_IMPLEMENTATION_EVIDENCE"
+
+
+def test_review_loader_parses_captured_bytes_without_path_reopen(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ctx = standard_setup(tmp_path)
+    result_path = ctx["review_dir"] / "review-result.json"
+    external = tmp_path / "later-review-result.json"
+    later_result = json.loads(result_path.read_text(encoding="utf-8"))
+    later_result["verdict"] = "APPROVE"
+    later_result["findings"] = []
+    later_result["goal_satisfied"] = True
+    later_result["checks_satisfied"] = True
+    external.write_text(json.dumps(later_result), encoding="utf-8")
+    real_reader = run_review.read_canonical_evidence
+
+    def capture_then_replace(root: Path, names: tuple[str, ...]):
+        measured = real_reader(root, names)
+        result_path.unlink()
+        result_path.symlink_to(external)
+        return measured
+
+    monkeypatch.setattr(run_review, "read_canonical_evidence", capture_then_replace)
+
+    loaded = run_repair.load_review_evidence(ctx["review_dir"])
+
+    assert result_path.is_symlink()
+    assert loaded["result"]["verdict"] == "REQUEST_CHANGES"
+
+
+def test_repair_rejects_linked_worktree_gitfile_drift_after_review(
+    tmp_path: Path,
+) -> None:
+    workspace, baseline_commit, after_hash = make_linked_reviewed_workspace(tmp_path)
+    impl_dir = make_implementation_evidence(
+        tmp_path,
+        workspace=workspace,
+        after_hash=after_hash,
+    )
+    review_dir = make_review_evidence(
+        tmp_path,
+        workspace=workspace,
+        baseline_commit=baseline_commit,
+        partitioned_identity=True,
+    )
+    (workspace / ".git").chmod(0o600)
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            workspace,
+            implementation_run_directory=impl_dir,
+            review_run_directory=review_dir,
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "WORKSPACE_STATE_MISMATCH"
+
+
+def test_linked_modern_review_missing_gitfile_identity_fails_closed(
+    tmp_path: Path,
+) -> None:
+    workspace, baseline_commit, after_hash = make_linked_reviewed_workspace(tmp_path)
+    impl_dir = make_implementation_evidence(
+        tmp_path,
+        workspace=workspace,
+        after_hash=after_hash,
+    )
+    review_dir = make_review_evidence(
+        tmp_path,
+        workspace=workspace,
+        baseline_commit=baseline_commit,
+        partitioned_identity=True,
+    )
+    receipt_path = review_dir / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    del receipt["reviewed_workspace_git_entry_hash"]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            workspace,
+            implementation_run_directory=impl_dir,
+            review_run_directory=review_dir,
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+def test_linked_legacy_review_without_modern_identity_retains_fallback(
+    tmp_path: Path,
+) -> None:
+    workspace, baseline_commit, _ = make_linked_reviewed_workspace(tmp_path)
+    current_hashes = snapshot_workspace_hashes(workspace)
+    historical_hashes = dict(current_hashes)
+    historical_hashes[".git"] = run_review._sha256((workspace / ".git").read_bytes())
+    impl_dir = make_implementation_evidence(
+        tmp_path,
+        workspace=workspace,
+        after_hash=workspace_hash(historical_hashes),
+    )
+    review_dir = make_review_evidence(
+        tmp_path,
+        workspace=workspace,
+        baseline_commit=baseline_commit,
+        partitioned_identity=False,
+    )
+
+    preflight = preflight_for(
+        tmp_path,
+        workspace,
+        implementation_run_directory=impl_dir,
+        review_run_directory=review_dir,
+        allowed_paths=["app.txt"],
+    )
+
+    assert preflight["fingerprint"].workspace_after_hash_expected == workspace_hash(
+        historical_hashes
+    )
 
 
 def test_repair_cannot_add_side_effect_root(tmp_path: Path) -> None:

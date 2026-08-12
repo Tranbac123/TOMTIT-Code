@@ -10,6 +10,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import signal
 import shutil
 import subprocess
 import threading
@@ -119,6 +120,7 @@ def test_unavailable_when_executable_not_discovered(
     assert result.exit_code is None
     assert result.error_category == "CLI_NOT_FOUND"
     assert result.changed_paths == ()
+    assert result.provider_invoked is False
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +151,7 @@ print("ok")
     assert result.unexpected_changed_paths == ()
     assert result.error_category is None
     assert result.duration_ms >= 0
+    assert result.provider_invoked is True
 
 
 # ---------------------------------------------------------------------------
@@ -166,6 +169,7 @@ def test_nonzero_exit_never_succeeds(workspace: Path, tmp_path: Path) -> None:
     assert result.success is False
     assert result.exit_code == 3
     assert result.error_category == "NONZERO_EXIT"
+    assert result.provider_invoked is True
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +197,7 @@ time.sleep(30)
     assert result.status is ClaudeCodeCLIStatus.TIMED_OUT
     assert result.success is False
     assert result.error_category == "TIMEOUT"
+    assert result.provider_invoked is True
 
 
 # ---------------------------------------------------------------------------
@@ -729,6 +734,7 @@ def test_invalid_explicit_path_returns_unavailable_result(workspace: Path, tmp_p
     assert result.exit_code is None
     assert result.timed_out is False
     assert result.error_category == "EXECUTABLE_UNAVAILABLE"
+    assert result.provider_invoked is False
 
 
 def test_explicit_path_that_is_a_directory_returns_unavailable(
@@ -805,6 +811,7 @@ def test_popen_file_not_found_is_normalized(
     assert result.completed_at >= result.started_at  # type: ignore[attr-defined]
     assert result.workspace_before_hash is not None  # type: ignore[attr-defined]
     assert result.workspace_after_hash is not None  # type: ignore[attr-defined]
+    assert result.provider_invoked is False  # type: ignore[attr-defined]
 
 
 def test_popen_permission_error_is_normalized(
@@ -1176,6 +1183,35 @@ def test_indeterminate_process_group_probe_fails_closed(
     monkeypatch.setattr(module, "_process_group_alive", lambda pgid: None)
 
     assert module.ensure_process_group_quiescent(999999) is module._ProcessGroupCleanup.FAILED
+
+
+@pytest.mark.parametrize("vanish_on_signal", [signal.SIGTERM, signal.SIGKILL])
+def test_process_group_exit_during_cleanup_signal_is_quiescent(
+    monkeypatch: pytest.MonkeyPatch,
+    vanish_on_signal: signal.Signals,
+) -> None:
+    """A group exit between liveness and killpg is not a cleanup failure."""
+
+    import tomtit.adapters.claude_code_cli as module
+
+    alive_states = iter([True, False])
+
+    monkeypatch.setattr(module, "_process_group_alive", lambda pgid: next(alive_states))
+    monkeypatch.setattr(
+        module,
+        "_await_process_group_absence",
+        lambda pgid, **kwargs: True,
+    )
+    monkeypatch.setattr(
+        module,
+        "_signal_process_group",
+        lambda pgid, sig: sig != vanish_on_signal,
+    )
+
+    assert (
+        module.ensure_process_group_quiescent(999999, grace_seconds=0)
+        is module._ProcessGroupCleanup.CLEANED
+    )
 
 
 def test_process_group_cleanup_never_targets_own_group() -> None:
@@ -5232,6 +5268,19 @@ def _mk_symlink_fixture(tmp_path: Path) -> tuple[Path, Path]:
     return ws, outside
 
 
+def test_linked_worktree_root_gitfile_is_not_product_state(tmp_path: Path) -> None:
+    ws = tmp_path / "linked-worktree"
+    ws.mkdir()
+    (ws / ".git").write_text("gitdir: /synthetic/common/worktrees/linked\n", encoding="utf-8")
+    (ws / "result.txt").write_text("product\n", encoding="utf-8")
+
+    snapshot = claude_code_cli_module.snapshot_workspace_hashes(ws)
+
+    assert snapshot == {
+        "result.txt": hashlib.sha256(b"product\n").hexdigest(),
+    }
+
+
 def test_corrective_snapshot_never_dereferences_file_symlinks(tmp_path: Path) -> None:
     """3. The observer must not read a symlink's target bytes."""
 
@@ -5755,6 +5804,7 @@ def test_untrusted_file_guard_module_prevents_worker_start(
 
     assert result.status is ClaudeCodeCLIStatus.FAILED
     assert result.error_category == "FILE_WRITE_GUARD_UNAVAILABLE"
+    assert result.provider_invoked is False
     assert not marker.exists(), "worker must never start without the file-write guard"
 
 
@@ -5777,6 +5827,7 @@ def test_file_guard_artifact_creation_failure_prevents_worker_start(
     result = ClaudeCodeCLIAdapter().run(base_request(workspace), executable_path=str(script))
     assert result.status is ClaudeCodeCLIStatus.FAILED
     assert result.error_category == "FILE_WRITE_GUARD_UNAVAILABLE"
+    assert result.provider_invoked is False
     assert not marker.exists()
 
 
