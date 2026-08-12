@@ -770,6 +770,13 @@ output-size limit
 
 These controls supervise the outer CLI process. They do not imply visibility into hidden inner commands.
 
+Runtime V0 guarantees bounded lifecycle control and positive quiescence for the
+process group it creates and manages. Owner-authorized deterministic checks and
+capability commands must not intentionally daemonize, create a new session, or
+otherwise detach execution outside that managed process group. Full containment
+of independently detached processes is outside Runtime V0 and requires stronger
+isolated execution in a future runtime environment.
+
 ### 13.4 WorkerRequest
 
 ```yaml
