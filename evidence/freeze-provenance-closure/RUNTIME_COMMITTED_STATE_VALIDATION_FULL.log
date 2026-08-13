@@ -1,0 +1,66 @@
+=== B: complete affected suites ===
+$ PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 PYTHONDONTWRITEBYTECODE=1 /usr/local/bin/python3 -m pytest -q -p no:cacheprovider .tomtit/dogfood/test_run_review.py .tomtit/dogfood/test_run_repair.py .tomtit/dogfood/test_run_loop.py tests/adapters/test_claude_code_cli.py
+........................................................................ [  9%]
+........................................................................ [ 19%]
+........................................................................ [ 29%]
+........................................................................ [ 39%]
+........................................................................ [ 49%]
+........................................................................ [ 59%]
+........................................................................ [ 69%]
+........................................................................ [ 79%]
+........................................................................ [ 89%]
+........................................................................ [ 98%]
+........                                                                 [100%]
+EXIT_CODE_B=0
+DONE_B
+
+=== C: exact full regression ===
+$ PYTHONDONTWRITEBYTECODE=1 /usr/local/bin/python3 -m pytest -q -p no:cacheprovider
+........................................................................ [  7%]
+........................................................................ [ 14%]
+........................................................................ [ 21%]
+........................................................................ [ 29%]
+........................................................................ [ 36%]
+........................................................................ [ 43%]
+........................................................................ [ 51%]
+........................................................................ [ 58%]
+........................................................................ [ 65%]
+........................................................................ [ 73%]
+........................................................................ [ 80%]
+........................................................................ [ 87%]
+........................................................................ [ 95%]
+.................................................                        [100%]
+EXIT_CODE_C=0
+DONE_C
+
+=== D: static validation ===
+--- compileall ---
+EXIT_CODE_COMPILEALL=0
+--- ruff check ---
+EXIT_CODE_RUFF=0
+--- git diff --check ---
+EXIT_CODE_DIFFCHECK1=0
+--- git diff --check baseline..target ---
+EXIT_CODE_DIFFCHECK2=0
+DONE_D
+
+=== E: repository audit ===
+--- git status --porcelain ---
+?? CODEX_RUNTIME_FINAL_NARROW_REVIEW.md
+?? CODEX_RUNTIME_REPAIR_PREFLIGHT_INDEPENDENT_REVIEW.md
+?? RUNTIME_FINAL_BOUNDED_CORRECTIVE_REPORT.md
+?? RUNTIME_REPAIR_PREFLIGHT_CORRECTIVE_REPORT.md
+?? RUNTIME_TRUST_BOUNDARY_CORRECTIVE_V2_REPORT.md
+--- git log --oneline -5 ---
+2e05608 fix(runtime): freeze provenance closure source and test commit
+771b8bc docs(policy): freeze provenance closure policy commit
+a1573bd docs(eval): approve decision evaluation v0
+07a0fac docs(eval): record decision evaluation v0 receipt
+971fa7d feat(eval): add decision evaluation v0
+--- lineage: baseline->policy->target parents ---
+2e0560886b60870267fea25c20ef6f2466338680 771b8bca67779c4e0e6ba18e3d3dfe7e59f2f686
+771b8bca67779c4e0e6ba18e3d3dfe7e59f2f686 a1573bdf3fc8f4adf48f46c96dcf1e3eeba1f7ee
+a1573bdf3fc8f4adf48f46c96dcf1e3eeba1f7ee 07a0facc378ea376c7f39ad2eb8e2984f7923460
+--- protected frozen paths unchanged (decision_eval / cli v0 / target-03 / personal-web) ---
+(empty above = no other files touched)
+DONE_E

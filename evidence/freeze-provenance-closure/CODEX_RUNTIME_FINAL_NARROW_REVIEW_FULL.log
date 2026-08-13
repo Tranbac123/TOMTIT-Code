@@ -1,0 +1,120 @@
+9e851ec49543af06f91c155bea5fe27e72524d94a7165ad78ceaeab8588b21b3  .tomtit/dogfood/run_loop.py
+1fb12f4e0fecc848dbfb329ff6a0ae6c6cb8d26bb0766ecfe199b52a0838813d  .tomtit/dogfood/run_repair.py
+3a809730e332e8038d55815b7ae3df8582a70dc7200c4a2ac5a2c26087e32831  .tomtit/dogfood/run_review.py
+a966a2712dfa226f8a959a4bc3e7ac5c016dfeaa81a29230b78043ce756895c6  .tomtit/dogfood/run_task.py
+91f95a01a05db79a355904d85b62d4f5c3d89a2b39c9f98e27b9b36289931e82  .tomtit/dogfood/test_run_loop.py
+95ff5a8c6bf175b8dce0f3d36d3413ed7b51feca88058f50f86805782fbfbf08  .tomtit/dogfood/test_run_repair.py
+b4824626a0d819f2f81b8ecfbaa16e4b13111323a2833485ecb7c353a112d583  .tomtit/dogfood/test_run_review.py
+f339c329ef24a35c6209ef217246b7dc482b2b369bb934dfcd626ca70f520861  docs/MVP_EXECUTION_POLICY_V0.md
+4970beabd05cf1fc34c1a54447e7c90e6813869134b6b445be1ca6e323be457e  src/tomtit/adapters/claude_code_cli.py
+7659adbfb7064936e95ad3360074872262b4b8b508d7f345d9a1b7ca15e40460  tests/adapters/test_claude_code_cli.py
+..............                                                           [100%]
+..............                                                           [100%]
+............                                                             [100%]
+...................                                                      [100%]
+........................................................................ [  9%]
+........................................................................ [ 19%]
+........................................................................ [ 29%]
+........................................................................ [ 39%]
+........................................................................ [ 49%]
+........................................................................ [ 59%]
+........................................................................ [ 69%]
+........................................................................ [ 79%]
+........................................................................ [ 89%]
+........................................................................ [ 98%]
+........                                                                 [100%]
+OMP: Error #179: Function Can't open SHM failed:
+OMP: System error #0: Undefined error: 0
+...............................F........................................ [  7%]
+........................................................................ [ 14%]
+........................................................................ [ 21%]
+........................................................................ [ 29%]
+........................................................................ [ 36%]
+........................................................................ [ 43%]
+........................................................................ [ 51%]
+........................................................................ [ 58%]
+........................................................................ [ 65%]
+........................................................................ [ 73%]
+........................................................................ [ 80%]
+........................................................................ [ 87%]
+........................................................................ [ 95%]
+.................................................                        [100%]
+=================================== FAILURES ===================================
+_________ test_normal_exit_with_surviving_descendant_kills_descendant __________
+
+workspace = PosixPath('/private/var/folders/2p/b_gvjktn5lvd22tw393wg5vc0000gn/T/pytest-of-tranvanbac/pytest-776/test_normal_exit_with_survivin0/workspace')
+tmp_path = PosixPath('/private/var/folders/2p/b_gvjktn5lvd22tw393wg5vc0000gn/T/pytest-of-tranvanbac/pytest-776/test_normal_exit_with_survivin0')
+
+    def test_normal_exit_with_surviving_descendant_kills_descendant(
+        workspace: Path,
+        tmp_path: Path,
+    ) -> None:
+        """G3-SOL-01 core: the old code cleaned the group only on timeout."""
+    
+        pid_file = tmp_path / "descendant.pid"
+        script = write_fake_executable(
+            tmp_path,
+            "fake-claude-survivor",
+            f"""
+    import pathlib, subprocess, sys
+    pathlib.Path("result.txt").write_text("changed", encoding="utf-8")
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))
+    raise SystemExit(0)
+    """,
+        )
+        adapter = ClaudeCodeCLIAdapter()
+    
+        result = adapter.run(base_request(workspace), executable_path=str(script))
+    
+        descendant_pid = int(pid_file.read_text(encoding="utf-8"))
+        try:
+            assert await_process_absence(descendant_pid), (
+                f"descendant {descendant_pid} survived a normal parent exit"
+            )
+            # The parent's own successful exit code is preserved.
+            assert result.exit_code == 0
+            assert result.timed_out is False
+>           assert result.status is ClaudeCodeCLIStatus.SUCCEEDED
+E           AssertionError: assert <ClaudeCodeCLIStatus.FAILED: 'FAILED'> is <ClaudeCodeCLIStatus.SUCCEEDED: 'SUCCEEDED'>
+E            +  where <ClaudeCodeCLIStatus.FAILED: 'FAILED'> = ClaudeCodeCLIResult(adapter_name='claude-code-cli', adapter_version='0.1.0-gate3-spike', task_id='task-1', run_id='run...=(), side_effect_changed_path_count=0, side_effect_changed_path_counts_by_root=(), side_effect_changed_paths_sample=()).status
+E            +  and   <ClaudeCodeCLIStatus.SUCCEEDED: 'SUCCEEDED'> = ClaudeCodeCLIStatus.SUCCEEDED
+
+tests/adapters/test_claude_code_cli.py:941: AssertionError
+=========================== short test summary info ============================
+FAILED tests/adapters/test_claude_code_cli.py::test_normal_exit_with_surviving_descendant_kills_descendant
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+.                                                                        [100%]
+........................................................................ [  7%]
+........................................................................ [ 14%]
+........................................................................ [ 21%]
+........................................................................ [ 29%]
+........................................................................ [ 36%]
+........................................................................ [ 43%]
+........................................................................ [ 51%]
+........................................................................ [ 58%]
+........................................................................ [ 65%]
+........................................................................ [ 73%]
+........................................................................ [ 80%]
+........................................................................ [ 87%]
+........................................................................ [ 95%]
+.................................................                        [100%]
+9e851ec49543af06f91c155bea5fe27e72524d94a7165ad78ceaeab8588b21b3  .tomtit/dogfood/run_loop.py
+1fb12f4e0fecc848dbfb329ff6a0ae6c6cb8d26bb0766ecfe199b52a0838813d  .tomtit/dogfood/run_repair.py
+3a809730e332e8038d55815b7ae3df8582a70dc7200c4a2ac5a2c26087e32831  .tomtit/dogfood/run_review.py
+a966a2712dfa226f8a959a4bc3e7ac5c016dfeaa81a29230b78043ce756895c6  .tomtit/dogfood/run_task.py
+91f95a01a05db79a355904d85b62d4f5c3d89a2b39c9f98e27b9b36289931e82  .tomtit/dogfood/test_run_loop.py
+95ff5a8c6bf175b8dce0f3d36d3413ed7b51feca88058f50f86805782fbfbf08  .tomtit/dogfood/test_run_repair.py
+b4824626a0d819f2f81b8ecfbaa16e4b13111323a2833485ecb7c353a112d583  .tomtit/dogfood/test_run_review.py
+f339c329ef24a35c6209ef217246b7dc482b2b369bb934dfcd626ca70f520861  docs/MVP_EXECUTION_POLICY_V0.md
+4970beabd05cf1fc34c1a54447e7c90e6813869134b6b445be1ca6e323be457e  src/tomtit/adapters/claude_code_cli.py
+7659adbfb7064936e95ad3360074872262b4b8b508d7f345d9a1b7ca15e40460  tests/adapters/test_claude_code_cli.py
