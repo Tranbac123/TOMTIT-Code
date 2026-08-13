@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -1848,6 +1849,31 @@ def test_partitioned_review_identity_allows_authorized_side_effect_drift(
     assert (
         pre["fingerprint"].reviewed_unexpected_state_hash_actual
         == pre["fingerprint"].reviewed_unexpected_state_hash_expected
+    )
+
+
+def test_reviewed_protected_git_metadata_hash_survives_timestamp_only_drift(
+    tmp_path: Path,
+) -> None:
+    """A benign timestamp-only change to `.git/index` between Review and
+    Repair (e.g. an OS-attached extended attribute) must not desynchronize
+    the reviewed-vs-actual protected-Git-metadata hash comparison."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    index_path = run_review.git_dir(ctx["ws"]) / "index"
+    os.utime(index_path, None)
+
+    pre = preflight_for(
+        tmp_path,
+        ctx["ws"],
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+        allowed_paths=["app.txt"],
+    )
+
+    assert (
+        pre["fingerprint"].reviewed_protected_git_metadata_hash_actual
+        == pre["fingerprint"].reviewed_protected_git_metadata_hash_expected
     )
 
 

@@ -132,6 +132,7 @@ def write_fake_codex(
     exit_code: int = 0,
     sleep_seconds: float = 0,
     write_unexpected: str | None = None,
+    help_write_path: str | None = None,
     omit_last_message: bool = False,
     top_help: str = TOP_HELP,
     exec_help: str = EXEC_HELP,
@@ -142,6 +143,8 @@ import sys, time, pathlib
 
 argv = sys.argv[1:]
 if argv[:1] == ["--help"]:
+    if {help_write_path!r}:
+        pathlib.Path({help_write_path!r}).write_text("capability probe touched source\\n")
     print({top_help!r})
     raise SystemExit(0)
 if argv[:2] == ["exec", "--help"]:
@@ -1450,6 +1453,44 @@ def test_preflight_failure_after_baseline_resolution_reports_live_paths(
     assert result["error_category"] == "CLAUDE_NOT_FOUND"
     assert result["workspace_final_changed_paths"] == ["app.txt"]
     assert result["workspace_final_hash"] == workspace_hash(snapshot_workspace_hashes(ws))
+
+
+def test_capability_probe_semantic_repository_mutation_still_blocks_preflight(
+    tmp_path: Path,
+) -> None:
+    """A capability probe that genuinely mutates repository state (not just a
+    volatile timestamp) must still block PREFLIGHT with IMMUTABILITY_VIOLATION
+    after the cross-phase-stable protected-Git-metadata fix -- the fix only
+    excludes mtime_ns/ctime_ns, never real semantic drift."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-capability-mutation")
+    hook = run_review.git_dir(ws) / "hooks" / "tomtit-loop-probe-hook"
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-capability-mutation",
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(hook),
+    )
+    loop_id = "loop-capability-mutation"
+    loop_root = tmp_path / "loops"
+
+    exit_code = run_loop_cli(
+        tmp_path,
+        ws,
+        claude,
+        codex,
+        loop_run_id=loop_id,
+        evidence_directory=loop_root,
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["run_state"] == "BLOCKED"
+    assert result["terminal_outcome"] == "BLOCKED"
+    assert result["stop_reason"] == "PREFLIGHT_FAILED"
+    assert result["implementation_attempts"] == 0
+    assert result["review_attempts"] == 0
 
 
 def test_invalid_allowed_path_preflight_does_not_fabricate_empty_final_paths(

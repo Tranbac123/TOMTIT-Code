@@ -28,6 +28,7 @@ import dataclasses
 import hashlib
 import json
 import os
+import re
 import shlex
 import shutil
 import signal
@@ -57,6 +58,16 @@ _HELP_PROBE_TIMEOUT_SECONDS = 15
 _PROCESS_POLL_INTERVAL_SECONDS = 0.05
 _PROCESS_CLEANUP_GRACE_SECONDS = 5.0
 _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
+
+# Bounded retry budget for one composite protected-Git-metadata measurement
+# (see `protected_git_metadata_snapshot`). Not a general-purpose retry knob.
+_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS = 3
+
+# `_directory_descriptor` and `_regular_file_measurement` always emit
+# `mtime_ns=<int>` immediately followed by `ctime_ns=<int>` in that exact
+# order. This matches only that adjacent pair, so "path:" and "symlink:"
+# descriptors (which never contain it) are left untouched.
+_VOLATILE_TIMESTAMP_FIELDS_RE = re.compile(r":mtime_ns=\d+:ctime_ns=\d+")
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")
 VALID_SEVERITIES = ("HIGH", "MEDIUM", "LOW")
@@ -203,6 +214,33 @@ def _read_only_subprocess_env() -> dict[str, str]:
     env = os.environ.copy()
     env["GIT_OPTIONAL_LOCKS"] = "0"
     return env
+
+
+def _strip_volatile_timestamp_fields(descriptor: str) -> str:
+    """Remove the `mtime_ns`/`ctime_ns` pair from one identity descriptor.
+
+    Used only to build a cross-phase-*stable* projection of an identity
+    descriptor for equality between two separate measurement calls (see
+    `protected_git_metadata_snapshot`). It must never be used inside a
+    single measurement's own before/opened/after race checks, which keep
+    comparing the full raw `os.stat_result`-derived identity so a genuine
+    same-window mutation is still caught.
+    """
+
+    return _VOLATILE_TIMESTAMP_FIELDS_RE.sub("", descriptor)
+
+
+def _stable_cross_phase_projection(identity: Mapping[str, str]) -> dict[str, str]:
+    """Project one identity snapshot onto its cross-phase-stable form.
+
+    Path identity, entry type, mode, device/inode, size, link count, and
+    content hashes remain fully load-bearing; only `mtime_ns`/`ctime_ns` are
+    excluded, since benign OS-level metadata churn (e.g. an asynchronously
+    attached extended attribute) can change them without any semantic
+    mutation of the measured object.
+    """
+
+    return {key: _strip_volatile_timestamp_fields(value) for key, value in identity.items()}
 
 
 def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:
@@ -579,41 +617,85 @@ def workspace_git_entry_hash_from_snapshot(snapshot: Mapping[str, str]) -> str:
 
 
 def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
-    """Snapshot root .git plus the actual per-worktree/common metadata trees."""
+    """Cross-phase-stable snapshot of protected Git metadata.
 
-    git_entry_before = _workspace_git_entry_descriptor(cwd)
-    directory = git_dir(cwd)
-    common_directory = git_common_dir(cwd)
-    if directory is None or common_directory is None:
-        raise EvidenceIntegrityFailure("Git metadata locations could not be resolved")
-    roots = (
-        ("git_dir", directory.resolve()),
-        ("git_common_dir", common_directory.resolve()),
-    )
-    identity: dict[str, str] = {
-        "@git_dir": f"path:{roots[0][1]}",
-        "@git_common_dir": f"path:{roots[1][1]}",
-        _WORKSPACE_GIT_ENTRY_PATH_KEY: git_entry_before[0],
-        _WORKSPACE_GIT_ENTRY_KEY: git_entry_before[1],
-    }
-    for role, root in roots:
-        tree = snapshot_type_aware_tree(
-            root,
-            reject_symlinks=True,
-            reject_hardlinks=False,
+    Snapshots the root `.git` entry plus the actual per-worktree/common
+    metadata trees. The returned identity is a *stable cross-phase
+    projection*: path identity, entry type, mode, device/inode, size, link
+    count, and content hashes remain fully load-bearing, but `mtime_ns`/
+    `ctime_ns` are excluded (see `_stable_cross_phase_projection`). Benign
+    OS-level metadata churn between two separate calls to this function --
+    for example an extended attribute the OS attaches to a file some time
+    after it was written -- can change those two fields without any
+    semantic mutation of the measured object, and must not register as one.
+
+    Internally, one composite measurement pass still requires the root
+    `.git` entry and the resolved git-dir/git-common-dir to be unchanged
+    from just before the tree walk to just after it -- a same-window
+    self-consistency check *within a single call*, not a cross-phase one.
+    `git_dir`/`git_common_dir` are pure path strings with no timestamp
+    component, so any difference there is always semantic and fails closed
+    immediately. If the root `.git` entry differs only in its timestamp
+    fields, the whole composite pass is retried, bounded by
+    `_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS`; a non-timestamp
+    difference, or persistent instability across every attempt, fails
+    closed.
+    """
+
+    last_error: EvidenceIntegrityFailure | None = None
+    for _ in range(_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS):
+        git_entry_before = _workspace_git_entry_descriptor(cwd)
+        directory = git_dir(cwd)
+        common_directory = git_common_dir(cwd)
+        if directory is None or common_directory is None:
+            raise EvidenceIntegrityFailure("Git metadata locations could not be resolved")
+        roots = (
+            ("git_dir", directory.resolve()),
+            ("git_common_dir", common_directory.resolve()),
         )
-        for relative, descriptor in tree.items():
-            identity[f"{role}/{relative}"] = descriptor
-    git_entry_after = _workspace_git_entry_descriptor(cwd)
-    if git_entry_after != git_entry_before:
-        raise EvidenceIntegrityFailure(
-            "workspace .git entry changed during protected metadata measurement"
+        identity: dict[str, str] = {
+            "@git_dir": f"path:{roots[0][1]}",
+            "@git_common_dir": f"path:{roots[1][1]}",
+            _WORKSPACE_GIT_ENTRY_PATH_KEY: git_entry_before[0],
+            _WORKSPACE_GIT_ENTRY_KEY: git_entry_before[1],
+        }
+        for role, root in roots:
+            tree = snapshot_type_aware_tree(
+                root,
+                reject_symlinks=True,
+                reject_hardlinks=False,
+            )
+            for relative, descriptor in tree.items():
+                identity[f"{role}/{relative}"] = descriptor
+        git_entry_after = _workspace_git_entry_descriptor(cwd)
+        entry_changed = git_entry_after != git_entry_before
+        roots_changed = (
+            git_dir(cwd) != roots[0][1] or git_common_dir(cwd) != roots[1][1]
         )
-    if git_dir(cwd) != roots[0][1] or git_common_dir(cwd) != roots[1][1]:
-        raise EvidenceIntegrityFailure(
-            "resolved Git metadata locations changed during protected metadata measurement"
+        if not entry_changed and not roots_changed:
+            return _stable_cross_phase_projection(identity)
+        if roots_changed:
+            raise EvidenceIntegrityFailure(
+                "resolved Git metadata locations changed during protected metadata measurement"
+            )
+        timestamp_only = (
+            git_entry_after[0] == git_entry_before[0]
+            and _strip_volatile_timestamp_fields(git_entry_after[1])
+            == _strip_volatile_timestamp_fields(git_entry_before[1])
         )
-    return identity
+        if not timestamp_only:
+            raise EvidenceIntegrityFailure(
+                "workspace .git entry changed during protected metadata measurement"
+            )
+        last_error = EvidenceIntegrityFailure(
+            "workspace .git entry timestamp remained unstable across the bounded "
+            "coherent-measurement retry limit"
+        )
+        # Timestamp-only same-window instability: bounded-retry the whole
+        # composite measurement from scratch.
+
+    assert last_error is not None
+    raise last_error
 
 
 def protected_git_metadata_hash(cwd: Path) -> str:

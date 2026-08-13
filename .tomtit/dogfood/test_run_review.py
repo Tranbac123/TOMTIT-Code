@@ -846,6 +846,182 @@ def test_linked_worktree_root_gitfile_replacement_type_change_is_detected(
         run_review.protected_git_metadata_snapshot(linked)
 
 
+# ---------------------------------------------------------------------------
+# Cross-phase-stable protected Git metadata (excludes mtime_ns/ctime_ns only).
+# ---------------------------------------------------------------------------
+
+
+def test_protected_git_metadata_ctime_only_drift_is_cross_phase_stable(
+    tmp_path: Path,
+) -> None:
+    """Benign OS-level timestamp-only churn between two separate calls (e.g.
+    an extended attribute the OS attaches asynchronously) must not register
+    as a semantic mutation of protected Git metadata."""
+
+    ws = make_workspace(tmp_path)
+    before = run_review.protected_git_metadata_snapshot(ws)
+
+    index_path = run_review.git_dir(ws) / "index"
+    os.utime(index_path, None)  # bumps mtime/ctime only; content is untouched
+
+    after = run_review.protected_git_metadata_snapshot(ws)
+    assert after == before
+
+
+def test_protected_git_metadata_same_size_content_mutation_is_detected(
+    tmp_path: Path,
+) -> None:
+    """A same-size content mutation must still be detected: the stable
+    projection excludes only mtime_ns/ctime_ns, never content identity."""
+
+    ws = make_workspace(tmp_path)
+    before = run_review.protected_git_metadata_snapshot(ws)
+
+    # `.git/description` is free-form and never parsed by Git itself, so
+    # mutating its bytes cannot break subsequent `git` subprocess calls the
+    # way corrupting `.git/config` could.
+    description_path = run_review.git_dir(ws) / "description"
+    original = bytearray(description_path.read_bytes())
+    assert original
+    original[-1] ^= 0xFF
+    description_path.write_bytes(bytes(original))
+
+    after = run_review.protected_git_metadata_snapshot(ws)
+    assert after != before
+
+
+def test_protected_git_metadata_index_stage_mutation_is_detected(
+    tmp_path: Path,
+) -> None:
+    """Staging a new file changes `.git/index` content and must still be
+    detected as a cross-phase Git metadata identity change."""
+
+    ws = make_workspace(tmp_path)
+    before = run_review.protected_git_metadata_snapshot(ws)
+
+    (ws / "new_file.txt").write_text("new\n", encoding="utf-8")
+    _git(["add", "new_file.txt"], ws)
+
+    after = run_review.protected_git_metadata_snapshot(ws)
+    assert after != before
+
+
+def test_protected_git_metadata_head_ref_mutation_is_detected(tmp_path: Path) -> None:
+    """A new commit changes HEAD/ref/log content and must still be detected."""
+
+    ws = make_workspace(tmp_path)
+    before = run_review.protected_git_metadata_snapshot(ws)
+
+    _git(
+        ["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "--allow-empty", "-q", "-m", "second"],
+        ws,
+    )
+
+    after = run_review.protected_git_metadata_snapshot(ws)
+    assert after != before
+
+
+def test_protected_git_metadata_root_directory_mode_change_is_detected(
+    tmp_path: Path,
+) -> None:
+    """A root `.git` directory mode change must still be detected (not just
+    for the linked-worktree gitfile case already covered above)."""
+
+    ws = make_workspace(tmp_path)
+    git_dir_path = ws / ".git"
+    before = run_review.protected_git_metadata_snapshot(ws)
+    original_mode = git_dir_path.stat().st_mode & 0o777
+    git_dir_path.chmod(0o750)
+    try:
+        after = run_review.protected_git_metadata_snapshot(ws)
+        assert after != before
+    finally:
+        git_dir_path.chmod(original_mode)
+
+
+def _synthetic_git_entry(
+    *, path: str, mtime_ns: int, ctime_ns: int, ino: int = 1, size: int = 64
+) -> tuple[str, str]:
+    return (
+        f"path:{path}",
+        f"dir:dev=1:ino={ino}:mode=0755:size={size}:nlink=1:"
+        f"mtime_ns={mtime_ns}:ctime_ns={ctime_ns}",
+    )
+
+
+def test_protected_git_metadata_bounded_retry_recovers_from_transient_timestamp_only_instability(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One same-window timestamp-only instability is retried and may still
+    succeed, without exhausting the bounded retry limit."""
+
+    ws = make_workspace(tmp_path)
+    entry_path = str((ws / ".git").resolve())
+    sequence = iter(
+        [
+            _synthetic_git_entry(path=entry_path, mtime_ns=100, ctime_ns=100),  # attempt 1 before
+            _synthetic_git_entry(path=entry_path, mtime_ns=200, ctime_ns=200),  # attempt 1 after (timestamp-only)
+            _synthetic_git_entry(path=entry_path, mtime_ns=300, ctime_ns=300),  # attempt 2 before
+            _synthetic_git_entry(path=entry_path, mtime_ns=300, ctime_ns=300),  # attempt 2 after (coherent)
+        ]
+    )
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+
+    result = run_review.protected_git_metadata_snapshot(ws)
+
+    assert result
+    with pytest.raises(StopIteration):
+        next(sequence)
+
+
+def test_protected_git_metadata_persistent_timestamp_instability_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If every bounded attempt sees only timestamp-only instability, the
+    measurement fails closed rather than retrying forever."""
+
+    ws = make_workspace(tmp_path)
+    entry_path = str((ws / ".git").resolve())
+    values = []
+    for attempt in range(run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS):
+        base = attempt * 2
+        values.append(_synthetic_git_entry(path=entry_path, mtime_ns=base, ctime_ns=base))
+        values.append(_synthetic_git_entry(path=entry_path, mtime_ns=base + 1, ctime_ns=base + 1))
+    sequence = iter(values)
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+    with pytest.raises(StopIteration):
+        next(sequence)
+
+
+def test_protected_git_metadata_content_changing_race_during_retry_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A retry attempt that itself detects a real (non-timestamp) change
+    must fail closed immediately, without exhausting further retries."""
+
+    ws = make_workspace(tmp_path)
+    entry_path = str((ws / ".git").resolve())
+    sequence = iter(
+        [
+            _synthetic_git_entry(path=entry_path, mtime_ns=1, ctime_ns=1),  # attempt 1 before
+            _synthetic_git_entry(path=entry_path, mtime_ns=2, ctime_ns=2),  # attempt 1 after (timestamp-only)
+            _synthetic_git_entry(path=entry_path, mtime_ns=3, ctime_ns=3, ino=1),  # attempt 2 before
+            _synthetic_git_entry(path=entry_path, mtime_ns=3, ctime_ns=3, ino=2),  # attempt 2 after (real change)
+        ]
+    )
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+    with pytest.raises(StopIteration):
+        next(sequence)
+
+
 def test_capability_probe_linked_worktree_gitfile_mutation_is_rejected(
     tmp_path: Path,
 ) -> None:
