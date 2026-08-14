@@ -63,15 +63,32 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 # (see `protected_git_metadata_snapshot`). Not a general-purpose retry knob.
 _PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS = 3
 
-# `_directory_descriptor` and `_regular_file_measurement` always emit
-# `mtime_ns=<int>` immediately followed by `ctime_ns=<int>` in that exact
-# order, and only within a "dir:" or "file:" descriptor. Only those two
-# descriptor types are eligible for stripping (see
-# `_strip_volatile_timestamp_fields`); this pattern is never applied to a
-# "path:" or "symlink:" descriptor, whose contents are caller-controlled
-# (e.g. a real filesystem path) and must never be regex-rewritten.
-_DIR_OR_FILE_DESCRIPTOR_PREFIX_RE = re.compile(r"^(?:dir|file):")
-_VOLATILE_TIMESTAMP_FIELDS_RE = re.compile(r":mtime_ns=\d+:ctime_ns=\d+")
+# The exact, complete descriptor grammars emitted by `_directory_descriptor`
+# and `_regular_file_measurement` (see those two functions). Numeric fields
+# allow an optional leading "-" only because Python's plain `{int}`
+# formatting would render one for a negative `os.stat_result` field (never
+# observed in practice, but the grammar must match exactly what an f-string
+# of that field can produce, not a narrower approximation of it). `mode` is
+# `stat.S_IMODE(...)` formatted `:04o`, whose value is masked to at most
+# 0o7777 -- i.e. always rendered as exactly four octal digits. `sha256` is a
+# `hashlib.sha256().hexdigest()`, always exactly 64 lowercase hex digits.
+#
+# `_strip_volatile_timestamp_fields` requires a `fullmatch` against one of
+# these two patterns -- the *entire* input, not merely a prefix -- before
+# stripping anything. Any input that is not byte-for-byte one of these two
+# canonical shapes (a "path:"/"symlink:" descriptor, an unknown type, a
+# truncated or reordered dir:/file: string, or any other caller-controlled
+# text that merely begins with "dir:" or "file:") is returned unchanged.
+_CANONICAL_DIR_DESCRIPTOR_RE = re.compile(
+    r"dir:dev=(?P<dev>-?\d+):ino=(?P<ino>-?\d+):mode=(?P<mode>[0-7]{4}):"
+    r"size=(?P<size>-?\d+):nlink=(?P<nlink>-?\d+):"
+    r"mtime_ns=-?\d+:ctime_ns=-?\d+"
+)
+_CANONICAL_FILE_DESCRIPTOR_RE = re.compile(
+    r"file:dev=(?P<dev>-?\d+):ino=(?P<ino>-?\d+):mode=(?P<mode>[0-7]{4}):"
+    r"size=(?P<size>-?\d+):nlink=(?P<nlink>-?\d+):"
+    r"mtime_ns=-?\d+:ctime_ns=-?\d+:sha256=(?P<sha256>[0-9a-f]{64})"
+)
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")
 VALID_SEVERITIES = ("HIGH", "MEDIUM", "LOW")
@@ -223,15 +240,18 @@ def _read_only_subprocess_env() -> dict[str, str]:
 def _strip_volatile_timestamp_fields(descriptor: str) -> str:
     """Remove the `mtime_ns`/`ctime_ns` pair from one identity descriptor.
 
-    Descriptor-type aware: only a `dir:` or `file:` descriptor -- whose
-    `mtime_ns=<int>:ctime_ns=<int>` field pair is entirely constructed by
-    `_directory_descriptor`/`_regular_file_measurement` from integer
-    `os.stat_result` fields -- is eligible for stripping. A `path:` or
-    `symlink:` descriptor embeds caller-controlled text (a real filesystem
-    path, possibly containing a substring that happens to look like
-    `:mtime_ns=1:ctime_ns=2`) and is returned byte-for-byte unchanged, as is
-    any other, unrecognized descriptor grammar: preserving is the safe
-    default when the grammar cannot be positively confirmed non-path-like.
+    Canonical-grammar aware, not merely prefix-aware: the *entire* input
+    must `fullmatch` the exact `dir:` or `file:` descriptor grammar emitted
+    by `_directory_descriptor`/`_regular_file_measurement` -- every field in
+    its exact structural position -- before anything is stripped. This
+    rejects not just `path:`/`symlink:` descriptors but also any
+    caller-controlled opaque string that merely begins with `dir:` or
+    `file:` (e.g. an unrelated extra field, a truncated or reordered
+    canonical-looking string, or any future/unrecognized extension of the
+    grammar): all such input is returned byte-for-byte unchanged, since the
+    grammar cannot be positively confirmed timestamp-only. Reconstruction
+    uses only the matched non-timestamp field values, so the result is
+    injective with respect to every load-bearing (non-timestamp) field.
 
     Used only to build a cross-phase-*stable* projection of an identity
     descriptor for equality between two separate measurement calls (see
@@ -241,9 +261,21 @@ def _strip_volatile_timestamp_fields(descriptor: str) -> str:
     same-window mutation is still caught.
     """
 
-    if not _DIR_OR_FILE_DESCRIPTOR_PREFIX_RE.match(descriptor):
-        return descriptor
-    return _VOLATILE_TIMESTAMP_FIELDS_RE.sub("", descriptor, count=1)
+    match = _CANONICAL_DIR_DESCRIPTOR_RE.fullmatch(descriptor)
+    if match is not None:
+        fields = match.groupdict()
+        return (
+            f"dir:dev={fields['dev']}:ino={fields['ino']}:mode={fields['mode']}:"
+            f"size={fields['size']}:nlink={fields['nlink']}"
+        )
+    match = _CANONICAL_FILE_DESCRIPTOR_RE.fullmatch(descriptor)
+    if match is not None:
+        fields = match.groupdict()
+        return (
+            f"file:dev={fields['dev']}:ino={fields['ino']}:mode={fields['mode']}:"
+            f"size={fields['size']}:nlink={fields['nlink']}:sha256={fields['sha256']}"
+        )
+    return descriptor
 
 
 def _stable_cross_phase_projection(identity: Mapping[str, str]) -> dict[str, str]:

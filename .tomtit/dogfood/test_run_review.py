@@ -11,9 +11,11 @@ Run with:
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
+import stat
 import subprocess
 import sys
 import time
@@ -981,10 +983,103 @@ def test_strip_volatile_timestamp_fields_dir_descriptor_removes_only_timestamp_f
 
 
 def test_strip_volatile_timestamp_fields_file_descriptor_retains_sha256() -> None:
-    descriptor = "file:dev=1:ino=2:mode=0644:size=64:nlink=1:mtime_ns=100:ctime_ns=200:sha256=deadbeef"
+    sha256 = "deadbeef" * 8  # a real hashlib.sha256().hexdigest() is 64 hex chars
+    descriptor = f"file:dev=1:ino=2:mode=0644:size=64:nlink=1:mtime_ns=100:ctime_ns=200:sha256={sha256}"
     assert (
         run_review._strip_volatile_timestamp_fields(descriptor)
-        == "file:dev=1:ino=2:mode=0644:size=64:nlink=1:sha256=deadbeef"
+        == f"file:dev=1:ino=2:mode=0644:size=64:nlink=1:sha256={sha256}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# F-01 re-repair: prefix-only recognition (anything starting "dir:"/"file:")
+# was still too broad. Recognition must require an exact fullmatch against
+# the canonical grammar `_directory_descriptor`/`_regular_file_measurement`
+# actually emit -- not merely the type prefix.
+# ---------------------------------------------------------------------------
+
+
+def test_strip_volatile_timestamp_fields_preserves_noncanonical_dir_with_timestamp_like_text() -> None:
+    descriptor = "dir:opaque=caller:mtime_ns=1:ctime_ns=2:payload=retained"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_noncanonical_file_with_timestamp_like_text() -> None:
+    descriptor = "file:opaque=caller:mtime_ns=1:ctime_ns=2:payload=retained"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_truncated_canonical_dir_descriptor() -> None:
+    # Missing the trailing ctime_ns field.
+    descriptor = "dir:dev=1:ino=2:mode=0755:size=64:nlink=1:mtime_ns=100"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_truncated_canonical_file_descriptor() -> None:
+    # Missing the trailing sha256 field.
+    descriptor = "file:dev=1:ino=2:mode=0644:size=64:nlink=1:mtime_ns=100:ctime_ns=200"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_reordered_canonical_fields() -> None:
+    # mode and ino swapped relative to the canonical dev/ino/mode/size/nlink order.
+    descriptor = "dir:dev=1:mode=0755:ino=2:size=64:nlink=1:mtime_ns=100:ctime_ns=200"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_extra_unknown_field() -> None:
+    # An otherwise-canonical dir: descriptor with one trailing field that is
+    # not part of the canonical grammar the producer functions emit.
+    descriptor = "dir:dev=1:ino=2:mode=0755:size=64:nlink=1:mtime_ns=100:ctime_ns=200:extra=1"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_strips_real_directory_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Positive case, generated through the real producer function: an exact
+    canonical `dir:` descriptor has only mtime_ns/ctime_ns removed."""
+
+    directory = tmp_path / "measured-dir"
+    directory.mkdir()
+    metadata = directory.lstat()
+    descriptor = run_review._directory_descriptor(metadata)
+
+    stripped = run_review._strip_volatile_timestamp_fields(descriptor)
+
+    assert "mtime_ns=" not in stripped
+    assert "ctime_ns=" not in stripped
+    assert stripped == (
+        f"dir:dev={metadata.st_dev}:ino={metadata.st_ino}:"
+        f"mode={stat.S_IMODE(metadata.st_mode):04o}:size={metadata.st_size}:"
+        f"nlink={metadata.st_nlink}"
+    )
+
+
+def test_strip_volatile_timestamp_fields_strips_real_file_descriptor(
+    tmp_path: Path,
+) -> None:
+    """Positive case, generated through the real producer function: an exact
+    canonical `file:` descriptor has only mtime_ns/ctime_ns removed, and
+    every other field -- including SHA-256 -- survives."""
+
+    file_path = tmp_path / "measured-file"
+    content = b"some real file content\n"
+    file_path.write_bytes(content)
+    metadata = file_path.lstat()
+    descriptor, _ = run_review._regular_file_measurement(
+        file_path, metadata, reject_hardlinks=False, capture_bytes=False
+    )
+
+    stripped = run_review._strip_volatile_timestamp_fields(descriptor)
+
+    assert "mtime_ns=" not in stripped
+    assert "ctime_ns=" not in stripped
+    expected_sha256 = hashlib.sha256(content).hexdigest()
+    assert stripped == (
+        f"file:dev={metadata.st_dev}:ino={metadata.st_ino}:"
+        f"mode={stat.S_IMODE(metadata.st_mode):04o}:size={metadata.st_size}:"
+        f"nlink={metadata.st_nlink}:sha256={expected_sha256}"
     )
 
 
