@@ -65,8 +65,12 @@ _PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS = 3
 
 # `_directory_descriptor` and `_regular_file_measurement` always emit
 # `mtime_ns=<int>` immediately followed by `ctime_ns=<int>` in that exact
-# order. This matches only that adjacent pair, so "path:" and "symlink:"
-# descriptors (which never contain it) are left untouched.
+# order, and only within a "dir:" or "file:" descriptor. Only those two
+# descriptor types are eligible for stripping (see
+# `_strip_volatile_timestamp_fields`); this pattern is never applied to a
+# "path:" or "symlink:" descriptor, whose contents are caller-controlled
+# (e.g. a real filesystem path) and must never be regex-rewritten.
+_DIR_OR_FILE_DESCRIPTOR_PREFIX_RE = re.compile(r"^(?:dir|file):")
 _VOLATILE_TIMESTAMP_FIELDS_RE = re.compile(r":mtime_ns=\d+:ctime_ns=\d+")
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")
@@ -219,6 +223,16 @@ def _read_only_subprocess_env() -> dict[str, str]:
 def _strip_volatile_timestamp_fields(descriptor: str) -> str:
     """Remove the `mtime_ns`/`ctime_ns` pair from one identity descriptor.
 
+    Descriptor-type aware: only a `dir:` or `file:` descriptor -- whose
+    `mtime_ns=<int>:ctime_ns=<int>` field pair is entirely constructed by
+    `_directory_descriptor`/`_regular_file_measurement` from integer
+    `os.stat_result` fields -- is eligible for stripping. A `path:` or
+    `symlink:` descriptor embeds caller-controlled text (a real filesystem
+    path, possibly containing a substring that happens to look like
+    `:mtime_ns=1:ctime_ns=2`) and is returned byte-for-byte unchanged, as is
+    any other, unrecognized descriptor grammar: preserving is the safe
+    default when the grammar cannot be positively confirmed non-path-like.
+
     Used only to build a cross-phase-*stable* projection of an identity
     descriptor for equality between two separate measurement calls (see
     `protected_git_metadata_snapshot`). It must never be used inside a
@@ -227,7 +241,9 @@ def _strip_volatile_timestamp_fields(descriptor: str) -> str:
     same-window mutation is still caught.
     """
 
-    return _VOLATILE_TIMESTAMP_FIELDS_RE.sub("", descriptor)
+    if not _DIR_OR_FILE_DESCRIPTOR_PREFIX_RE.match(descriptor):
+        return descriptor
+    return _VOLATILE_TIMESTAMP_FIELDS_RE.sub("", descriptor, count=1)
 
 
 def _stable_cross_phase_projection(identity: Mapping[str, str]) -> dict[str, str]:

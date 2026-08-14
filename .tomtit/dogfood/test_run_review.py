@@ -939,6 +939,111 @@ def test_protected_git_metadata_root_directory_mode_change_is_detected(
         git_dir_path.chmod(original_mode)
 
 
+# ---------------------------------------------------------------------------
+# F-01 repair: the timestamp-stripping projection must be descriptor-type
+# aware. A `path:`/`symlink:` descriptor is caller-controlled text (a real
+# filesystem path) and must never be regex-rewritten, even when it happens
+# to contain a substring that looks like `:mtime_ns=1:ctime_ns=2`.
+# ---------------------------------------------------------------------------
+
+
+def test_strip_volatile_timestamp_fields_preserves_path_descriptor_byte_for_byte() -> None:
+    descriptor = "path:/tmp/repo:mtime_ns=1:ctime_ns=2/.git"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_does_not_collide_distinct_paths() -> None:
+    colliding_path = "path:/tmp/repo:mtime_ns=1:ctime_ns=2/.git"
+    plain_path = "path:/tmp/repo/.git"
+    assert colliding_path != plain_path
+    assert (
+        run_review._strip_volatile_timestamp_fields(colliding_path)
+        != run_review._strip_volatile_timestamp_fields(plain_path)
+    )
+
+
+def test_strip_volatile_timestamp_fields_preserves_symlink_descriptor_byte_for_byte() -> None:
+    descriptor = "symlink:mode=0777:target=some/target:mtime_ns=1:ctime_ns=2"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_unrecognized_descriptor_grammar() -> None:
+    descriptor = "unknown-type:mtime_ns=1:ctime_ns=2"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_dir_descriptor_removes_only_timestamp_fields() -> None:
+    descriptor = "dir:dev=1:ino=2:mode=0755:size=64:nlink=1:mtime_ns=100:ctime_ns=200"
+    assert (
+        run_review._strip_volatile_timestamp_fields(descriptor)
+        == "dir:dev=1:ino=2:mode=0755:size=64:nlink=1"
+    )
+
+
+def test_strip_volatile_timestamp_fields_file_descriptor_retains_sha256() -> None:
+    descriptor = "file:dev=1:ino=2:mode=0644:size=64:nlink=1:mtime_ns=100:ctime_ns=200:sha256=deadbeef"
+    assert (
+        run_review._strip_volatile_timestamp_fields(descriptor)
+        == "file:dev=1:ino=2:mode=0644:size=64:nlink=1:sha256=deadbeef"
+    )
+
+
+def _make_workspace_with_timestamp_like_name(tmp_path: Path) -> Path:
+    """A committed Git repo whose own directory name contains text matching
+    the volatile-timestamp-field pattern, to prove path descriptors survive
+    projection byte-for-byte even under an adversarial-looking real path."""
+
+    root = tmp_path / "repo:mtime_ns=1:ctime_ns=2"
+    root.mkdir()
+    (root / "app.txt").write_text("original\n", encoding="utf-8")
+    _git(["init", "-q"], root)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], root)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], root)
+    return root
+
+
+def test_protected_git_metadata_git_dir_path_with_timestamp_like_text_is_preserved(
+    tmp_path: Path,
+) -> None:
+    ws = _make_workspace_with_timestamp_like_name(tmp_path)
+
+    identity = run_review.protected_git_metadata_snapshot(ws)
+
+    expected_git_dir = run_review.git_dir(ws)
+    assert expected_git_dir is not None
+    assert identity["@git_dir"] == f"path:{expected_git_dir.resolve()}"
+    assert "mtime_ns=1:ctime_ns=2" in identity["@git_dir"]
+
+
+def test_protected_git_metadata_git_common_dir_path_with_timestamp_like_text_is_preserved(
+    tmp_path: Path,
+) -> None:
+    primary = _make_workspace_with_timestamp_like_name(tmp_path)
+    linked = tmp_path / "linked-worktree"
+    _git(["worktree", "add", "-q", "-b", "linked-timestamp-like", str(linked), "HEAD"], primary)
+
+    identity = run_review.protected_git_metadata_snapshot(linked)
+
+    expected_git_dir = run_review.git_dir(linked)
+    expected_common_dir = run_review.git_common_dir(linked)
+    assert expected_git_dir is not None and expected_common_dir is not None
+    assert expected_git_dir != expected_common_dir
+    assert identity["@git_common_dir"] == f"path:{expected_common_dir.resolve()}"
+    assert "mtime_ns=1:ctime_ns=2" in identity["@git_common_dir"]
+
+
+def test_protected_git_metadata_workspace_root_git_path_with_timestamp_like_text_is_preserved(
+    tmp_path: Path,
+) -> None:
+    ws = _make_workspace_with_timestamp_like_name(tmp_path)
+
+    identity = run_review.protected_git_metadata_snapshot(ws)
+
+    entry_key = run_review._WORKSPACE_GIT_ENTRY_PATH_KEY
+    assert identity[entry_key] == f"path:{(ws / '.git').resolve()}"
+    assert "mtime_ns=1:ctime_ns=2" in identity[entry_key]
+
+
 def _synthetic_git_entry(
     *, path: str, mtime_ns: int, ctime_ns: int, ino: int = 1, size: int = 64
 ) -> tuple[str, str]:
