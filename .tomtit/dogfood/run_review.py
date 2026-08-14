@@ -64,30 +64,41 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 _PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS = 3
 
 # The exact, complete descriptor grammars emitted by `_directory_descriptor`
-# and `_regular_file_measurement` (see those two functions). Numeric fields
-# allow an optional leading "-" only because Python's plain `{int}`
-# formatting would render one for a negative `os.stat_result` field (never
-# observed in practice, but the grammar must match exactly what an f-string
-# of that field can produce, not a narrower approximation of it). `mode` is
+# and `_regular_file_measurement` (see those two functions). `mode` is
 # `stat.S_IMODE(...)` formatted `:04o`, whose value is masked to at most
 # 0o7777 -- i.e. always rendered as exactly four octal digits. `sha256` is a
 # `hashlib.sha256().hexdigest()`, always exactly 64 lowercase hex digits.
+#
+# `dev`/`ino`/`size`/`nlink`/`mtime_ns`/`ctime_ns` are all rendered with
+# Python's plain `{int}` (i.e. `str(int)`) formatting of an `os.stat_result`
+# field. That formatting is lexically exact: "0", or a non-zero digit
+# sequence with no leading zeros, optionally negated for a negative value
+# (never observed in practice for these fields, but the grammar must match
+# what the formatting *can* produce, not a narrower approximation of it). It
+# never emits an alternate spelling of the same value such as "00", "01",
+# "-0", or "-01" -- so those must NOT be accepted as canonical, even though
+# they look numeric.
+_CANONICAL_INT = r"(?:0|-?[1-9][0-9]*)"
 #
 # `_strip_volatile_timestamp_fields` requires a `fullmatch` against one of
 # these two patterns -- the *entire* input, not merely a prefix -- before
 # stripping anything. Any input that is not byte-for-byte one of these two
 # canonical shapes (a "path:"/"symlink:" descriptor, an unknown type, a
-# truncated or reordered dir:/file: string, or any other caller-controlled
-# text that merely begins with "dir:" or "file:") is returned unchanged.
+# truncated or reordered dir:/file: string, a field spelled with a
+# non-canonical integer lexical form, or any other caller-controlled text
+# that merely begins with "dir:" or "file:") is returned unchanged.
 _CANONICAL_DIR_DESCRIPTOR_RE = re.compile(
-    r"dir:dev=(?P<dev>-?\d+):ino=(?P<ino>-?\d+):mode=(?P<mode>[0-7]{4}):"
-    r"size=(?P<size>-?\d+):nlink=(?P<nlink>-?\d+):"
-    r"mtime_ns=-?\d+:ctime_ns=-?\d+"
+    r"dir:dev=(?P<dev>" + _CANONICAL_INT + r"):ino=(?P<ino>" + _CANONICAL_INT + r"):"
+    r"mode=(?P<mode>[0-7]{4}):size=(?P<size>" + _CANONICAL_INT + r"):"
+    r"nlink=(?P<nlink>" + _CANONICAL_INT + r"):"
+    r"mtime_ns=" + _CANONICAL_INT + r":ctime_ns=" + _CANONICAL_INT
 )
 _CANONICAL_FILE_DESCRIPTOR_RE = re.compile(
-    r"file:dev=(?P<dev>-?\d+):ino=(?P<ino>-?\d+):mode=(?P<mode>[0-7]{4}):"
-    r"size=(?P<size>-?\d+):nlink=(?P<nlink>-?\d+):"
-    r"mtime_ns=-?\d+:ctime_ns=-?\d+:sha256=(?P<sha256>[0-9a-f]{64})"
+    r"file:dev=(?P<dev>" + _CANONICAL_INT + r"):ino=(?P<ino>" + _CANONICAL_INT + r"):"
+    r"mode=(?P<mode>[0-7]{4}):size=(?P<size>" + _CANONICAL_INT + r"):"
+    r"nlink=(?P<nlink>" + _CANONICAL_INT + r"):"
+    r"mtime_ns=" + _CANONICAL_INT + r":ctime_ns=" + _CANONICAL_INT + r":"
+    r"sha256=(?P<sha256>[0-9a-f]{64})"
 )
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")

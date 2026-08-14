@@ -1083,6 +1083,59 @@ def test_strip_volatile_timestamp_fields_strips_real_file_descriptor(
     )
 
 
+# ---------------------------------------------------------------------------
+# F-01 final precision correction: integer fields must match exactly
+# Python's default `{int}` lexical form ("0", or a non-zero digit sequence
+# with no leading zeros, optionally negated). A canonical-*looking*
+# descriptor whose integer field is spelled some other way (a leading zero,
+# or "-0") is not byte-for-byte what the producer emits, and must be
+# preserved unchanged, not accepted as canonical.
+# ---------------------------------------------------------------------------
+
+
+def test_strip_volatile_timestamp_fields_preserves_dir_with_leading_zero_dev() -> None:
+    descriptor = "dir:dev=001:ino=2:mode=0755:size=64:nlink=1:mtime_ns=100:ctime_ns=200"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_dir_with_negative_zero_ino() -> None:
+    descriptor = "dir:dev=1:ino=-0:mode=0755:size=64:nlink=1:mtime_ns=100:ctime_ns=200"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_file_with_leading_zero_size() -> None:
+    sha256 = "a" * 64
+    descriptor = f"file:dev=1:ino=2:mode=0644:size=0003:nlink=1:mtime_ns=100:ctime_ns=200:sha256={sha256}"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_file_with_leading_zero_negative_nlink() -> None:
+    sha256 = "a" * 64
+    descriptor = f"file:dev=1:ino=2:mode=0644:size=64:nlink=-01:mtime_ns=100:ctime_ns=200:sha256={sha256}"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_leading_zero_mtime_ns() -> None:
+    descriptor = "dir:dev=1:ino=2:mode=0755:size=64:nlink=1:mtime_ns=001:ctime_ns=200"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_preserves_negative_zero_ctime_ns() -> None:
+    descriptor = "dir:dev=1:ino=2:mode=0755:size=64:nlink=1:mtime_ns=100:ctime_ns=-0"
+    assert run_review._strip_volatile_timestamp_fields(descriptor) == descriptor
+
+
+def test_strip_volatile_timestamp_fields_strips_canonical_negative_integer_fields() -> None:
+    """A canonical-form negative integer (no leading zero, single leading
+    "-") is still recognized: only mtime_ns/ctime_ns are removed."""
+
+    descriptor = "dir:dev=-1:ino=-12:mode=0755:size=0:nlink=1:mtime_ns=-100:ctime_ns=-200"
+    assert (
+        run_review._strip_volatile_timestamp_fields(descriptor)
+        == "dir:dev=-1:ino=-12:mode=0755:size=0:nlink=1"
+    )
+
+
 def _make_workspace_with_timestamp_like_name(tmp_path: Path) -> Path:
     """A committed Git repo whose own directory name contains text matching
     the volatile-timestamp-field pattern, to prove path descriptors survive
