@@ -917,13 +917,30 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
     if claude_executable is None:
         raise PreflightBlocked("CLAUDE_NOT_FOUND", "claude executable was not discovered")
 
-    capability_probe_before = _snapshot_workspace_for_review(workspace)
+    # L1: explicit, bounded coherent-bootstrap establishment of the initial
+    # protected-repository baseline. Nothing untrusted has run yet -- this
+    # must succeed before the first untrusted subprocess (the Codex
+    # capability probe below) is ever allowed to start.
+    try:
+        established_baseline = run_review.establish_protected_git_metadata_baseline(workspace)
+    except run_review.EvidenceIntegrityFailure as exc:
+        raise PreflightBlocked("PROTECTED_BASELINE_ESTABLISHMENT_FAILED", str(exc)) from None
+    baseline_git_metadata = established_baseline.stable_projection
+
+    # L2: strict trusted-validation using the L1 authority baseline just
+    # established -- never another implicit bootstrap snapshot.
+    capability_probe_before = _snapshot_workspace_for_review(
+        workspace, trusted_git_metadata_baseline=baseline_git_metadata
+    )
     codex_contract: tuple[str, dict[str, bool], tuple[str, str]] | None = None
     codex_contract_failure: run_review.PreflightFailure | None = None
     try:
         codex_contract = run_review.resolve_codex_contract(args.codex_executable)
     except run_review.PreflightFailure as exc:
         codex_contract_failure = exc
+    # L3: also strict trusted validation, within the same established
+    # authority boundary (chained from the already-L1-anchored L2 reading,
+    # which is transitively consistent with L1).
     capability_probe_after = _snapshot_workspace_for_review(
         workspace, trusted_git_metadata_baseline=capability_probe_before[5]
     )
@@ -951,6 +968,7 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
         "claude_executable": claude_executable,
         "codex_executable": codex_executable,
         "children_root": children_root,
+        "baseline_git_metadata": baseline_git_metadata,
     }
 
 
@@ -1068,12 +1086,12 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         if candidate_baseline is not None:
             baseline_commit_for_final = candidate_baseline
             workspace_baseline_hashes = snapshot_workspace_hashes(workspace)
-            try:
-                baseline_git_metadata = run_review.protected_git_metadata_snapshot(
-                    workspace
-                )
-            except run_review.EvidenceIntegrityFailure:
-                baseline_git_metadata = None
+            # `baseline_git_metadata` is intentionally left unset here: it is
+            # only ever populated by the explicit, bounded coherent-bootstrap
+            # establishment inside `_deep_preflight` (L1). If that has not
+            # run yet (or fails), there is no established authority baseline
+            # to report -- this fallback path must not silently bootstrap
+            # one of its own via an implicit single-snapshot call.
             try:
                 candidate_allowed_paths = run_review.normalize_allowed_paths(
                     args.allowed_path,
@@ -1122,6 +1140,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         baseline_commit_for_final = baseline_commit
         workspace_baseline_hashes = snapshot_workspace_hashes(workspace)
         allowed_paths_for_final = allowed_paths
+        baseline_git_metadata = phase_b["baseline_git_metadata"]
         claude_executable: str = phase_b["claude_executable"]
         codex_executable: str = phase_b["codex_executable"]
         children_root: Path = phase_b["children_root"]

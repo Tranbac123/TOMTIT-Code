@@ -20,6 +20,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -1436,6 +1437,304 @@ def test_protected_git_metadata_persistent_ctime_instability_fails_closed_despit
         run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
 
     assert state["calls"] == 4 * run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS
+
+
+# ---------------------------------------------------------------------------
+# Coherent-bootstrap INITIAL baseline establishment
+# (`establish_protected_git_metadata_baseline`). This supersedes the old
+# "initial protected measurement + timestamp instability + no prior trusted
+# content -> block" invariant for the *bootstrap* case only: the explicit,
+# bounded, two-consecutive-match algorithm below is the only place Runtime
+# may ever trust a protected observation without external evidence.
+# `protected_git_metadata_snapshot`'s own strict-validation behavior (tested
+# above) is completely unchanged and is not reopened by any of this.
+# ---------------------------------------------------------------------------
+
+
+def test_establish_baseline_clean_bootstrap_two_matching_observations(
+    tmp_path: Path,
+) -> None:
+    """(A) A clean repository establishes its baseline on the second
+    independently rebuilt observation, since nothing changes between them."""
+
+    ws = make_workspace(tmp_path)
+
+    result = run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert result.observations_used == 2
+    assert result.timestamp_churn_observed is False
+    assert result.required_third_observation is False
+    # The established baseline round-trips as valid trusted evidence for
+    # strict post-baseline validation.
+    validated = run_review.protected_git_metadata_snapshot(
+        ws, trusted_baseline=result.stable_projection
+    )
+    assert validated == result.stable_projection
+
+
+def test_establish_baseline_benign_timestamp_churn_during_first_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(B) A genuine same-window ctime-only touch on HEAD during the first
+    provisional observation is tolerated unconditionally; the semantic
+    content is unchanged, so the second independent observation still
+    agrees and establishes the baseline, with the churn recorded only as a
+    diagnostic."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    # Perturb only the "opened" reading (the 2nd _stat_identity call) of
+    # HEAD's very first measurement -- confined entirely within S1. S2 is
+    # completely unperturbed.
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    result = run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert result.observations_used == 2
+    assert result.timestamp_churn_observed is True
+    assert result.required_third_observation is False
+
+
+def test_establish_baseline_content_mutated_before_first_read_adopts_new_content(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(C) If content changes from A to B before the bootstrap sequence's
+    very first read of a file, Runtime never claimed to have observed A:
+    both S1 and S2 independently observe B, and B legitimately becomes the
+    baseline -- this is now EXPECTED, not a failure."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    original = head_path.read_bytes()
+    mutated = bytearray(original)
+    # Flip the byte just before the trailing newline (inside the branch
+    # name), not the "ref: " prefix -- HEAD must remain a parseable
+    # symbolic-ref file so `git rev-parse --git-dir` keeps working.
+    mutated[-2] ^= 0xFF
+    mutated_bytes = bytes(mutated)
+    assert len(mutated_bytes) == len(original)
+    assert mutated_bytes != original
+
+    _open_count_content_swap(
+        monkeypatch, head_path, swap_on_open_number=1, new_content=mutated_bytes
+    )
+
+    result = run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert result.observations_used == 2
+    match = run_review._STABLE_FILE_DESCRIPTOR_RE.fullmatch(
+        result.stable_projection["git_dir/HEAD"]
+    )
+    assert match is not None
+    assert match.group("sha256") == hashlib.sha256(mutated_bytes).hexdigest()
+
+
+def test_establish_baseline_disagree_then_agree_establishes_on_third_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(D) S1 observes A, S2 observes B (a real, non-timestamp content
+    change), S3 observes B again: S2 and S3 are the first *consecutive*
+    agreement, so B is established on the third observation -- S1 is never
+    compared directly against S3, only against S2."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    original = head_path.read_bytes()
+    mutated = bytearray(original)
+    # See test C: flip a byte inside the branch name, not the "ref: "
+    # prefix, so HEAD stays a parseable symbolic-ref file throughout.
+    mutated[-2] ^= 0xFF
+    mutated_bytes = bytes(mutated)
+    assert len(mutated_bytes) == len(original)
+
+    # HEAD is visited twice per observation (once via the git_dir role, once
+    # via the git_common_dir role, since both resolve to the same directory
+    # for an ordinary non-linked-worktree repository): opens 1-2 are S1,
+    # opens 3-4 are S2, opens 5-6 are S3. Mutate in place immediately before
+    # the third open (S2's first read) so S1 sees A throughout and S2/S3
+    # both see B.
+    _open_count_content_swap(
+        monkeypatch, head_path, swap_on_open_number=3, new_content=mutated_bytes
+    )
+
+    result = run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert result.observations_used == 3
+    assert result.required_third_observation is True
+    match = run_review._STABLE_FILE_DESCRIPTOR_RE.fullmatch(
+        result.stable_projection["git_dir/HEAD"]
+    )
+    assert match is not None
+    assert match.group("sha256") == hashlib.sha256(mutated_bytes).hexdigest()
+
+
+def test_establish_baseline_three_disagreeing_observations_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(E) S1 observes A, S2 observes B, S3 observes C: no two consecutive
+    observations ever agree, so establishment fails closed once the global
+    bound is exhausted -- it must never fall back to comparing S1 against
+    S3 directly."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    original = head_path.read_bytes()
+
+    def _flip(content: bytes, salt: int) -> bytes:
+        # See test C: mutate a byte inside the branch name, not the "ref: "
+        # prefix, so HEAD stays a parseable symbolic-ref file.
+        mutated = bytearray(content)
+        mutated[-2] = (mutated[-2] + salt) % 256
+        return bytes(mutated)
+
+    content_b = _flip(original, 1)
+    content_c = _flip(original, 2)
+    assert content_b != original
+    assert content_c != original
+    assert content_c != content_b
+
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            # Mutate immediately before S2's first open (3) to B, and
+            # immediately before S3's first open (5) to C.
+            if state["opens"] == 3:
+                head_path.write_bytes(content_b)
+            elif state["opens"] == 5:
+                head_path.write_bytes(content_c)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.establish_protected_git_metadata_baseline(ws)
+
+
+def test_establish_baseline_intra_observation_inode_replacement_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F) A real (non-timestamp) identity change observed mid-measurement
+    -- here, HEAD's inode changing via unlink+rewrite immediately before the
+    first open -- is never tolerated, even during bootstrap: establishment
+    fails closed immediately rather than continuing to another observation."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    content = head_path.read_bytes()
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            if state["opens"] == 1:
+                head_path.unlink()
+                head_path.write_bytes(content)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert state["opens"] == 1
+
+
+def test_establish_baseline_unreadable_member_prevents_establishment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(G) An observation that cannot produce a complete trustworthy
+    projection -- here, HEAD becoming unreadable mid-observation -- must be
+    discarded outright; it can never participate in establishing a baseline."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    real_open = os.open
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            raise OSError("simulated unreadable")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.establish_protected_git_metadata_baseline(ws)
+
+
+def test_establish_baseline_persistent_disagreement_blocks_after_exactly_bound(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(L) If no two consecutive observations ever agree, establishment
+    fails closed after exactly the global bound of independently rebuilt
+    observations -- never fewer, never more, and never a nested retry
+    multiplying that count."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    original = head_path.read_bytes()
+
+    call_counter = {"n": 0}
+    real_build = run_review._build_provisional_protected_git_metadata_observation
+
+    def counting_build(cwd: Path, **kwargs: Any) -> dict[str, str]:
+        call_counter["n"] += 1
+        # See test C: mutate a byte inside the branch name, not the "ref: "
+        # prefix, so HEAD stays a parseable symbolic-ref file.
+        mutated = bytearray(original)
+        mutated[-2] = (mutated[-2] + call_counter["n"]) % 256
+        head_path.write_bytes(bytes(mutated))
+        return real_build(cwd, **kwargs)
+
+    monkeypatch.setattr(
+        run_review,
+        "_build_provisional_protected_git_metadata_observation",
+        counting_build,
+    )
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert call_counter["n"] == run_review._MAX_INITIAL_BASELINE_OBSERVATIONS
+
+
+def test_establish_baseline_rebuilds_whole_tree_each_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(M) Each observation independently rebuilds the complete protected
+    tree from scratch -- a file added to the tree strictly between two
+    observation attempts is detected as a fresh disagreement, not silently
+    missed by reusing a cached prior subtree measurement."""
+
+    ws = make_workspace(tmp_path)
+    extra_file = run_review.git_dir(ws) / "extra-loose-like-file"
+
+    call_counter = {"n": 0}
+    real_build = run_review._build_provisional_protected_git_metadata_observation
+
+    def adding_file_before_second_attempt(cwd: Path, **kwargs: Any) -> dict[str, str]:
+        call_counter["n"] += 1
+        if call_counter["n"] == 2:
+            extra_file.write_bytes(b"synthetic content for tree-rebuild proof\n")
+        return real_build(cwd, **kwargs)
+
+    monkeypatch.setattr(
+        run_review,
+        "_build_provisional_protected_git_metadata_observation",
+        adding_file_before_second_attempt,
+    )
+
+    result = run_review.establish_protected_git_metadata_baseline(ws)
+
+    assert result.observations_used == 3
+    assert "git_dir/extra-loose-like-file" in result.stable_projection
 
 
 def test_protected_git_metadata_same_size_content_mutation_between_retries_fails_closed(

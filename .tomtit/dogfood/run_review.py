@@ -63,6 +63,15 @@ _EMPTY_SHA256 = hashlib.sha256(b"").hexdigest()
 # (see `protected_git_metadata_snapshot`). Not a general-purpose retry knob.
 _PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS = 3
 
+# Bounded observation budget for establishing the *initial* protected-Git-
+# metadata baseline (see `establish_protected_git_metadata_baseline`). A
+# separate knob from the one above: that one bounds *retries of a single
+# already-trusted-anchored measurement*; this one bounds *independent
+# from-scratch observations compared against each other*, since bootstrap
+# has no external trust to anchor a retry to. Not a general-purpose retry
+# knob.
+_MAX_INITIAL_BASELINE_OBSERVATIONS = 3
+
 # The exact, complete descriptor grammars emitted by `_directory_descriptor`
 # and `_regular_file_measurement` (see those two functions). `mode` is
 # `stat.S_IMODE(...)` formatted `:04o`, whose value is masked to at most
@@ -465,22 +474,27 @@ def _regular_file_measurement(
     capture_bytes: bool,
     tolerate_timestamp_only_instability: bool = False,
     trusted_evidence: TrustedRegularFileEvidence | None = None,
+    bootstrap_unconditional_timestamp_tolerance: bool = False,
+    churn_sink: list[str] | None = None,
 ) -> tuple[str, bytes | None]:
     """Measure one regular file's identity and content across a single pass.
 
-    By default (`tolerate_timestamp_only_instability=False`), behavior is
+    By default (both tolerance parameters `False`), behavior is
     byte-for-byte what it has always been: any before/opened/closing/final
     stat mismatch -- for any reason, including a timestamp-only one --
     fails closed with `EvidenceIntegrityFailure`. This is what canonical
     evidence reading (`read_canonical_evidence` and friends) always gets;
-    it is not affected by anything below.
+    it is not affected by anything below. `bootstrap_unconditional_timestamp_tolerance`
+    and `tolerate_timestamp_only_instability` are mutually exclusive modes;
+    no caller sets both.
 
-    When a caller opts in with `tolerate_timestamp_only_instability=True`
-    (only `protected_git_metadata_snapshot` does), a mismatch confined
-    *exactly* to `mtime_ns`/`ctime_ns` -- device, inode, mode, size, nlink,
-    and type all agree at every observation point, and the full content was
-    read and hashed without a byte-count discrepancy -- is *provisionally*
-    eligible for tolerance. It is never accepted on that basis alone:
+    **Strict validation mode** (`tolerate_timestamp_only_instability=True`,
+    used by `protected_git_metadata_snapshot` once a trusted baseline
+    exists): a mismatch confined *exactly* to `mtime_ns`/`ctime_ns` --
+    device, inode, mode, size, nlink, and type all agree at every
+    observation point, and the full content was read and hashed without a
+    byte-count discrepancy -- is *provisionally* eligible for tolerance.
+    It is never accepted on that basis alone:
 
     - if `trusted_evidence` is `None` (no previously successful *coherent*
       snapshot exists to compare against), tolerance is refused and this
@@ -497,10 +511,25 @@ def _regular_file_measurement(
       `TimestampOnlyRegularFileInstability`, a diagnostic retry-eligible
       signal (never treated as evidence of anything itself).
 
+    **Bootstrap observation mode** (`bootstrap_unconditional_timestamp_tolerance=True`,
+    used only while building one *provisional* observation for
+    `establish_protected_git_metadata_baseline` -- see there): a
+    timestamp-only-confined mismatch is tolerated unconditionally, with no
+    trusted evidence needed and no exception raised at all -- the normal
+    descriptor is returned as if the reading had been coherent, and the
+    path is appended to `churn_sink` (if given) purely as diagnostic
+    record-keeping. This is safe *only* because one bootstrap observation
+    is never authoritative by itself: the caller must independently
+    rebuild a second, separate observation and compare their complete
+    stable projections before either is trusted (see
+    `establish_protected_git_metadata_baseline`).
+
     Any non-timestamp-only mismatch (a real semantic change) still fails
-    closed exactly as in the default case regardless of `trusted_evidence`;
-    none of this ever removes a check, only narrows what -- given genuinely
-    trusted external proof -- does not have to be a hard failure.
+    closed exactly as in the default case regardless of either tolerance
+    parameter; neither one ever removes a check, only narrows what --
+    given either genuinely trusted external proof or the caller's own
+    independent-rebuild-and-compare obligation -- does not have to be a
+    hard failure in isolation.
     """
 
     if reject_hardlinks and metadata.st_nlink != 1:
@@ -578,38 +607,53 @@ def _regular_file_measurement(
             and _differs_only_in_timestamps(closed_identity, opened_identity)
             and _differs_only_in_timestamps(final_identity, opened_identity)
         )
-        if not (tolerate_timestamp_only_instability and confined_to_timestamps):
+        if not confined_to_timestamps or not (
+            tolerate_timestamp_only_instability or bootstrap_unconditional_timestamp_tolerance
+        ):
             raise EvidenceIntegrityFailure(
                 f"regular file identity changed during measurement: {path.name}"
             )
-        # Provisionally timestamp-only. Never accepted on that basis alone:
-        # it must be proven against evidence from outside this call.
-        if trusted_evidence is None:
-            raise EvidenceIntegrityFailure(
-                "regular file timestamp-only instability has no trusted prior "
-                f"coherent evidence to validate against: {path.name}"
+        if bootstrap_unconditional_timestamp_tolerance:
+            # One provisional bootstrap observation: tolerated unconditionally
+            # -- no trusted evidence exists yet to prove it against, and none
+            # is needed, because this single reading is never authoritative
+            # by itself (see establish_protected_git_metadata_baseline). Fall
+            # through to the normal return below, using the bytes actually
+            # read.
+            if churn_sink is not None:
+                churn_sink.append(str(path))
+        else:
+            # Strict validation mode. Provisionally timestamp-only. Never
+            # accepted on that basis alone: it must be proven against
+            # evidence from outside this call.
+            if trusted_evidence is None:
+                raise EvidenceIntegrityFailure(
+                    "regular file timestamp-only instability has no trusted prior "
+                    f"coherent evidence to validate against: {path.name}"
+                )
+            if not trusted_evidence.matches(
+                dev=opened.st_dev,
+                ino=opened.st_ino,
+                mode=stat.S_IMODE(opened.st_mode),
+                size=opened.st_size,
+                nlink=opened.st_nlink,
+                sha256=sha256_hex,
+            ):
+                raise EvidenceIntegrityFailure(
+                    "regular file content or identity does not match trusted prior "
+                    f"coherent evidence: {path.name}"
+                )
+            if churn_sink is not None:
+                churn_sink.append(str(path))
+            raise TimestampOnlyRegularFileInstability(
+                path=str(path),
+                dev=opened.st_dev,
+                ino=opened.st_ino,
+                mode=opened.st_mode,
+                size=opened.st_size,
+                nlink=opened.st_nlink,
+                sha256=sha256_hex,
             )
-        if not trusted_evidence.matches(
-            dev=opened.st_dev,
-            ino=opened.st_ino,
-            mode=stat.S_IMODE(opened.st_mode),
-            size=opened.st_size,
-            nlink=opened.st_nlink,
-            sha256=sha256_hex,
-        ):
-            raise EvidenceIntegrityFailure(
-                "regular file content or identity does not match trusted prior "
-                f"coherent evidence: {path.name}"
-            )
-        raise TimestampOnlyRegularFileInstability(
-            path=str(path),
-            dev=opened.st_dev,
-            ino=opened.st_ino,
-            mode=opened.st_mode,
-            size=opened.st_size,
-            nlink=opened.st_nlink,
-            sha256=sha256_hex,
-        )
 
     return (
         f"file:dev={opened.st_dev}:ino={opened.st_ino}:"
@@ -636,13 +680,17 @@ def _measure_type_aware_tree(
     capture_files: frozenset[str] = frozenset(),
     tolerate_regular_file_timestamp_only_instability: bool = False,
     trusted_regular_file_baseline: Mapping[str, str] | None = None,
+    bootstrap_unconditional_timestamp_tolerance: bool = False,
+    churn_sink: list[str] | None = None,
 ) -> CanonicalEvidenceSnapshot:
     """Measure a tree without following aliases, revalidating every live path.
 
     Directory measurement is never relaxed here: a directory's own stat
-    identity must match exactly across the walk regardless of the two
-    tolerance parameters below, which apply only to regular-file members
-    (see `_regular_file_measurement`).
+    identity must match exactly across the walk regardless of the tolerance
+    parameters below, which apply only to regular-file members (see
+    `_regular_file_measurement`). `bootstrap_unconditional_timestamp_tolerance`
+    and `tolerate_regular_file_timestamp_only_instability` are mutually
+    exclusive modes; no caller sets both.
 
     `trusted_regular_file_baseline`, when given, maps each relative member
     key (the same key used in the returned identity dict, e.g. `"HEAD"` or
@@ -717,6 +765,8 @@ def _measure_type_aware_tree(
                         if trusted_descriptor is not None
                         else None
                     ),
+                    bootstrap_unconditional_timestamp_tolerance=bootstrap_unconditional_timestamp_tolerance,
+                    churn_sink=churn_sink,
                 )
                 identity[key] = descriptor
                 if content is not None:
@@ -749,6 +799,8 @@ def snapshot_type_aware_tree(
     reject_hardlinks: bool,
     tolerate_regular_file_timestamp_only_instability: bool = False,
     trusted_regular_file_baseline: Mapping[str, str] | None = None,
+    bootstrap_unconditional_timestamp_tolerance: bool = False,
+    churn_sink: list[str] | None = None,
 ) -> dict[str, str]:
     """Return an lstat-based, non-following identity for one exact filesystem tree."""
 
@@ -758,6 +810,8 @@ def snapshot_type_aware_tree(
         reject_hardlinks=reject_hardlinks,
         tolerate_regular_file_timestamp_only_instability=tolerate_regular_file_timestamp_only_instability,
         trusted_regular_file_baseline=trusted_regular_file_baseline,
+        bootstrap_unconditional_timestamp_tolerance=bootstrap_unconditional_timestamp_tolerance,
+        churn_sink=churn_sink,
     ).identity
 
 
@@ -884,6 +938,8 @@ def _workspace_git_entry_descriptor(
     *,
     tolerate_timestamp_only_instability: bool = False,
     trusted_evidence: TrustedRegularFileEvidence | None = None,
+    bootstrap_unconditional_timestamp_tolerance: bool = False,
+    churn_sink: list[str] | None = None,
 ) -> tuple[str, str]:
     """Measure the worktree-root .git entry without following aliases.
 
@@ -891,7 +947,9 @@ def _workspace_git_entry_descriptor(
     (see `_measure_type_aware_tree`'s docstring); only the linked-worktree
     regular-indirection-file case can raise `TimestampOnlyRegularFileInstability`,
     and only when the caller opts in and supplies matching `trusted_evidence`
-    from a previously successful, fully coherent snapshot.
+    from a previously successful, fully coherent snapshot -- or, in bootstrap
+    observation mode, tolerates a timestamp-only mismatch unconditionally
+    (see `_regular_file_measurement`).
     """
 
     entry = cwd.resolve() / ".git"
@@ -911,6 +969,8 @@ def _workspace_git_entry_descriptor(
             capture_bytes=False,
             tolerate_timestamp_only_instability=tolerate_timestamp_only_instability,
             trusted_evidence=trusted_evidence,
+            bootstrap_unconditional_timestamp_tolerance=bootstrap_unconditional_timestamp_tolerance,
+            churn_sink=churn_sink,
         )
     else:
         raise EvidenceIntegrityFailure(
@@ -937,12 +997,198 @@ def workspace_git_entry_hash_from_snapshot(snapshot: Mapping[str, str]) -> str:
     )
 
 
+def _build_provisional_protected_git_metadata_observation(
+    cwd: Path,
+    *,
+    churn_sink: list[str] | None = None,
+) -> dict[str, str]:
+    """Build exactly one complete, independently-rebuilt protected Git
+    metadata observation, for bootstrap comparison purposes only (see
+    `establish_protected_git_metadata_baseline`).
+
+    Every non-timestamp check -- unreadable/incomplete files, byte-count
+    inconsistency, path replacement, device/inode/mode/type/symlink
+    mismatches, malformed protected paths, incomplete tree traversal -- is
+    unconditional here and fails closed exactly as in strict validation
+    mode; nothing in bootstrap mode ever weakens any of them. Only a
+    same-window mismatch confined *exactly* to `mtime_ns`/`ctime_ns` (the
+    root `.git` entry, the resolved git-dir/git-common-dir themselves never
+    have a timestamp component and so any difference there is always
+    semantic, or any regular-file member) is unconditionally tolerated,
+    without needing external trusted evidence -- because this ONE
+    observation is never accepted as authoritative by itself. It is always
+    returned as the stable cross-phase projection (`mtime_ns`/`ctime_ns`
+    excluded), ready for direct comparison against another observation
+    built the same way.
+
+    Raises `EvidenceIntegrityFailure` immediately or a filesystem-level
+    exception is not caught. A caller wanting a bounded number of
+    independent attempts is responsible for that bound (see
+    `establish_protected_git_metadata_baseline`); this function never
+    retries internally.
+    """
+
+    git_entry_before = _workspace_git_entry_descriptor(
+        cwd,
+        bootstrap_unconditional_timestamp_tolerance=True,
+        churn_sink=churn_sink,
+    )
+    directory = git_dir(cwd)
+    common_directory = git_common_dir(cwd)
+    if directory is None or common_directory is None:
+        raise EvidenceIntegrityFailure("Git metadata locations could not be resolved")
+    roots = (
+        ("git_dir", directory.resolve()),
+        ("git_common_dir", common_directory.resolve()),
+    )
+    identity: dict[str, str] = {
+        "@git_dir": f"path:{roots[0][1]}",
+        "@git_common_dir": f"path:{roots[1][1]}",
+        _WORKSPACE_GIT_ENTRY_PATH_KEY: git_entry_before[0],
+        _WORKSPACE_GIT_ENTRY_KEY: git_entry_before[1],
+    }
+    for role, root in roots:
+        tree = snapshot_type_aware_tree(
+            root,
+            reject_symlinks=True,
+            reject_hardlinks=False,
+            bootstrap_unconditional_timestamp_tolerance=True,
+            churn_sink=churn_sink,
+        )
+        for relative, descriptor in tree.items():
+            identity[f"{role}/{relative}"] = descriptor
+    git_entry_after = _workspace_git_entry_descriptor(
+        cwd,
+        bootstrap_unconditional_timestamp_tolerance=True,
+        churn_sink=churn_sink,
+    )
+    if git_dir(cwd) != roots[0][1] or git_common_dir(cwd) != roots[1][1]:
+        raise EvidenceIntegrityFailure(
+            "resolved Git metadata locations changed during baseline observation"
+        )
+    if git_entry_after != git_entry_before:
+        timestamp_only = (
+            git_entry_after[0] == git_entry_before[0]
+            and _strip_volatile_timestamp_fields(git_entry_after[1])
+            == _strip_volatile_timestamp_fields(git_entry_before[1])
+        )
+        if not timestamp_only:
+            raise EvidenceIntegrityFailure(
+                "workspace .git entry changed during baseline observation"
+            )
+        if churn_sink is not None:
+            churn_sink.append(_WORKSPACE_GIT_ENTRY_KEY)
+        identity[_WORKSPACE_GIT_ENTRY_PATH_KEY] = git_entry_after[0]
+        identity[_WORKSPACE_GIT_ENTRY_KEY] = git_entry_after[1]
+
+    return _stable_cross_phase_projection(identity)
+
+
+@dataclasses.dataclass(frozen=True, slots=True)
+class ProtectedGitMetadataBaseline:
+    """The result of `establish_protected_git_metadata_baseline`."""
+
+    stable_projection: dict[str, str]
+    observations_used: int
+    timestamp_churn_observed: bool
+    required_third_observation: bool
+
+
+def establish_protected_git_metadata_baseline(
+    cwd: Path,
+) -> ProtectedGitMetadataBaseline:
+    """Explicitly, boundedly establish the *initial* coherent
+    protected-repository starting state.
+
+    This is the only place Runtime is ever permitted to trust a protected
+    Git metadata observation without external trusted evidence -- and it
+    never does so from a single reading. Runtime cannot prove content that
+    existed before its first content observation, so bootstrap instead
+    requires *two independently rebuilt, complete observations whose
+    stable semantic/nonvolatile projections agree*:
+
+        observation_1 = complete provisional observation
+        observation_2 = independently rebuilt complete provisional observation
+        if stable(observation_1) == stable(observation_2):
+            establish observation_2 as the baseline
+        else:
+            continue with observation_3, comparing it only against
+            observation_2 (never observation_1 -- a prior disagreement is
+            never silently bridged), until either two *consecutive*
+            observations agree or `_MAX_INITIAL_BASELINE_OBSERVATIONS` is
+            exhausted.
+
+    With the bound at 3: `S1 == S2` establishes `S2`; `S1 != S2` but
+    `S2 == S3` establishes `S3`; `S1 != S2` and `S2 != S3` fails closed.
+    This is intentionally a flat, non-nested bound -- one observation
+    attempt per loop iteration, never a retry loop nested inside another.
+
+    If content changes from A to B before the very first read of a
+    bootstrap sequence (`S1` observes B because the mutation already
+    happened; `S2` independently observes B again), `B` legitimately
+    becomes the baseline: Runtime never claimed to have observed A, and
+    never needs to reconstruct or prove it. This is deliberately different
+    from later (post-baseline) validation, where a mismatch against
+    already-*trusted* evidence must fail closed -- see
+    `protected_git_metadata_snapshot`'s `trusted_baseline` parameter and
+    `TrustedRegularFileEvidence`; that contract is unchanged and is not
+    reopened by this function.
+
+    Each observation independently rebuilds the *complete* protected
+    repository state from scratch (root `.git` entry, plus the full
+    `git_dir`/`git_common_dir` trees) -- no subtree reuse, no descriptor
+    reuse, no partial-observation reuse, no per-file nested retry. Only a
+    same-window timestamp-only mismatch (never any other kind of
+    difference) is tolerated *within* one observation, and only because
+    that single observation is never trusted by itself.
+
+    Raises `EvidenceIntegrityFailure` if no two consecutive observations
+    ever agree within the bound, or if any single observation hits a
+    genuine (non-timestamp) semantic problem -- unreadable/incomplete
+    files, byte-count inconsistency, path replacement, device/inode/mode/
+    type/symlink mismatches, malformed protected paths, or incomplete
+    tree traversal -- which aborts establishment immediately rather than
+    silently moving on to another attempt.
+    """
+
+    previous: dict[str, str] | None = None
+    timestamp_churn_observed = False
+
+    for attempt in range(1, _MAX_INITIAL_BASELINE_OBSERVATIONS + 1):
+        churn: list[str] = []
+        current = _build_provisional_protected_git_metadata_observation(cwd, churn_sink=churn)
+        if churn:
+            timestamp_churn_observed = True
+        if previous is not None and current == previous:
+            return ProtectedGitMetadataBaseline(
+                stable_projection=current,
+                observations_used=attempt,
+                timestamp_churn_observed=timestamp_churn_observed,
+                required_third_observation=attempt >= 3,
+            )
+        previous = current
+
+    raise EvidenceIntegrityFailure(
+        "could not establish a coherent protected Git metadata baseline within "
+        f"{_MAX_INITIAL_BASELINE_OBSERVATIONS} independently rebuilt observations"
+    )
+
+
 def protected_git_metadata_snapshot(
     cwd: Path,
     *,
     trusted_baseline: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
-    """Cross-phase-stable snapshot of protected Git metadata.
+    """Cross-phase-stable **validation** of protected Git metadata against
+    `trusted_baseline` -- this function never establishes a new baseline,
+    with or without one. Omitting `trusted_baseline` (or a path having no
+    entry in it) does not fall back to any bootstrap behavior: it simply
+    means there is nothing to validate a timestamp-only instability
+    against, so that measurement fails closed exactly as any other
+    unproven mismatch would. To establish the very first trusted baseline
+    for a run, call the separate, explicit
+    `establish_protected_git_metadata_baseline()` instead -- never this
+    function with `trusted_baseline=None`.
 
     Snapshots the root `.git` entry plus the actual per-worktree/common
     metadata trees. The returned identity is a *stable cross-phase
@@ -2342,18 +2588,22 @@ def main(
     # capability/help probes. Those probes are subprocesses of the configured
     # executable and therefore must be treated as untrusted: unlike
     # Owner-authorized deterministic checks, they may not change any workspace
-    # or repository state at all.
+    # or repository state at all. This is the explicit, bounded coherent-
+    # bootstrap establishment (L1) -- not a single untrusted snapshot -- so
+    # a genuine but transient timestamp-only instability cannot by itself
+    # block a review before any untrusted subprocess has even run.
     review_entry_hashes = snapshot_workspace_hashes(workspace)
     review_entry_head = git_rev_parse(workspace, "HEAD") or ""
     review_entry_index_identity = git_index_identity(workspace) or ""
     try:
-        review_entry_git_metadata = protected_git_metadata_snapshot(workspace)
+        review_entry_baseline = establish_protected_git_metadata_baseline(workspace)
     except EvidenceIntegrityFailure as exc:
         if provider_observer is not None:
             provider_observer(False)
         print("STATUS=PREFLIGHT_FAILURE:GIT_METADATA_IDENTITY_UNAVAILABLE")
         print(f"MESSAGE={exc}")
         return 3
+    review_entry_git_metadata = review_entry_baseline.stable_projection
     review_entry_git_metadata_hash = workspace_hash(review_entry_git_metadata)
     review_entry_git_entry_hash = workspace_git_entry_hash_from_snapshot(
         review_entry_git_metadata

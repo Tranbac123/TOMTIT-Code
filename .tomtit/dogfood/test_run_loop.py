@@ -1493,6 +1493,199 @@ def test_capability_probe_semantic_repository_mutation_still_blocks_preflight(
     assert result["review_attempts"] == 0
 
 
+# ---------------------------------------------------------------------------
+# Coherent-bootstrap INITIAL baseline establishment lifecycle threading
+# (L1 = establish_protected_git_metadata_baseline, L2 = capability probe
+# BEFORE, L3 = capability probe AFTER). Source-level bootstrap-algorithm
+# tests (clean bootstrap, benign churn, disagreement bounds, tree rebuild,
+# ...) live in test_run_review.py; these test the loop-level threading.
+# ---------------------------------------------------------------------------
+
+
+def test_no_untrusted_subprocess_before_baseline_establishment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(H) If the coherent-bootstrap baseline cannot be established, no
+    untrusted subprocess (the Codex capability probe) may ever run."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-no-subprocess-before-baseline")
+    marker = tmp_path / "codex-invoked.marker"
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-no-subprocess-before-baseline",
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(marker),
+    )
+
+    def _always_fails(cwd: Path) -> "run_review.ProtectedGitMetadataBaseline":
+        raise run_review.EvidenceIntegrityFailure("simulated establishment failure")
+
+    monkeypatch.setattr(run_review, "establish_protected_git_metadata_baseline", _always_fails)
+
+    loop_id = "loop-no-subprocess-before-baseline"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["error_category"] == "PROTECTED_BASELINE_ESTABLISHMENT_FAILED"
+    assert not marker.exists()
+
+
+def test_no_rebootstrap_after_baseline_established_on_later_drift(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(I) Once the L1 baseline is established, a later genuine drift (here,
+    the Codex capability probe writing a Git hook) must still block
+    PREFLIGHT -- Runtime must never silently re-enter bootstrap and accept
+    the drifted state as a new baseline.
+    `establish_protected_git_metadata_baseline` is called exactly once for
+    the whole run."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-no-rebootstrap")
+    hook = run_review.git_dir(ws) / "hooks" / "tomtit-loop-probe-hook"
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-no-rebootstrap",
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(hook),
+    )
+
+    real_establish = run_review.establish_protected_git_metadata_baseline
+    calls = {"count": 0}
+
+    def _counting_establish(cwd: Path) -> "run_review.ProtectedGitMetadataBaseline":
+        calls["count"] += 1
+        return real_establish(cwd)
+
+    monkeypatch.setattr(run_review, "establish_protected_git_metadata_baseline", _counting_establish)
+
+    loop_id = "loop-no-rebootstrap"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["error_category"] == "IMMUTABILITY_VIOLATION"
+    assert calls["count"] == 1
+
+
+def test_capability_probe_before_validates_against_run_baseline_not_bootstrap(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(J) The capability-probe BEFORE snapshot (L2) must execute in strict
+    trusted-validation mode using L1's already-established baseline -- not
+    another implicit bootstrap of its own. A single transient timestamp-only
+    touch on HEAD occurring only after L1 has established must still be
+    tolerated (proving L2 has trusted evidence to validate against), and the
+    loop must proceed to a normal APPROVE outcome."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-l2-strict-validation")
+    codex = write_fake_codex(
+        tmp_path, name="codex-l2-strict-validation", verdict_json=approve_verdict_json()
+    )
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    real_establish = run_review.establish_protected_git_metadata_baseline
+    real_stat_identity = run_review._stat_identity
+    state = {"established": False, "perturbed": False}
+
+    def perturbing_after_establishment(metadata: object) -> tuple:
+        real = real_stat_identity(metadata)
+        if (
+            state["established"]
+            and metadata.st_ino == target_ino  # type: ignore[union-attr]
+            and not state["perturbed"]
+        ):
+            state["perturbed"] = True
+            dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+            return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        return real
+
+    def establishing(cwd: Path) -> "run_review.ProtectedGitMetadataBaseline":
+        result = real_establish(cwd)
+        state["established"] = True
+        return result
+
+    monkeypatch.setattr(run_review, "_stat_identity", perturbing_after_establishment)
+    monkeypatch.setattr(run_review, "establish_protected_git_metadata_baseline", establishing)
+
+    loop_id = "loop-l2-strict-validation"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert state["perturbed"] is True
+    assert exit_code == 0
+    result = load_result(loop_root / loop_id)
+    assert result["final_verdict"] == "APPROVE"
+
+
+def test_capability_probe_after_remains_strict_validation_chained_from_before(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(K) The capability-probe AFTER snapshot (L3) must also remain within
+    the established authority boundary -- chained from L2's own trusted
+    reading, never an implicit bootstrap of its own. A transient timestamp-
+    only touch on HEAD occurring only during L3's measurement must still be
+    tolerated, and the loop must proceed to a normal APPROVE outcome."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-l3-strict-validation")
+    codex = write_fake_codex(
+        tmp_path, name="codex-l3-strict-validation", verdict_json=approve_verdict_json()
+    )
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    real_snapshot_for_review = run_loop._snapshot_workspace_for_review
+    real_stat_identity = run_review._stat_identity
+    state = {"before_done": False, "perturbed": False}
+    call_count = {"n": 0}
+
+    def perturbing_after_before_probe(metadata: object) -> tuple:
+        real = real_stat_identity(metadata)
+        if (
+            state["before_done"]
+            and metadata.st_ino == target_ino  # type: ignore[union-attr]
+            and not state["perturbed"]
+        ):
+            state["perturbed"] = True
+            dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+            return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        return real
+
+    def counting_snapshot(workspace: Path, **kwargs: object) -> tuple:
+        call_count["n"] += 1
+        result = real_snapshot_for_review(workspace, **kwargs)
+        if call_count["n"] == 1:
+            state["before_done"] = True
+        return result
+
+    monkeypatch.setattr(run_review, "_stat_identity", perturbing_after_before_probe)
+    monkeypatch.setattr(run_loop, "_snapshot_workspace_for_review", counting_snapshot)
+
+    loop_id = "loop-l3-strict-validation"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert state["perturbed"] is True
+    assert exit_code == 0
+    result = load_result(loop_root / loop_id)
+    assert result["final_verdict"] == "APPROVE"
+
+
 def test_invalid_allowed_path_preflight_does_not_fabricate_empty_final_paths(
     tmp_path: Path,
 ) -> None:
