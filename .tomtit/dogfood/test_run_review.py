@@ -1218,7 +1218,7 @@ def test_protected_git_metadata_bounded_retry_recovers_from_transient_timestamp_
             _synthetic_git_entry(path=entry_path, mtime_ns=300, ctime_ns=300),  # attempt 2 after (coherent)
         ]
     )
-    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd, **kwargs: next(sequence))
 
     result = run_review.protected_git_metadata_snapshot(ws)
 
@@ -1241,7 +1241,7 @@ def test_protected_git_metadata_persistent_timestamp_instability_fails_closed(
         values.append(_synthetic_git_entry(path=entry_path, mtime_ns=base, ctime_ns=base))
         values.append(_synthetic_git_entry(path=entry_path, mtime_ns=base + 1, ctime_ns=base + 1))
     sequence = iter(values)
-    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd, **kwargs: next(sequence))
 
     with pytest.raises(run_review.EvidenceIntegrityFailure):
         run_review.protected_git_metadata_snapshot(ws)
@@ -1266,13 +1266,306 @@ def test_protected_git_metadata_content_changing_race_during_retry_fails_closed(
             _synthetic_git_entry(path=entry_path, mtime_ns=3, ctime_ns=3, ino=2),  # attempt 2 after (real change)
         ]
     )
-    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd: next(sequence))
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd, **kwargs: next(sequence))
 
     with pytest.raises(run_review.EvidenceIntegrityFailure):
         run_review.protected_git_metadata_snapshot(ws)
 
     with pytest.raises(StopIteration):
         next(sequence)
+
+
+# ---------------------------------------------------------------------------
+# Intra-measurement timestamp-only instability for a protected regular-file
+# *member* (HEAD, a ref, a loose object, ...), not just the root .git entry.
+# See TimestampOnlyRegularFileInstability. All of these perturb only the
+# opaque `_stat_identity()` tuple for one targeted inode -- never real OS
+# timing -- so they are fully deterministic.
+# ---------------------------------------------------------------------------
+
+
+def _perturb_stat_identity_ctime_for_inode(
+    monkeypatch: pytest.MonkeyPatch, target_ino: int, *, perturb_calls: set[int]
+) -> dict[str, int]:
+    """Return every real `_stat_identity()` observation unperturbed, except
+    that any call numbered in `perturb_calls` (1-indexed, counting only
+    calls whose `st_ino` matches `target_ino`) has its `ctime_ns` bumped by
+    one. This simulates an OS-level ctime-only touch landing between two
+    specific observation points of one specific file, deterministically."""
+
+    real_stat_identity = run_review._stat_identity
+    state = {"calls": 0}
+
+    def perturbing(metadata: object) -> tuple:
+        real = real_stat_identity(metadata)
+        if metadata.st_ino == target_ino:  # type: ignore[union-attr]
+            state["calls"] += 1
+            if state["calls"] in perturb_calls:
+                dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+                return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        return real
+
+    monkeypatch.setattr(run_review, "_stat_identity", perturbing)
+    return state
+
+
+def test_protected_git_metadata_member_ctime_only_transient_recovers(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A ctime-only instability confined to one member file (HEAD) on its
+    first measurement is reported internally, the whole snapshot retries,
+    and a later coherent reading of the same unchanged bytes succeeds."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    # Perturb only the second observation (the post-open `fstat`) of HEAD's
+    # very first measurement -- a same-window mismatch confined to
+    # ctime_ns, exactly the pattern that must raise
+    # TimestampOnlyRegularFileInstability rather than fail closed outright.
+    state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    result = run_review.protected_git_metadata_snapshot(ws)
+
+    assert result
+    # HEAD was measured at least twice (an unstable first attempt, a
+    # coherent second one): 4 raw-identity observations per measurement.
+    assert state["calls"] >= 8
+
+
+def test_protected_git_metadata_persistent_member_ctime_instability_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """If HEAD's measurement is timestamp-only unstable on every bounded
+    attempt, the whole snapshot fails closed after exactly 3 attempts."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    # Perturb the second observation of every attempt (calls 2, 6, 10 for
+    # three complete 4-observation measurements of HEAD).
+    state = _perturb_stat_identity_ctime_for_inode(
+        monkeypatch, target_ino, perturb_calls={2, 6, 10}
+    )
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+    assert state["calls"] == 4 * run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS
+
+
+def _open_count_content_swap(
+    monkeypatch: pytest.MonkeyPatch,
+    target_path: Path,
+    *,
+    swap_on_open_number: int,
+    new_content: bytes,
+) -> dict[str, int]:
+    """Rewrite `target_path`'s bytes in place immediately before its Nth
+    `os.open()` call, simulating a real mutation landing between two
+    coherent-measurement retry attempts (as opposed to a same-window
+    ctime-only touch, which `_perturb_stat_identity_ctime_for_inode`
+    simulates instead)."""
+
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(target_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            if state["opens"] == swap_on_open_number:
+                target_path.write_bytes(new_content)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+    return state
+
+
+def test_protected_git_metadata_content_change_after_member_ctime_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First attempt: HEAD is timestamp-only unstable (recorded). Before the
+    retry's read completes, HEAD's actual content changes (different size).
+    The retry must NOT accept the new bytes as coherent -- fail closed."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    original = head_path.read_bytes()
+    mutated = original.rstrip(b"\n") + b"-mutated-longer\n"
+    assert len(mutated) != len(original)
+
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+    _open_count_content_swap(monkeypatch, head_path, swap_on_open_number=2, new_content=mutated)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+
+def test_protected_git_metadata_same_size_content_change_after_member_ctime_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same as above, but the post-instability content mutation preserves
+    the exact original byte size. Must still fail closed: SHA-256, not
+    size, is what proves content identity here."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    original = head_path.read_bytes()
+    mutated = bytearray(original)
+    mutated[0] = mutated[0] ^ 0xFF if mutated else 0
+    mutated_bytes = bytes(mutated)
+    assert len(mutated_bytes) == len(original)
+    assert mutated_bytes != original
+
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+    _open_count_content_swap(
+        monkeypatch, head_path, swap_on_open_number=2, new_content=mutated_bytes
+    )
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+
+def test_protected_git_metadata_inode_replacement_after_member_ctime_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """First attempt: HEAD is timestamp-only unstable (recorded). Before the
+    retry's read completes, HEAD is replaced (unlink + recreate, a new
+    inode) with byte-identical content. Must still fail closed: inode
+    identity, not just content, is load-bearing."""
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    original = head_path.read_bytes()
+
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            if state["opens"] == 2:
+                head_path.unlink()
+                head_path.write_bytes(original)  # byte-identical, new inode
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws)
+
+
+def test_protected_git_metadata_root_gitfile_transient_retry_shares_global_attempt_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The pre-existing root-.git-entry transient-retry regression, rerun
+    to confirm it still passes unchanged under the new shared attempt
+    budget (this is the same scenario as
+    test_protected_git_metadata_bounded_retry_recovers_from_transient_timestamp_only_instability,
+    kept here to anchor requirement F explicitly)."""
+
+    ws = make_workspace(tmp_path)
+    entry_path = str((ws / ".git").resolve())
+    sequence = iter(
+        [
+            _synthetic_git_entry(path=entry_path, mtime_ns=100, ctime_ns=100),
+            _synthetic_git_entry(path=entry_path, mtime_ns=200, ctime_ns=200),
+            _synthetic_git_entry(path=entry_path, mtime_ns=300, ctime_ns=300),
+            _synthetic_git_entry(path=entry_path, mtime_ns=300, ctime_ns=300),
+        ]
+    )
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", lambda cwd, **kwargs: next(sequence))
+
+    result = run_review.protected_git_metadata_snapshot(ws)
+
+    assert result
+
+
+def test_protected_git_metadata_mixed_root_and_member_instability_shares_one_budget(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Root-entry instability that resolves within attempt 1, followed by
+    member-file (HEAD) instability during attempt 2, must still consume
+    from the same shared 3-attempt total budget -- not 3 root retries
+    times 3 member retries -- and succeed by the 3rd attempt.
+
+    `ws` is an ordinary (non-linked-worktree) repository, so `git_dir` and
+    `git_common_dir` are the same physical directory and a fully coherent
+    attempt walks it twice (once per role) -- HEAD is therefore measured
+    twice per attempt when nothing aborts early. Root instability is
+    forced for exactly one attempt via the same synthetic-sequence
+    technique as the pre-existing root-entry tests (both the "before" and
+    "after" calls of attempt 1 are satisfied from the synthetic sequence,
+    so attempt 1's tree walk runs for real and completes coherently).
+    Member instability is then targeted at the *second* attempt's tree
+    walk specifically, so it lands after root has already resolved.
+    """
+
+    ws = make_workspace(tmp_path)
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+
+    entry_path = str((ws / ".git").resolve())
+    real_entry_descriptor = run_review._workspace_git_entry_descriptor
+    root_sequence = iter(
+        [
+            _synthetic_git_entry(path=entry_path, mtime_ns=1, ctime_ns=1),  # attempt 1 before
+            _synthetic_git_entry(path=entry_path, mtime_ns=2, ctime_ns=2),  # attempt 1 after (timestamp-only)
+        ]
+    )
+
+    def entry_descriptor_stub(cwd: Path, **kwargs: object) -> tuple[str, str]:
+        try:
+            return next(root_sequence)
+        except StopIteration:
+            return real_entry_descriptor(cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_workspace_git_entry_descriptor", entry_descriptor_stub)
+
+    tree_walk_calls = {"n": 0}
+    real_snapshot_tree = run_review.snapshot_type_aware_tree
+
+    def counting_snapshot_tree(root: Path, **kwargs: object) -> dict[str, str]:
+        tree_walk_calls["n"] += 1
+        return real_snapshot_tree(root, **kwargs)
+
+    monkeypatch.setattr(run_review, "snapshot_type_aware_tree", counting_snapshot_tree)
+
+    # Attempt 1's tree walk measures HEAD coherently twice (calls 1-4 and
+    # 5-8, one per role). Attempt 2's first (git_dir) measurement of HEAD
+    # begins at call 9; its "opened" observation is call 10.
+    state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={10})
+
+    result = run_review.protected_git_metadata_snapshot(ws)
+
+    assert result
+    assert state["calls"] > 8  # member instability was actually exercised
+    # Two tree-walk roles per attempt, three attempts total: never more
+    # than a flat 2x3 budget, regardless of mixing root- and member-level
+    # instability sources (never a nested 3x3 multiplication).
+    assert tree_walk_calls["n"] <= 2 * run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS
+
+
+def test_protected_git_metadata_cross_phase_timestamp_stability_still_passes(
+    tmp_path: Path,
+) -> None:
+    """The original cross-phase-projection regression, rerun to confirm it
+    remains unaffected by the intra-measurement retry mechanism added
+    above (requirement H)."""
+
+    ws = make_workspace(tmp_path)
+    before = run_review.protected_git_metadata_snapshot(ws)
+    index_path = run_review.git_dir(ws) / "index"
+    os.utime(index_path, None)
+    after = run_review.protected_git_metadata_snapshot(ws)
+    assert after == before
 
 
 def test_capability_probe_linked_worktree_gitfile_mutation_is_rejected(
