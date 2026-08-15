@@ -212,7 +212,9 @@ def _derive_final_workspace_evidence(
         allowed_side_effect_paths,
     )
     try:
-        final_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+        final_git_metadata = run_review.protected_git_metadata_snapshot(
+            workspace, trusted_baseline=baseline_git_metadata
+        )
     except run_review.EvidenceIntegrityFailure:
         final_git_metadata = {}
     git_metadata_changed_paths = (
@@ -922,7 +924,9 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
         codex_contract = run_review.resolve_codex_contract(args.codex_executable)
     except run_review.PreflightFailure as exc:
         codex_contract_failure = exc
-    capability_probe_after = _snapshot_workspace_for_review(workspace)
+    capability_probe_after = _snapshot_workspace_for_review(
+        workspace, trusted_git_metadata_baseline=capability_probe_before[5]
+    )
     if capability_probe_after != capability_probe_before:
         raise PreflightBlocked(
             "IMMUTABILITY_VIOLATION",
@@ -1253,7 +1257,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         )
         review_run_ids.append(review1_id)
         _record_child_evidence(review1_id, review1["run_directory"])
-        post_review1_snapshot = _snapshot_workspace_for_review(workspace)
+        post_review1_snapshot = _snapshot_workspace_for_review(
+            workspace, trusted_git_metadata_baseline=pre_review1_snapshot[5]
+        )
         review1_observation = _review_preservation_evidence(
             attempt=1,
             workspace=workspace,
@@ -1290,7 +1296,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         verdict1 = extract_validated_verdict(review1)
         workspace_preserved_during_reviews = review1_preserved
         post_review1_state_preserved = (
-            _snapshot_workspace_for_review(workspace) == post_review1_snapshot
+            _snapshot_workspace_for_review(
+                workspace, trusted_git_metadata_baseline=post_review1_snapshot[5]
+            )
+            == post_review1_snapshot
         )
         review1_observation["post_review_state_preserved"] = (
             post_review1_state_preserved
@@ -1539,7 +1548,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         )
         review_run_ids.append(review2_id)
         _record_child_evidence(review2_id, review2["run_directory"])
-        post_review2_snapshot = _snapshot_workspace_for_review(workspace)
+        post_review2_snapshot = _snapshot_workspace_for_review(
+            workspace, trusted_git_metadata_baseline=pre_review2_snapshot[5]
+        )
         review2_observation = _review_preservation_evidence(
             attempt=2,
             workspace=workspace,
@@ -1576,7 +1587,10 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
         verdict2 = extract_validated_verdict(review2)
         post_review2_state_preserved = (
-            _snapshot_workspace_for_review(workspace) == post_review2_snapshot
+            _snapshot_workspace_for_review(
+                workspace, trusted_git_metadata_baseline=post_review2_snapshot[5]
+            )
+            == post_review2_snapshot
         )
         review2_observation["post_review_state_preserved"] = (
             post_review2_state_preserved
@@ -1715,10 +1729,23 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
 
 def _snapshot_workspace_for_review(
     workspace: Path,
+    *,
+    trusted_git_metadata_baseline: dict[str, str] | None = None,
 ) -> tuple[str, dict[str, str], bool, str | None, str | None, dict[str, str]]:
+    """`trusted_git_metadata_baseline`, when given, must be the protected
+    git_metadata component (index 5) of a `_snapshot_workspace_for_review()`
+    call already known to be part of a coherent pair -- e.g. the "before"
+    half of a before/probe/after sequence -- never a value produced by this
+    same call. It is the only thing that can make a same-window
+    timestamp-only measurement instability retry-eligible instead of
+    failing closed; see `run_review.protected_git_metadata_snapshot`.
+    """
+
     head = run_review.git_rev_parse(workspace, "HEAD") or ""
     try:
-        git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+        git_metadata = run_review.protected_git_metadata_snapshot(
+            workspace, trusted_baseline=trusted_git_metadata_baseline
+        )
     except run_review.EvidenceIntegrityFailure:
         git_metadata = {}
     return (
@@ -1869,7 +1896,7 @@ def _finalize(
     duration_ms = _elapsed_ms(started_at, finished_at)
     try:
         fallback_final_git_metadata = run_review.protected_git_metadata_snapshot(
-            workspace
+            workspace, trusted_baseline=baseline_git_metadata
         )
     except run_review.EvidenceIntegrityFailure:
         fallback_final_git_metadata = {}

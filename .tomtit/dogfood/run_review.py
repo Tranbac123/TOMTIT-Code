@@ -100,6 +100,18 @@ _CANONICAL_FILE_DESCRIPTOR_RE = re.compile(
     r"mtime_ns=" + _CANONICAL_INT + r":ctime_ns=" + _CANONICAL_INT + r":"
     r"sha256=(?P<sha256>[0-9a-f]{64})"
 )
+# The *stable cross-phase projection* of a `file:` descriptor -- i.e. what
+# `_strip_volatile_timestamp_fields` actually returns, and therefore what a
+# trusted_baseline value (the return of a prior `protected_git_metadata_snapshot()`
+# call) really looks like: identical to `_CANONICAL_FILE_DESCRIPTOR_RE` but
+# with the `mtime_ns=...:ctime_ns=...` segment entirely absent, never merely
+# optional -- a projected value can never legitimately carry it.
+_STABLE_FILE_DESCRIPTOR_RE = re.compile(
+    r"file:dev=(?P<dev>" + _CANONICAL_INT + r"):ino=(?P<ino>" + _CANONICAL_INT + r"):"
+    r"mode=(?P<mode>[0-7]{4}):size=(?P<size>" + _CANONICAL_INT + r"):"
+    r"nlink=(?P<nlink>" + _CANONICAL_INT + r"):"
+    r"sha256=(?P<sha256>[0-9a-f]{64})"
+)
 
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")
 VALID_SEVERITIES = ("HIGH", "MEDIUM", "LOW")
@@ -214,48 +226,33 @@ class ProcessQuiescenceFailure(Exception):
     """A controlled subprocess group could not be positively proven absent."""
 
 
-class TimestampOnlyRegularFileInstability(Exception):
-    """A regular-file measurement observed a before/opened/closing/final stat
-    mismatch confined *exactly* to `mtime_ns`/`ctime_ns`: device, inode,
-    mode, size, nlink, and the actually-read content (SHA-256) all agreed
-    across every observation point. This is never returned as a successful
-    measurement -- it is not evidence that the object is unchanged, only
-    that no *semantic* mutation was observed this attempt. The caller (see
-    `protected_git_metadata_snapshot`) must retry the whole composite
-    snapshot from scratch, and validate any later reading of this same path
-    -- whether itself unstable again or fully coherent -- against the
-    nonvolatile identity recorded here before accepting it.
+@dataclasses.dataclass(frozen=True, slots=True)
+class TrustedRegularFileEvidence:
+    """Trusted per-path nonvolatile identity + content evidence for one
+    regular file, sourced *only* from a previously successful, fully
+    coherent `protected_git_metadata_snapshot()` call -- never from an
+    unstable reading observed during the *current* call. `mtime_ns`/
+    `ctime_ns` are deliberately absent: they are exactly the two fields a
+    timestamp-only instability is allowed to differ on.
 
-    Only raised when a caller explicitly opts in via
-    `tolerate_timestamp_only_instability=True`; every other caller of
-    `_regular_file_measurement` (in particular canonical evidence reading)
-    is completely unaffected and keeps failing closed on any mismatch,
-    exactly as before.
+    This is the fix for the reproduced proof gap where an unstable
+    attempt's own SHA was (incorrectly) trusted as a baseline for a later
+    retry within the *same* call: a same-size, same-inode, same-mode
+    content mutation occurring immediately before the first read would
+    then pass as "coherent," because both readings agreed with each
+    other -- while neither was ever checked against genuinely
+    pre-mutation content. Comparison must be against evidence from
+    *outside* the current call.
     """
 
-    def __init__(
-        self,
-        *,
-        path: str,
-        dev: int,
-        ino: int,
-        mode: int,
-        size: int,
-        nlink: int,
-        sha256: str,
-    ) -> None:
-        super().__init__(
-            f"regular file measurement observed a timestamp-only stat difference: {path}"
-        )
-        self.path = path
-        self.dev = dev
-        self.ino = ino
-        self.mode = mode
-        self.size = size
-        self.nlink = nlink
-        self.sha256 = sha256
+    dev: int
+    ino: int
+    mode: int
+    size: int
+    nlink: int
+    sha256: str
 
-    def matches_nonvolatile_identity(
+    def matches(
         self,
         *,
         dev: int,
@@ -275,6 +272,78 @@ class TimestampOnlyRegularFileInstability(Exception):
             and self.nlink == nlink
             and self.sha256 == sha256
         )
+
+
+def _parse_trusted_file_descriptor(descriptor: str) -> TrustedRegularFileEvidence | None:
+    """Safely extract trusted per-file evidence from a stable-projected
+    identity descriptor string -- i.e. a value out of a `trusted_baseline`
+    mapping, which is always the *return value* of a prior
+    `protected_git_metadata_snapshot()` call and therefore already has its
+    `mtime_ns`/`ctime_ns` fields stripped (see `_STABLE_FILE_DESCRIPTOR_RE`).
+    Uses the same approved, exact `fullmatch()`-anchored parsing style
+    `_strip_volatile_timestamp_fields` relies on -- never an ad-hoc or
+    partial parse. Returns `None` for anything that is not byte-for-byte a
+    stable-projected `file:` descriptor (a `dir:`/`path:`/`symlink:` entry,
+    or any non-canonical text): there is no content evidence to trust for
+    those, by construction.
+    """
+
+    match = _STABLE_FILE_DESCRIPTOR_RE.fullmatch(descriptor)
+    if match is None:
+        return None
+    fields = match.groupdict()
+    return TrustedRegularFileEvidence(
+        dev=int(fields["dev"]),
+        ino=int(fields["ino"]),
+        mode=int(fields["mode"], 8),
+        size=int(fields["size"]),
+        nlink=int(fields["nlink"]),
+        sha256=fields["sha256"],
+    )
+
+
+class TimestampOnlyRegularFileInstability(Exception):
+    """A regular-file measurement observed a before/opened/closing/final stat
+    mismatch confined *exactly* to `mtime_ns`/`ctime_ns`, where the actually
+    -read content and every other nonvolatile field were verified to match
+    *trusted* evidence from a prior coherent snapshot (see
+    `TrustedRegularFileEvidence`). This is never returned as a successful
+    measurement -- it is a diagnostic, retry-triggering signal only. The
+    caller (`protected_git_metadata_snapshot`) retries the whole composite
+    snapshot from scratch; this exception carries no authority of its own
+    and is never itself used as evidence for a later attempt.
+
+    Only raised when a caller explicitly opts in via
+    `tolerate_timestamp_only_instability=True` *and* supplies matching
+    `trusted_evidence`; every other caller of `_regular_file_measurement`
+    (in particular canonical evidence reading, and any timestamp-only
+    instability with no trusted evidence available) is completely
+    unaffected and keeps failing closed on any mismatch.
+    """
+
+    def __init__(
+        self,
+        *,
+        path: str,
+        dev: int,
+        ino: int,
+        mode: int,
+        size: int,
+        nlink: int,
+        sha256: str,
+        changed_fields: tuple[str, ...] = ("mtime_ns", "ctime_ns"),
+    ) -> None:
+        super().__init__(
+            f"regular file measurement observed a timestamp-only stat difference: {path}"
+        )
+        self.path = path
+        self.dev = dev
+        self.ino = ino
+        self.mode = mode
+        self.size = size
+        self.nlink = nlink
+        self.sha256 = sha256
+        self.changed_fields = changed_fields
 
 
 # ---------------------------------------------------------------------------
@@ -395,7 +464,7 @@ def _regular_file_measurement(
     reject_hardlinks: bool,
     capture_bytes: bool,
     tolerate_timestamp_only_instability: bool = False,
-    previous_instability: TimestampOnlyRegularFileInstability | None = None,
+    trusted_evidence: TrustedRegularFileEvidence | None = None,
 ) -> tuple[str, bytes | None]:
     """Measure one regular file's identity and content across a single pass.
 
@@ -410,19 +479,28 @@ def _regular_file_measurement(
     (only `protected_git_metadata_snapshot` does), a mismatch confined
     *exactly* to `mtime_ns`/`ctime_ns` -- device, inode, mode, size, nlink,
     and type all agree at every observation point, and the full content was
-    read and hashed without a byte-count discrepancy -- raises
-    `TimestampOnlyRegularFileInstability` instead of failing closed. Any
-    other mismatch (a real semantic change) still fails closed exactly as
-    in the default case; this parameter only ever narrows what triggers a
-    hard failure, never removes a check.
+    read and hashed without a byte-count discrepancy -- is *provisionally*
+    eligible for tolerance. It is never accepted on that basis alone:
 
-    `previous_instability`, when given, is a `TimestampOnlyRegularFileInstability`
-    a *prior* measurement of this same path already reported. Regardless of
-    whether this attempt is internally coherent or unstable again, its
-    nonvolatile identity (device, inode, mode, size, nlink, SHA-256) is
-    validated against that prior evidence first; a mismatch fails closed
-    immediately -- a real mutation between coherent-measurement retry
-    attempts is never silently accepted as the new baseline.
+    - if `trusted_evidence` is `None` (no previously successful *coherent*
+      snapshot exists to compare against), tolerance is refused and this
+      still fails closed. There is no trusted pre-instability content to
+      prove the unstable reading against, so an unstable reading can never
+      establish its own baseline -- this is the fix for the reproduced
+      counterexample where a same-size content mutation immediately before
+      the read (A -> B) would otherwise pass simply because the unstable
+      reading and a later retry both happened to agree *with each other*.
+    - if `trusted_evidence` is given, the bytes actually read this attempt
+      (device, inode, mode, size, nlink, SHA-256) are compared against it.
+      Any mismatch -- including, decisively, a different SHA-256 -- fails
+      closed immediately. Only when every field matches does this raise
+      `TimestampOnlyRegularFileInstability`, a diagnostic retry-eligible
+      signal (never treated as evidence of anything itself).
+
+    Any non-timestamp-only mismatch (a real semantic change) still fails
+    closed exactly as in the default case regardless of `trusted_evidence`;
+    none of this ever removes a check, only narrows what -- given genuinely
+    trusted external proof -- does not have to be a hard failure.
     """
 
     if reject_hardlinks and metadata.st_nlink != 1:
@@ -504,21 +582,25 @@ def _regular_file_measurement(
             raise EvidenceIntegrityFailure(
                 f"regular file identity changed during measurement: {path.name}"
             )
-
-    if previous_instability is not None and not previous_instability.matches_nonvolatile_identity(
-        dev=opened.st_dev,
-        ino=opened.st_ino,
-        mode=opened.st_mode,
-        size=opened.st_size,
-        nlink=opened.st_nlink,
-        sha256=sha256_hex,
-    ):
-        raise EvidenceIntegrityFailure(
-            "regular file content or identity changed between coherent-measurement "
-            f"retry attempts: {path.name}"
-        )
-
-    if not intra_measurement_coherent:
+        # Provisionally timestamp-only. Never accepted on that basis alone:
+        # it must be proven against evidence from outside this call.
+        if trusted_evidence is None:
+            raise EvidenceIntegrityFailure(
+                "regular file timestamp-only instability has no trusted prior "
+                f"coherent evidence to validate against: {path.name}"
+            )
+        if not trusted_evidence.matches(
+            dev=opened.st_dev,
+            ino=opened.st_ino,
+            mode=stat.S_IMODE(opened.st_mode),
+            size=opened.st_size,
+            nlink=opened.st_nlink,
+            sha256=sha256_hex,
+        ):
+            raise EvidenceIntegrityFailure(
+                "regular file content or identity does not match trusted prior "
+                f"coherent evidence: {path.name}"
+            )
         raise TimestampOnlyRegularFileInstability(
             path=str(path),
             dev=opened.st_dev,
@@ -553,8 +635,7 @@ def _measure_type_aware_tree(
     reject_hardlinks: bool,
     capture_files: frozenset[str] = frozenset(),
     tolerate_regular_file_timestamp_only_instability: bool = False,
-    previous_regular_file_instabilities: Mapping[str, TimestampOnlyRegularFileInstability]
-    | None = None,
+    trusted_regular_file_baseline: Mapping[str, str] | None = None,
 ) -> CanonicalEvidenceSnapshot:
     """Measure a tree without following aliases, revalidating every live path.
 
@@ -562,9 +643,17 @@ def _measure_type_aware_tree(
     identity must match exactly across the walk regardless of the two
     tolerance parameters below, which apply only to regular-file members
     (see `_regular_file_measurement`).
+
+    `trusted_regular_file_baseline`, when given, maps each relative member
+    key (the same key used in the returned identity dict, e.g. `"HEAD"` or
+    `"refs/heads/main"`) to that path's canonical `file:` descriptor string
+    from a previously successful, fully coherent tree measurement -- never
+    from the current call. It is parsed with the same approved, exact
+    canonical-grammar `fullmatch()` parser used elsewhere
+    (`_parse_trusted_file_descriptor`), never with an ad-hoc partial parse.
     """
 
-    previous_instabilities = previous_regular_file_instabilities or {}
+    trusted_baseline = trusted_regular_file_baseline or {}
 
     try:
         root_metadata = root.lstat()
@@ -616,13 +705,18 @@ def _measure_type_aware_tree(
                 identity[key] = _directory_descriptor(metadata)
                 visit(entry_path, entry_relative, metadata)
             elif stat.S_ISREG(metadata.st_mode):
+                trusted_descriptor = trusted_baseline.get(key)
                 descriptor, content = _regular_file_measurement(
                     entry_path,
                     metadata,
                     reject_hardlinks=reject_hardlinks,
                     capture_bytes=key in capture_files,
                     tolerate_timestamp_only_instability=tolerate_regular_file_timestamp_only_instability,
-                    previous_instability=previous_instabilities.get(str(entry_path)),
+                    trusted_evidence=(
+                        _parse_trusted_file_descriptor(trusted_descriptor)
+                        if trusted_descriptor is not None
+                        else None
+                    ),
                 )
                 identity[key] = descriptor
                 if content is not None:
@@ -654,8 +748,7 @@ def snapshot_type_aware_tree(
     reject_symlinks: bool,
     reject_hardlinks: bool,
     tolerate_regular_file_timestamp_only_instability: bool = False,
-    previous_regular_file_instabilities: Mapping[str, TimestampOnlyRegularFileInstability]
-    | None = None,
+    trusted_regular_file_baseline: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Return an lstat-based, non-following identity for one exact filesystem tree."""
 
@@ -664,7 +757,7 @@ def snapshot_type_aware_tree(
         reject_symlinks=reject_symlinks,
         reject_hardlinks=reject_hardlinks,
         tolerate_regular_file_timestamp_only_instability=tolerate_regular_file_timestamp_only_instability,
-        previous_regular_file_instabilities=previous_regular_file_instabilities,
+        trusted_regular_file_baseline=trusted_regular_file_baseline,
     ).identity
 
 
@@ -790,14 +883,15 @@ def _workspace_git_entry_descriptor(
     cwd: Path,
     *,
     tolerate_timestamp_only_instability: bool = False,
-    previous_instabilities: Mapping[str, TimestampOnlyRegularFileInstability] | None = None,
+    trusted_evidence: TrustedRegularFileEvidence | None = None,
 ) -> tuple[str, str]:
     """Measure the worktree-root .git entry without following aliases.
 
     A directory-typed root entry is never subject to timestamp tolerance
     (see `_measure_type_aware_tree`'s docstring); only the linked-worktree
     regular-indirection-file case can raise `TimestampOnlyRegularFileInstability`,
-    and only when the caller opts in.
+    and only when the caller opts in and supplies matching `trusted_evidence`
+    from a previously successful, fully coherent snapshot.
     """
 
     entry = cwd.resolve() / ".git"
@@ -816,7 +910,7 @@ def _workspace_git_entry_descriptor(
             reject_hardlinks=False,
             capture_bytes=False,
             tolerate_timestamp_only_instability=tolerate_timestamp_only_instability,
-            previous_instability=(previous_instabilities or {}).get(str(entry)),
+            trusted_evidence=trusted_evidence,
         )
     else:
         raise EvidenceIntegrityFailure(
@@ -843,7 +937,11 @@ def workspace_git_entry_hash_from_snapshot(snapshot: Mapping[str, str]) -> str:
     )
 
 
-def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
+def protected_git_metadata_snapshot(
+    cwd: Path,
+    *,
+    trusted_baseline: Mapping[str, str] | None = None,
+) -> dict[str, str]:
     """Cross-phase-stable snapshot of protected Git metadata.
 
     Snapshots the root `.git` entry plus the actual per-worktree/common
@@ -874,26 +972,59 @@ def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
     member file -- a different path, device, inode, mode, size, nlink, or
     content -- also fails closed immediately, exactly as before.
 
-    A difference confined *exactly* to `mtime_ns`/`ctime_ns`, whether at the
-    root entry or in a member file measured via
-    `TimestampOnlyRegularFileInstability`, does not fail the whole snapshot
-    immediately. It bounded-retries the *entire* composite measurement from
-    scratch -- never a partial tree or a previously successful subtree --
-    capped at `_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS` *total*
-    attempts shared across every source of instability, root or member,
-    however many distinct paths are involved. A later reading of any path
-    that previously reported timestamp-only instability is validated
-    against that path's first unstable reading on every nonvolatile field
-    before being accepted; a mismatch (the file actually changed between
-    retry attempts) fails closed immediately rather than being silently
-    accepted as a new baseline. Persistent timestamp-only instability across
-    every attempt also fails closed once the bound is exhausted.
+    A difference confined *exactly* to `mtime_ns`/`ctime_ns` in a member
+    file is never accepted on its own -- an unstable reading can never
+    prove its own past. It is validated against `trusted_baseline`: the
+    *stable-projected return value of a previously successful, fully
+    coherent call to this same function* (e.g. the "before" snapshot of a
+    before/probe/after sequence), never anything produced during the
+    current call. If `trusted_baseline` is `None`, or has no entry for the
+    affected path, there is no trusted pre-instability content to prove
+    the reading against, so the measurement fails closed immediately --
+    this is what keeps the very first ("initial") snapshot in any sequence
+    honestly fail-closed rather than silently self-baselining. If
+    `trusted_baseline` does have an entry for that path, every load-bearing
+    field of the unstable reading -- including, decisively, its SHA-256 --
+    must match it exactly; any mismatch fails closed immediately (this is
+    what closes a same-size, same-inode, same-mode content mutation
+    occurring immediately before the read: the unstable reading's SHA no
+    longer matches the trusted evidence, even though a later retry might
+    coherently reproduce the *mutated* content). Only when the trusted
+    evidence matches does the whole composite measurement bounded-retry
+    from scratch -- never a partial tree or a previously successful
+    subtree -- capped at `_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS`
+    *total* attempts shared across every source of instability, root or
+    member, however many distinct paths are involved; a different path
+    becoming unstable on a later attempt is validated against its own
+    entry in the same constant `trusted_baseline`, independent of any
+    other path. Persistent timestamp-only instability across every attempt
+    still fails closed once the bound is exhausted, exactly as before.
+
+    The root `.git` entry's own before/after comparison (only meaningful
+    when it is a linked-worktree regular-indirection file) is unaffected
+    architecturally: it still compares two readings taken within this same
+    call, each of which independently goes through the same trusted-baseline
+    proof above before being tolerated as timestamp-only.
 
     Directory measurement is never relaxed by any of this (see
     `_measure_type_aware_tree`).
     """
 
-    observed_instabilities: dict[str, TimestampOnlyRegularFileInstability] = {}
+    root_trusted_evidence = (
+        _parse_trusted_file_descriptor(trusted_baseline[_WORKSPACE_GIT_ENTRY_KEY])
+        if trusted_baseline is not None and _WORKSPACE_GIT_ENTRY_KEY in trusted_baseline
+        else None
+    )
+    tree_trusted_baselines: dict[str, dict[str, str]] = {}
+    if trusted_baseline is not None:
+        for role in ("git_dir", "git_common_dir"):
+            prefix = f"{role}/"
+            tree_trusted_baselines[role] = {
+                key[len(prefix) :]: value
+                for key, value in trusted_baseline.items()
+                if key.startswith(prefix)
+            }
+
     last_error: EvidenceIntegrityFailure | None = None
 
     for _ in range(_PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS):
@@ -901,7 +1032,7 @@ def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
             git_entry_before = _workspace_git_entry_descriptor(
                 cwd,
                 tolerate_timestamp_only_instability=True,
-                previous_instabilities=observed_instabilities,
+                trusted_evidence=root_trusted_evidence,
             )
             directory = git_dir(cwd)
             common_directory = git_common_dir(cwd)
@@ -923,36 +1054,23 @@ def protected_git_metadata_snapshot(cwd: Path) -> dict[str, str]:
                     reject_symlinks=True,
                     reject_hardlinks=False,
                     tolerate_regular_file_timestamp_only_instability=True,
-                    previous_regular_file_instabilities=observed_instabilities,
+                    trusted_regular_file_baseline=tree_trusted_baselines.get(role),
                 )
                 for relative, descriptor in tree.items():
                     identity[f"{role}/{relative}"] = descriptor
             git_entry_after = _workspace_git_entry_descriptor(
                 cwd,
                 tolerate_timestamp_only_instability=True,
-                previous_instabilities=observed_instabilities,
+                trusted_evidence=root_trusted_evidence,
             )
         except TimestampOnlyRegularFileInstability as exc:
-            previous = observed_instabilities.get(exc.path)
-            if previous is not None and not exc.matches_nonvolatile_identity(
-                dev=previous.dev,
-                ino=previous.ino,
-                mode=previous.mode,
-                size=previous.size,
-                nlink=previous.nlink,
-                sha256=previous.sha256,
-            ):
-                raise EvidenceIntegrityFailure(
-                    "protected Git metadata member changed between coherent-measurement "
-                    f"retry attempts: {exc.path}"
-                ) from None
-            observed_instabilities[exc.path] = exc
             last_error = EvidenceIntegrityFailure(
                 "protected Git metadata member timestamp remained unstable across the "
                 f"bounded coherent-measurement retry limit: {exc.path}"
             )
-            # Timestamp-only same-window instability in a member file:
-            # bounded-retry the whole composite measurement from scratch.
+            # Timestamp-only same-window instability in a member file,
+            # already proven against trusted_baseline: bounded-retry the
+            # whole composite measurement from scratch.
             continue
 
         entry_changed = git_entry_after != git_entry_before
@@ -2257,7 +2375,9 @@ def main(
 
     capability_probe_hashes = snapshot_workspace_hashes(workspace)
     try:
-        capability_probe_git_metadata = protected_git_metadata_snapshot(workspace)
+        capability_probe_git_metadata = protected_git_metadata_snapshot(
+            workspace, trusted_baseline=review_entry_git_metadata
+        )
     except EvidenceIntegrityFailure:
         capability_probe_git_metadata = {}
     capability_probe_git_metadata_hash = workspace_hash(capability_probe_git_metadata)
@@ -2307,7 +2427,9 @@ def main(
     post_check_head = git_rev_parse(workspace, "HEAD") or ""
     post_check_index_identity = git_index_identity(workspace) or ""
     try:
-        post_check_git_metadata = protected_git_metadata_snapshot(workspace)
+        post_check_git_metadata = protected_git_metadata_snapshot(
+            workspace, trusted_baseline=capability_probe_git_metadata
+        )
     except EvidenceIntegrityFailure:
         post_check_git_metadata = {}
     post_check_git_metadata_hash = workspace_hash(post_check_git_metadata)
@@ -2402,7 +2524,9 @@ def main(
         review_exit_hashes = snapshot_workspace_hashes(workspace)
         review_exit_head = git_rev_parse(workspace, "HEAD") or ""
         try:
-            review_exit_git_metadata = protected_git_metadata_snapshot(workspace)
+            review_exit_git_metadata = protected_git_metadata_snapshot(
+                workspace, trusted_baseline=post_check_git_metadata
+            )
         except EvidenceIntegrityFailure:
             review_exit_git_metadata = {}
         review_exit_git_metadata_hash = workspace_hash(review_exit_git_metadata)

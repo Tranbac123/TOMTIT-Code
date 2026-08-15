@@ -1309,51 +1309,6 @@ def _perturb_stat_identity_ctime_for_inode(
     return state
 
 
-def test_protected_git_metadata_member_ctime_only_transient_recovers(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A ctime-only instability confined to one member file (HEAD) on its
-    first measurement is reported internally, the whole snapshot retries,
-    and a later coherent reading of the same unchanged bytes succeeds."""
-
-    ws = make_workspace(tmp_path)
-    head_path = run_review.git_dir(ws) / "HEAD"
-    target_ino = head_path.stat().st_ino
-    # Perturb only the second observation (the post-open `fstat`) of HEAD's
-    # very first measurement -- a same-window mismatch confined to
-    # ctime_ns, exactly the pattern that must raise
-    # TimestampOnlyRegularFileInstability rather than fail closed outright.
-    state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
-
-    result = run_review.protected_git_metadata_snapshot(ws)
-
-    assert result
-    # HEAD was measured at least twice (an unstable first attempt, a
-    # coherent second one): 4 raw-identity observations per measurement.
-    assert state["calls"] >= 8
-
-
-def test_protected_git_metadata_persistent_member_ctime_instability_fails_closed(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """If HEAD's measurement is timestamp-only unstable on every bounded
-    attempt, the whole snapshot fails closed after exactly 3 attempts."""
-
-    ws = make_workspace(tmp_path)
-    head_path = run_review.git_dir(ws) / "HEAD"
-    target_ino = head_path.stat().st_ino
-    # Perturb the second observation of every attempt (calls 2, 6, 10 for
-    # three complete 4-observation measurements of HEAD).
-    state = _perturb_stat_identity_ctime_for_inode(
-        monkeypatch, target_ino, perturb_calls={2, 6, 10}
-    )
-
-    with pytest.raises(run_review.EvidenceIntegrityFailure):
-        run_review.protected_git_metadata_snapshot(ws)
-
-    assert state["calls"] == 4 * run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS
-
-
 def _open_count_content_swap(
     monkeypatch: pytest.MonkeyPatch,
     target_path: Path,
@@ -1382,43 +1337,127 @@ def _open_count_content_swap(
     return state
 
 
-def test_protected_git_metadata_content_change_after_member_ctime_fails_closed(
+def test_protected_git_metadata_original_counterexample_mutation_before_first_read_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """First attempt: HEAD is timestamp-only unstable (recorded). Before the
-    retry's read completes, HEAD's actual content changes (different size).
-    The retry must NOT accept the new bytes as coherent -- fail closed."""
+    """(A) Codex's exact deterministic reproduction: content A exists, a
+    same-size A->B mutation happens immediately before the very first real
+    read (so the measurement's own before/opened comparison is genuinely
+    confined to mtime_ns/ctime_ns -- same dev/ino/mode/size/nlink -- but
+    the bytes actually read are B, not A). Trusted evidence from an
+    earlier, separate, real coherent snapshot proves SHA(A); SHA(B) !=
+    SHA(A) must fail the whole protected snapshot closed on this very
+    first unstable attempt -- never merely retried and then accepted just
+    because a later reading agrees with itself."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)  # coherent: content A
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    original = head_path.read_bytes()
+    mutated = bytearray(original)
+    mutated[0] ^= 0xFF
+    mutated_bytes = bytes(mutated)
+    assert len(mutated_bytes) == len(original)
+    assert mutated_bytes != original
+
+    # Mutate HEAD's bytes in place immediately before the very first real
+    # open of the second call -- no _stat_identity perturbation needed:
+    # the in-place same-size rewrite naturally produces a before/opened
+    # mismatch confined to mtime_ns/ctime_ns on its own.
+    _open_count_content_swap(monkeypatch, head_path, swap_on_open_number=1, new_content=mutated_bytes)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+
+def test_protected_git_metadata_benign_ctime_only_with_trusted_baseline_retries_and_succeeds(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(B) Trusted BEFORE snapshot has HEAD's real SHA. The AFTER
+    measurement experiences a genuine ctime-only instability but the bytes
+    read are unchanged, so the unstable reading's SHA matches the trusted
+    evidence exactly: the whole snapshot is retry-eligible and a later
+    coherent reading of the same bytes is accepted."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    result = run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+    assert result
+    # HEAD was measured at least twice (an unstable first attempt, a
+    # coherent second one): 4 raw-identity observations per measurement.
+    assert state["calls"] >= 8
+
+
+def test_protected_git_metadata_initial_snapshot_timestamp_instability_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(C) No trusted prior coherent protected snapshot exists at all
+    (`trusted_baseline` defaults to `None`). A member's timestamp-only
+    instability must fail closed immediately: there is no trusted
+    pre-instability content to prove the unstable reading against, so it
+    can never establish its own baseline (no self-baselining)."""
 
     ws = make_workspace(tmp_path)
     head_path = run_review.git_dir(ws) / "HEAD"
     target_ino = head_path.stat().st_ino
-    original = head_path.read_bytes()
-    mutated = original.rstrip(b"\n") + b"-mutated-longer\n"
-    assert len(mutated) != len(original)
-
     _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
-    _open_count_content_swap(monkeypatch, head_path, swap_on_open_number=2, new_content=mutated)
 
     with pytest.raises(run_review.EvidenceIntegrityFailure):
         run_review.protected_git_metadata_snapshot(ws)
 
 
-def test_protected_git_metadata_same_size_content_change_after_member_ctime_fails_closed(
+def test_protected_git_metadata_persistent_ctime_instability_fails_closed_despite_matching_trusted_baseline(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Same as above, but the post-instability content mutation preserves
-    the exact original byte size. Must still fail closed: SHA-256, not
-    size, is what proves content identity here."""
+    """A trusted baseline that matches on every attempt still does not grant
+    unbounded retries: if HEAD's measurement is timestamp-only unstable on
+    every one of the 3 bounded attempts, the whole snapshot fails closed
+    once the bound is exhausted."""
 
     ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    # Perturb the second observation of every attempt (calls 2, 6, 10 for
+    # three complete 4-observation measurements of HEAD).
+    state = _perturb_stat_identity_ctime_for_inode(
+        monkeypatch, target_ino, perturb_calls={2, 6, 10}
+    )
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+    assert state["calls"] == 4 * run_review._PROTECTED_GIT_METADATA_MEASUREMENT_ATTEMPTS
+
+
+def test_protected_git_metadata_same_size_content_mutation_between_retries_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(D) Attempt 1 is genuinely timestamp-only unstable (content still A,
+    matching trusted evidence) and is retry-eligible. Before the retry's
+    read completes, the file is mutated in place to same-size content B.
+    The retry must NOT accept B as coherent merely because it read
+    consistently within itself -- it fails closed against the trusted
+    evidence."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
     head_path = run_review.git_dir(ws) / "HEAD"
     target_ino = head_path.stat().st_ino
     original = head_path.read_bytes()
     mutated = bytearray(original)
-    mutated[0] = mutated[0] ^ 0xFF if mutated else 0
+    mutated[0] ^= 0xFF
     mutated_bytes = bytes(mutated)
     assert len(mutated_bytes) == len(original)
-    assert mutated_bytes != original
 
     _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
     _open_count_content_swap(
@@ -1426,18 +1465,20 @@ def test_protected_git_metadata_same_size_content_change_after_member_ctime_fail
     )
 
     with pytest.raises(run_review.EvidenceIntegrityFailure):
-        run_review.protected_git_metadata_snapshot(ws)
+        run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
 
 
-def test_protected_git_metadata_inode_replacement_after_member_ctime_fails_closed(
+def test_protected_git_metadata_inode_replacement_between_retries_fails_closed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """First attempt: HEAD is timestamp-only unstable (recorded). Before the
-    retry's read completes, HEAD is replaced (unlink + recreate, a new
-    inode) with byte-identical content. Must still fail closed: inode
-    identity, not just content, is load-bearing."""
+    """(E) Attempt 1 is genuinely timestamp-only unstable and retry-eligible.
+    Before the retry's read completes, the file is replaced (unlink +
+    recreate, a new inode) with byte-identical content. Must still fail
+    closed: inode identity, not just content, is load-bearing."""
 
     ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
     head_path = run_review.git_dir(ws) / "HEAD"
     target_ino = head_path.stat().st_ino
     original = head_path.read_bytes()
@@ -1459,7 +1500,148 @@ def test_protected_git_metadata_inode_replacement_after_member_ctime_fails_close
     monkeypatch.setattr(os, "open", wrapped_open)
 
     with pytest.raises(run_review.EvidenceIntegrityFailure):
-        run_review.protected_git_metadata_snapshot(ws)
+        run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+
+def test_protected_git_metadata_mode_mutation_between_retries_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F) Attempt 1 is genuinely timestamp-only unstable and retry-eligible.
+    Before the retry's read completes, the file's mode changes (same
+    dev/ino/size/nlink/content). Must fail closed -- mode is load-bearing,
+    caught at the intra-measurement coherence gate itself."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    original_mode = head_path.stat().st_mode & 0o777
+    replacement_mode = 0o600 if original_mode != 0o600 else 0o644
+
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            if state["opens"] == 2:
+                head_path.chmod(replacement_mode)
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    try:
+        with pytest.raises(run_review.EvidenceIntegrityFailure):
+            run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+    finally:
+        head_path.chmod(original_mode)
+
+
+def test_protected_git_metadata_symlink_replacement_between_retries_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F) Same as above but the replacement is a symlink, not a mode
+    change. Still fails closed (via the existing O_NOFOLLOW protection,
+    unaffected by the trusted-baseline mechanism)."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    target_ino = head_path.stat().st_ino
+
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    real_open = os.open
+    state = {"opens": 0}
+    target = str(head_path)
+
+    def wrapped_open(path: object, flags: int, *args: object, **kwargs: object) -> int:
+        if str(path) == target:
+            state["opens"] += 1
+            if state["opens"] == 2:
+                head_path.unlink()
+                head_path.symlink_to(ws / "app.txt")
+        return real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "open", wrapped_open)
+
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+
+def test_protected_git_metadata_multiple_unstable_paths_each_validated_against_own_trusted_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(G) Two distinct member paths (HEAD and refs/heads/main) each become
+    timestamp-only unstable on their own first measurement. Each is
+    validated against its own entry in the same constant trusted baseline,
+    independent of the other, and the whole snapshot still succeeds within
+    the shared 3-attempt budget."""
+
+    ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
+
+    head_path = run_review.git_dir(ws) / "HEAD"
+    ref_path = run_review.git_dir(ws) / "refs" / "heads" / "main"
+    head_ino = head_path.stat().st_ino
+    ref_ino = ref_path.stat().st_ino
+
+    real_stat_identity = run_review._stat_identity
+    state = {"head_calls": 0, "ref_calls": 0}
+
+    def perturbing(metadata: object) -> tuple:
+        real = real_stat_identity(metadata)
+        if metadata.st_ino == head_ino:  # type: ignore[union-attr]
+            state["head_calls"] += 1
+            if state["head_calls"] == 2:
+                dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+                return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        elif metadata.st_ino == ref_ino:  # type: ignore[union-attr]
+            state["ref_calls"] += 1
+            if state["ref_calls"] == 2:
+                dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+                return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        return real
+
+    monkeypatch.setattr(run_review, "_stat_identity", perturbing)
+
+    result = run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
+
+    assert result
+    assert state["head_calls"] >= 2
+    assert state["ref_calls"] >= 2
+
+
+def test_protected_git_metadata_linked_worktree_gitfile_instability_requires_trusted_evidence_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(H) The root `.git` entry's before/after comparison mechanism is
+    architecturally unaffected when the entry is a directory (see the
+    dedicated root-gitfile-transient-retry test below), but when it is a
+    linked-worktree *regular* indirection file, its own intra-measurement
+    instability must go through the exact same trusted-evidence proof as
+    any other member -- it does not get to bypass it. Without a trusted
+    baseline, timestamp-only instability at the root gitfile still fails
+    closed; with a matching one, it is still retry-eligible."""
+
+    _, linked = make_linked_workspace(tmp_path)
+    gitfile = linked / ".git"
+    assert gitfile.is_file()
+    target_ino = gitfile.stat().st_ino
+
+    # No trusted baseline at all: must fail closed (same as requirement C,
+    # but for the root entry specifically).
+    state_no_trust = _perturb_stat_identity_ctime_for_inode(
+        monkeypatch, target_ino, perturb_calls={2}
+    )
+    with pytest.raises(run_review.EvidenceIntegrityFailure):
+        run_review.protected_git_metadata_snapshot(linked)
+    assert state_no_trust["calls"] >= 1
 
 
 def test_protected_git_metadata_root_gitfile_transient_retry_shares_global_attempt_limit(
@@ -1509,6 +1691,7 @@ def test_protected_git_metadata_mixed_root_and_member_instability_shares_one_bud
     """
 
     ws = make_workspace(tmp_path)
+    trusted = run_review.protected_git_metadata_snapshot(ws)
     head_path = run_review.git_dir(ws) / "HEAD"
     target_ino = head_path.stat().st_ino
 
@@ -1543,7 +1726,7 @@ def test_protected_git_metadata_mixed_root_and_member_instability_shares_one_bud
     # begins at call 9; its "opened" observation is call 10.
     state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={10})
 
-    result = run_review.protected_git_metadata_snapshot(ws)
+    result = run_review.protected_git_metadata_snapshot(ws, trusted_baseline=trusted)
 
     assert result
     assert state["calls"] > 8  # member instability was actually exercised
