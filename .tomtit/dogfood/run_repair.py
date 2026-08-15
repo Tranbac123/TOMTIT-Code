@@ -456,6 +456,58 @@ def _legacy_workspace_hash_with_root_gitfile(
     return workspace_hash(historical_hashes)
 
 
+def _load_trusted_review_projection(
+    review_receipt: dict[str, Any],
+    *,
+    expected_hash: str,
+) -> dict[str, str]:
+    """Load and verify the exact Review1 protected Git metadata projection.
+
+    This is the only `trusted_baseline` repair may ever pass to
+    `run_review.protected_git_metadata_snapshot()`: never a run-start
+    baseline, never a fresh `establish_protected_git_metadata_baseline()`
+    re-establishment, never an unstable current reading accepted on its
+    own. The projection is read from the same `review_receipt` dict whose
+    `workspace` / `implementation_run_id` / `implementation_attempt` /
+    `baseline_commit` fields `bind_review_to_implementation()` already
+    verified before this is ever called, so it inherits that same binding
+    for free -- but a receipt can only be trusted at all once its own
+    canonical evidence identity is intact (`load_review_evidence()`, via
+    `read_canonical_evidence()`, already guarantees that before any of this
+    module ever reads `review_receipt`).
+
+    Additionally bound here to the receipt's own already-`_is_sha256`-
+    validated `reviewed_protected_git_metadata_hash`: a projection that does
+    not hash to that exact value cannot be the one Review1 actually
+    measured, regardless of how it got here.
+    """
+
+    projection = review_receipt.get("reviewed_protected_git_metadata_projection")
+    if projection is None:
+        raise IntegrityFailure(
+            "REVIEWED_PROTECTED_PROJECTION_MISSING",
+            "review evidence has no reviewed protected Git metadata projection",
+        )
+    if (
+        not isinstance(projection, dict)
+        or not projection
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for key, value in projection.items()
+        )
+    ):
+        raise IntegrityFailure(
+            "REVIEWED_PROTECTED_PROJECTION_MALFORMED",
+            "review evidence protected Git metadata projection is not a well-formed string mapping",
+        )
+    if workspace_hash(projection) != expected_hash:
+        raise IntegrityFailure(
+            "REVIEWED_PROTECTED_PROJECTION_HASH_MISMATCH",
+            "review evidence protected Git metadata projection does not match its own bound hash",
+        )
+    return projection
+
+
 def prove_reviewed_state(
     *,
     workspace: Path,
@@ -520,15 +572,6 @@ def prove_reviewed_state(
     expected_git_entry_hash = review_receipt.get(
         "reviewed_workspace_git_entry_hash"
     )
-    try:
-        actual_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
-        actual_git_metadata_hash = workspace_hash(actual_git_metadata)
-        actual_git_entry_hash = run_review.workspace_git_entry_hash_from_snapshot(
-            actual_git_metadata
-        )
-    except run_review.EvidenceIntegrityFailure:
-        actual_git_metadata_hash = ""
-        actual_git_entry_hash = ""
     expected_git_special_state = review_receipt.get("reviewed_git_special_state")
     expected_baseline_commit = review_receipt.get("reviewed_baseline_commit")
     expected_allowed_source_paths = review_receipt.get(
@@ -589,6 +632,34 @@ def prove_reviewed_state(
             "PREVIOUS_EVIDENCE_INCOMPLETE",
             "review evidence contains an incomplete or malformed partitioned workspace identity",
         )
+
+    # The trusted projection Review1 actually measured is the ONLY basis
+    # repair may ever use to tolerate a benign timestamp-only instability
+    # here -- never `establish_protected_git_metadata_baseline()` (repair
+    # must never bootstrap its own authority), never the run-start baseline,
+    # never an unstable current reading accepted on its own. Legacy review
+    # evidence (no partitioned identity at all) never had this projection
+    # and is unaffected: its equality check below does not gate on
+    # `actual_git_metadata_hash`, so it keeps the pre-existing strict
+    # whole-workspace-hash-only fallback unchanged.
+    try:
+        if partitioned_identity_available:
+            reviewed_projection = _load_trusted_review_projection(
+                review_receipt, expected_hash=str(expected_git_metadata_hash)
+            )
+            actual_git_metadata = run_review.protected_git_metadata_snapshot(
+                workspace, trusted_baseline=reviewed_projection
+            )
+        else:
+            actual_git_metadata = run_review.protected_git_metadata_snapshot(workspace)
+        actual_git_metadata_hash = workspace_hash(actual_git_metadata)
+        actual_git_entry_hash = run_review.workspace_git_entry_hash_from_snapshot(
+            actual_git_metadata
+        )
+    except run_review.EvidenceIntegrityFailure:
+        actual_git_metadata_hash = ""
+        actual_git_entry_hash = ""
+
     if partitioned_identity_available:
         if (
             actual_head != expected_head

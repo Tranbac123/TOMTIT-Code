@@ -241,6 +241,12 @@ def make_review_evidence(
             source_paths,
             side_effect_paths,
         )
+        # One real measurement, reused for the hash/entry-hash/projection
+        # fields below -- exactly what run_review.py's own receipt-building
+        # does (`review_exit_git_metadata` computed once, then hashed and
+        # embedded), so the fabricated fixture receipt matches the real
+        # binding invariant `_load_trusted_review_projection()` verifies.
+        git_metadata_projection = run_review.protected_git_metadata_snapshot(workspace)
         receipt.update(
             {
                 "reviewed_head": subprocess.run(
@@ -253,11 +259,12 @@ def make_review_evidence(
                 "reviewed_index_clean": True,
                 "reviewed_index_identity": run_review.git_index_identity(workspace),
                 "reviewed_protected_git_metadata_hash": (
-                    run_review.protected_git_metadata_hash(workspace)
+                    workspace_hash(git_metadata_projection)
                 ),
+                "reviewed_protected_git_metadata_projection": git_metadata_projection,
                 "reviewed_workspace_git_entry_hash": (
                     run_review.workspace_git_entry_hash_from_snapshot(
-                        run_review.protected_git_metadata_snapshot(workspace)
+                        git_metadata_projection
                     )
                 ),
                 "reviewed_git_special_state": None,
@@ -2614,3 +2621,268 @@ def test_negative_review_implementation_attempt_fails(tmp_path: Path) -> None:
             allowed_paths=["app.txt"],
         )
     assert excinfo.value.category == "REVIEW_IMPLEMENTATION_ATTEMPT_MISMATCH"
+
+
+# ---------------------------------------------------------------------------
+# R01_REPAIR_PREFLIGHT_TRUSTED_PROJECTION_MISSING -- repair preflight's
+# protected-Git-metadata validation must use the exact Review1 trusted
+# projection (never a run-start baseline, never a fresh coherent-bootstrap
+# re-establishment, never an unstable current reading trusted on its own).
+# ---------------------------------------------------------------------------
+
+
+def _perturb_stat_identity_ctime_for_inode(
+    monkeypatch: pytest.MonkeyPatch, target_ino: int, *, perturb_calls: set[int]
+) -> dict[str, int]:
+    """Deterministically simulate an OS-level ctime-only touch landing
+    between two specific observation points of one specific file during a
+    single measurement -- never real OS timing. Mirrors the identical
+    helper in test_run_review.py's coherent-bootstrap tests."""
+
+    real_stat_identity = run_review._stat_identity
+    state = {"calls": 0}
+
+    def perturbing(metadata: object) -> tuple:
+        real = real_stat_identity(metadata)
+        if metadata.st_ino == target_ino:  # type: ignore[union-attr]
+            state["calls"] += 1
+            if state["calls"] in perturb_calls:
+                dev, ino, mode, size, nlink, mtime_ns, ctime_ns = real
+                return (dev, ino, mode, size, nlink, mtime_ns, ctime_ns + 1)
+        return real
+
+    monkeypatch.setattr(run_review, "_stat_identity", perturbing)
+    return state
+
+
+def test_repair_recovers_from_benign_intra_measurement_timestamp_race(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(Section 7) A protected regular file experiencing a genuine
+    same-window timestamp-only instability during repair's OWN measurement
+    -- path, dev, inode, mode, size, nlink, and bytes/SHA all unchanged --
+    must be tolerated because it is validated against the exact Review1
+    trusted projection, and repair preflight must succeed (the point where
+    Attempt 2 would be invoked is reached)."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    head_path = run_review.git_dir(ctx["ws"]) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    state = _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    pre = preflight_for(
+        tmp_path,
+        ctx["ws"],
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+        allowed_paths=["app.txt"],
+    )
+
+    assert (
+        pre["fingerprint"].reviewed_protected_git_metadata_hash_actual
+        == pre["fingerprint"].reviewed_protected_git_metadata_hash_expected
+    )
+    assert state["calls"] >= 4
+
+
+def test_repair_rejects_semantic_git_metadata_drift_even_with_matching_stat_fields(
+    tmp_path: Path,
+) -> None:
+    """(Section 8) Even when size/inode/mode/nlink all match, if a protected
+    file's content genuinely differs from the exact Review1 trusted
+    projection, repair must block -- Attempt 2 must never start."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    description_path = run_review.git_dir(ctx["ws"]) / "description"
+    original = description_path.read_bytes()
+    mutated = bytearray(original)
+    mutated[0] ^= 0xFF
+    before_stat = description_path.stat()
+    description_path.write_bytes(bytes(mutated))
+    after_stat = description_path.stat()
+    assert after_stat.st_ino == before_stat.st_ino
+    assert after_stat.st_mode == before_stat.st_mode
+    assert after_stat.st_size == before_stat.st_size
+    assert after_stat.st_nlink == before_stat.st_nlink
+
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 3
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+def test_repair_blocks_when_reviewed_projection_missing(tmp_path: Path) -> None:
+    """(Section 9.A) Missing full projection -> repair blocks."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    del receipt["reviewed_protected_git_metadata_projection"]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MISSING"
+
+
+def test_repair_blocks_when_reviewed_projection_malformed(tmp_path: Path) -> None:
+    """(Section 9.B) Malformed projection (not a string-mapping) -> repair blocks."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["reviewed_protected_git_metadata_projection"] = ["not", "a", "mapping"]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MALFORMED"
+
+
+def test_repair_blocks_when_reviewed_projection_empty(tmp_path: Path) -> None:
+    """(Section 9.B) An empty projection is schema-malformed too -- a real
+    protected-repository projection is never empty."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    receipt["reviewed_protected_git_metadata_projection"] = {}
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MALFORMED"
+
+
+def test_repair_blocks_when_reviewed_projection_hash_mismatch(tmp_path: Path) -> None:
+    """(Section 9.C) Projection content does not hash to the receipt's own
+    bound `reviewed_protected_git_metadata_hash` -> repair blocks."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    projection = dict(receipt["reviewed_protected_git_metadata_projection"])
+    tampered_key = next(iter(projection))
+    projection[tampered_key] = projection[tampered_key] + "-tampered"
+    receipt["reviewed_protected_git_metadata_projection"] = projection
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_HASH_MISMATCH"
+
+
+def test_repair_accepts_valid_exact_review1_projection_with_no_drift(tmp_path: Path) -> None:
+    """(Section 9.G) A valid, exact Review1 projection with a live state
+    that genuinely matches it -- repair proceeds, Attempt 2 is invoked."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 0
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "repaired\n"
+
+
+def test_repair_never_calls_coherent_bootstrap_establishment() -> None:
+    """(Section 6) Repair must never call
+    `establish_protected_git_metadata_baseline()` to recover from a mismatch
+    or missing evidence -- no baseline rollover, ever. Only the qualified
+    call form (`run_review.establish_protected_git_metadata_baseline`) would
+    ever actually invoke it from this module -- a bare mention of the name
+    in prose/docstrings (explaining what NOT to do) is not a call."""
+
+    source = (DOGFOOD_DIR / "run_repair.py").read_text(encoding="utf-8")
+    assert "run_review.establish_protected_git_metadata_baseline" not in source
+
+
+def test_target04_repair_lifecycle_benign_churn_reaches_attempt2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(Section 12) Target-04 gate lifecycle regression: Review1
+    REQUEST_CHANGES -> repair preflight observes a benign intra-measurement
+    timestamp-only race on a protected file -> the exact Review1 trusted
+    projection validates it -> the fake Attempt 2 model is actually
+    invoked. Proves R01 no longer prevents the repair invocation boundary."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    head_path = run_review.git_dir(ctx["ws"]) / "HEAD"
+    target_ino = head_path.stat().st_ino
+    _perturb_stat_identity_ctime_for_inode(monkeypatch, target_ino, perturb_calls={2})
+
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 0
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "repaired\n"
+
+
+def test_target04_repair_lifecycle_semantic_drift_blocks_attempt2(tmp_path: Path) -> None:
+    """(Section 12) Opposite case: a genuine semantic drift on a protected
+    file between Review 1 and repair must block preflight, and the fake
+    Attempt 2 model must never be invoked."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    description_path = run_review.git_dir(ctx["ws"]) / "description"
+    mutated = bytearray(description_path.read_bytes())
+    mutated[0] ^= 0xFF
+    description_path.write_bytes(bytes(mutated))
+
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 3
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "changed\n"

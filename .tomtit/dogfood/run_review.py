@@ -3003,6 +3003,17 @@ def main(
         "reviewed_index_clean": git_index_clean(workspace),
         "reviewed_index_identity": git_index_identity(workspace),
         "reviewed_protected_git_metadata_hash": review_exit_git_metadata_hash,
+        # The exact complete stable protected-Git-metadata projection Review
+        # measured at exit -- not merely its hash. Repair must never validate
+        # its own later reading against anything but this exact projection
+        # (never a run-start baseline, never a fresh coherent-bootstrap
+        # re-establishment): see `run_repair.prove_reviewed_state()`. Bound
+        # to `reviewed_protected_git_metadata_hash` above by construction
+        # (both are derived from the same `review_exit_git_metadata` value)
+        # and additionally participates in the same canonical review
+        # evidence identity check as every other `review-receipt.json`
+        # field (see `read_canonical_evidence` in `run_repair.load_review_evidence`).
+        "reviewed_protected_git_metadata_projection": review_exit_git_metadata,
         "reviewed_workspace_git_entry_hash": review_exit_git_entry_hash,
         "reviewed_git_special_state": git_special_state(workspace),
         "reviewed_baseline_commit": git_rev_parse(workspace, args.baseline_ref),
