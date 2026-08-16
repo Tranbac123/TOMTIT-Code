@@ -1116,6 +1116,8 @@ def test_final_workspace_evidence_no_product_change(tmp_path: Path) -> None:
     ).stdout.strip()
     before = snapshot_workspace_hashes(ws)
     baseline_git_metadata = run_review.protected_git_metadata_snapshot(ws)
+    baseline_index_identity = run_review.git_index_identity(ws)
+    assert baseline_index_identity is not None
 
     evidence = run_loop._derive_final_workspace_evidence(
         workspace=ws,
@@ -1124,6 +1126,7 @@ def test_final_workspace_evidence_no_product_change(tmp_path: Path) -> None:
         allowed_source_paths=("app.txt",),
         allowed_side_effect_paths=(".pytest_cache",),
         baseline_git_metadata=baseline_git_metadata,
+        baseline_index_identity=baseline_index_identity,
     )
 
     assert evidence["workspace_final_changed_paths"] == []
@@ -1533,6 +1536,40 @@ def test_no_untrusted_subprocess_before_baseline_establishment(
     assert exit_code == 2
     result = load_result(loop_root / loop_id)
     assert result["error_category"] == "PROTECTED_BASELINE_ESTABLISHMENT_FAILED"
+    assert not marker.exists()
+
+
+def test_no_untrusted_subprocess_before_index_identity_established(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F02/Section 6) If the canonical effective Git index identity
+    cannot be established at the L1/L2 authority boundary, PREFLIGHT must
+    block with GIT_INDEX_IDENTITY_UNAVAILABLE *before* the first untrusted
+    subprocess (the Codex capability probe) ever runs -- an unavailable
+    baseline index identity must never flow downstream where a later
+    None == None comparison could silently look like preservation."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-no-subprocess-before-index-identity")
+    marker = tmp_path / "codex-invoked.marker"
+    codex = write_fake_codex(
+        tmp_path,
+        name="codex-no-subprocess-before-index-identity",
+        verdict_json=approve_verdict_json(),
+        help_write_path=str(marker),
+    )
+
+    monkeypatch.setattr(run_review, "canonical_index_projection", lambda cwd: None)
+
+    loop_id = "loop-no-subprocess-before-index-identity"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert exit_code == 2
+    result = load_result(loop_root / loop_id)
+    assert result["error_category"] == "GIT_INDEX_IDENTITY_UNAVAILABLE"
     assert not marker.exists()
 
 
@@ -2710,10 +2747,18 @@ def test_review_preservation_evidence_tolerates_index_only_representation_change
         "@workspace_git_entry_path": f"path:{ws / '.git'}",
         "@workspace_git_entry": run_review._directory_descriptor((ws / ".git").stat()),
     }
+    # An ordinary (non-linked-worktree) repository: git_dir and
+    # git_common_dir resolve to the same directory, so both index keys are
+    # eligible for the canonical representation exception (Section 8/F03).
+    same_root_paths = {
+        "@git_dir": f"path:{ws / '.git'}",
+        "@git_common_dir": f"path:{ws / '.git'}",
+    }
     before_metadata = {
         "git_dir/index": "file:dev=1:ino=100:mode=0644:size=137:nlink=1:sha256=" + "a" * 64,
         "git_dir/HEAD": "file:dev=1:ino=200:mode=0644:size=41:nlink=1:sha256=" + "b" * 64,
         **workspace_git_entry,
+        **same_root_paths,
     }
     after_metadata = dict(before_metadata)
     after_metadata["git_dir/index"] = (
@@ -2734,7 +2779,12 @@ def test_review_preservation_evidence_tolerates_index_only_representation_change
 
     assert evidence["repository_identity_preserved"] is True
     assert evidence["workspace_preserved"] is True
+    # (F05/Section 17) Accepted index-representation-only lifecycle: the
+    # semantic authority field is true, but the sibling raw-representation
+    # field is false -- these are deliberately DIFFERENT decisions, and the
+    # receipt must report both, not collapse them into one.
     assert evidence["protected_git_metadata_preserved"] is True
+    assert evidence["protected_git_metadata_raw_representation_preserved"] is False
     assert evidence["protected_git_metadata_changed_path_count"] == 1
     assert evidence["index_representation_diagnostic"] == {
         "dev_changed": False,
@@ -2781,6 +2831,48 @@ def test_review_preservation_evidence_rejects_semantic_index_drift(tmp_path: Pat
 
     assert evidence["repository_identity_preserved"] is False
     assert evidence["workspace_preserved"] is False
+    # (F05/Section 17) Semantic index change: authority preservation false,
+    # and the receipt's semantic field must agree -- not merely derived
+    # from raw changed paths.
+    assert evidence["protected_git_metadata_preserved"] is False
+
+
+def test_review_preservation_evidence_semantic_false_raw_representation_true(
+    tmp_path: Path,
+) -> None:
+    """(F02/F05) Raw protected metadata identical, but the canonical index
+    identity itself differs between observations -- the semantic
+    preservation field must be false even though the raw-representation
+    field is true, proving the two receipt fields are independent and the
+    semantic field (not raw byte equality) is authoritative."""
+
+    ws = make_clean_workspace(tmp_path)
+    head = run_review.git_rev_parse(ws, "HEAD") or ""
+    hashes = snapshot_workspace_hashes(ws)
+    workspace_git_entry = {
+        "@workspace_git_entry_path": f"path:{ws / '.git'}",
+        "@workspace_git_entry": run_review._directory_descriptor((ws / ".git").stat()),
+    }
+    same_metadata = {
+        "git_dir/index": "file:dev=1:ino=100:mode=0644:size=137:nlink=1:sha256=" + "a" * 64,
+        **workspace_git_entry,
+    }
+
+    before = (head, hashes, True, None, "identity-X", same_metadata)
+    after = (head, hashes, True, None, "identity-Y", dict(same_metadata))
+
+    evidence = run_loop._review_preservation_evidence(
+        attempt=1,
+        workspace=ws,
+        before=before,
+        after=after,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+    )
+
+    assert evidence["protected_git_metadata_preserved"] is False
+    assert evidence["protected_git_metadata_raw_representation_preserved"] is True
+    assert evidence["repository_identity_preserved"] is False
 
 
 def test_review_preservation_evidence_rejects_non_index_drift_alongside_index_drift(

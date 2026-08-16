@@ -3764,5 +3764,485 @@ def test_describe_index_representation_diff_none_on_non_matching_descriptor() ->
     assert run_review.describe_index_representation_diff("not-a-descriptor", "also-not-one") is None
 
 
+# ---------------------------------------------------------------------------
+# F01 (Section 4/21): bounded coherent multi-observation canonical index
+# projection -- two *consecutive* identical complete observations required,
+# up to `_MAX_CANONICAL_INDEX_OBSERVATIONS`, flat and non-nested.
+# ---------------------------------------------------------------------------
+
+
+def _sequence_of_projections(
+    monkeypatch: pytest.MonkeyPatch, sequence: list[dict[str, str] | None]
+) -> dict[str, int]:
+    calls = {"n": 0}
+
+    def fake(cwd: Path) -> dict[str, str] | None:
+        calls["n"] += 1
+        value = sequence[calls["n"] - 1]
+        return dict(value) if value is not None else None
+
+    monkeypatch.setattr(run_review, "_build_canonical_index_projection_once", fake)
+    return calls
+
+
+def test_canonical_index_projection_two_matching_observations_establish_in_two(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(F01.A) observation 1 = A, observation 2 = A -> establish A in
+    exactly 2 complete observations."""
+
+    calls = _sequence_of_projections(monkeypatch, [{"a": "1"}, {"a": "1"}, {"a": "999"}])
+    result = run_review.canonical_index_projection(Path("/unused"))
+    assert result == {"a": "1"}
+    assert calls["n"] == 2
+
+
+def test_canonical_index_projection_disagree_then_agree_establishes_on_third(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(F01.B) observation 1 = A, observation 2 = B, observation 3 = B ->
+    establish B."""
+
+    calls = _sequence_of_projections(monkeypatch, [{"a": "1"}, {"a": "2"}, {"a": "2"}])
+    result = run_review.canonical_index_projection(Path("/unused"))
+    assert result == {"a": "2"}
+    assert calls["n"] == 3
+
+
+def test_canonical_index_projection_three_disagreeing_observations_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(F01.C) A -> B -> C -> canonical state unavailable after the bound."""
+
+    calls = _sequence_of_projections(monkeypatch, [{"a": "1"}, {"a": "2"}, {"a": "3"}])
+    result = run_review.canonical_index_projection(Path("/unused"))
+    assert result is None
+    assert calls["n"] == 3
+
+
+def test_canonical_index_projection_incomplete_first_observation_not_authoritative_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(F01.D) One complete projection attempt cannot be built (returns
+    `None`) -- that incomplete result cannot become authoritative by
+    itself, but two later consecutive complete matches still can."""
+
+    calls = _sequence_of_projections(monkeypatch, [None, {"a": "1"}, {"a": "1"}])
+    result = run_review.canonical_index_projection(Path("/unused"))
+    assert result == {"a": "1"}
+    assert calls["n"] == 3
+
+
+def test_canonical_index_projection_all_incomplete_observations_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """(F01.D) Every observation incomplete -> unavailable, never an
+    empty/default projection."""
+
+    calls = _sequence_of_projections(monkeypatch, [None, None, None])
+    result = run_review.canonical_index_projection(Path("/unused"))
+    assert result is None
+    assert calls["n"] == 3
+
+
+def test_canonical_index_projection_bound_is_flat_never_nested(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Exactly `_MAX_CANONICAL_INDEX_OBSERVATIONS` calls to the single-shot
+    builder in the worst (all-disagreeing) case -- one whole-projection
+    attempt per loop iteration, never a retry loop nested inside another."""
+
+    calls = _sequence_of_projections(monkeypatch, [{"a": "1"}, {"a": "2"}, {"a": "3"}])
+    run_review.canonical_index_projection(Path("/unused"))
+    assert calls["n"] == run_review._MAX_CANONICAL_INDEX_OBSERVATIONS
+
+
+def test_build_canonical_index_projection_once_rejects_intent_to_add_hybrid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F01.E) Query outputs within ONE provisional observation that
+    correspond to inconsistent logical states -- here, `status` reports a
+    path as intent-to-add while `stage` simultaneously holds a real,
+    non-empty staged object for that same path -- must not be enough by
+    itself to establish authority: this exact single observation is
+    rejected outright (`None`), so it can never even participate as a
+    "previous" value in the bounded coherence comparison. This is the
+    original Codex-discovered "impossible hybrid" reproduction."""
+
+    ws = make_committed_workspace(tmp_path)
+    real_run_git_bytes = run_review._run_git_bytes
+
+    def faking(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["ls-files", "--stage"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"H 100644 " + b"a" * 40 + b" 0\ta.txt\x00",
+                stderr=b"",
+            )
+        if args[:2] == ["status", "--porcelain=v2"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=(
+                    b"1 .A N... 000000 000000 100644 "
+                    + b"0" * 40
+                    + b" "
+                    + b"0" * 40
+                    + b" a.txt\x00"
+                ),
+                stderr=b"",
+            )
+        return real_run_git_bytes(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git_bytes", faking)
+
+    assert run_review._build_canonical_index_projection_once(ws) is None
+    assert run_review.canonical_index_projection(ws) is None
+
+
+# ---------------------------------------------------------------------------
+# F02 (Section 5/21): canonical index identity must be non-`None` and equal
+# on BOTH sides before ANY preservation success path -- even when the raw
+# protected-metadata projections are already byte-for-byte identical.
+# ---------------------------------------------------------------------------
+
+
+def test_protected_git_metadata_preserved_raw_equal_canonical_differs_rejected() -> None:
+    """(F02) Raw metadata identical, but canonical index identity differs
+    between observations -- must still block."""
+
+    same = {"git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            same, dict(same), canonical_index_identity_before="X", canonical_index_identity_after="Y"
+        )
+        is False
+    )
+
+
+def test_protected_git_metadata_preserved_raw_equal_canonical_unavailable_rejected() -> None:
+    """(F02) Raw equality never substitutes for an unavailable canonical
+    index identity -- an unavailable (`None`) reading must never compare
+    equal to another unavailable reading."""
+
+    same = {"git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            same, dict(same), canonical_index_identity_before=None, canonical_index_identity_after=None
+        )
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# F03 (Section 8/9/21): role-aware index handling -- `git_dir/index` (the
+# current worktree's own index) may always use the canonical exception;
+# `git_common_dir/index` may use it only when it aliases the same physical
+# file (ordinary repository), never in a linked worktree.
+# ---------------------------------------------------------------------------
+
+
+def test_index_metadata_exception_keys_ordinary_repository_both_aliases() -> None:
+    """(F03.C) git_dir == git_common_dir -> both alias keys behave
+    consistently."""
+
+    metadata = {"@git_dir": "path:/repo/.git", "@git_common_dir": "path:/repo/.git"}
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset(
+        {"git_dir/index", "git_common_dir/index"}
+    )
+
+
+def test_index_metadata_exception_keys_linked_worktree_current_only() -> None:
+    """(F03) git_dir != git_common_dir (linked worktree) -> the current
+    worktree's own git_dir/index is eligible, along with the second key
+    under which the common-dir tree walk re-discovers that exact same
+    physical file (Git's own nested `<common>/worktrees/<name>` layout) --
+    but never a genuinely different `git_common_dir/index`."""
+
+    metadata = {
+        "@git_dir": "path:/repo/.git/worktrees/linked",
+        "@git_common_dir": "path:/repo/.git",
+    }
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset(
+        {"git_dir/index", "git_common_dir/worktrees/linked/index"}
+    )
+
+
+def test_index_metadata_exception_keys_missing_role_info_applies_nothing() -> None:
+    """(F03.D) Role info unavailable/inconsistent -> do not apply the
+    exception to anything (fails closed)."""
+
+    assert run_review._index_metadata_exception_keys({}) == frozenset()
+    assert run_review._index_metadata_exception_keys({"@git_dir": "path:/x"}) == frozenset()
+
+
+def test_protected_git_metadata_preserved_linked_worktree_current_index_change_tolerated() -> None:
+    """(F03.A, synthetic) A raw representation-only change confined to the
+    CURRENT linked worktree's own index may still be tolerated."""
+
+    linked_roles = {"@git_dir": "path:/repo/.git/worktrees/linked", "@git_common_dir": "path:/repo/.git"}
+    before = {**linked_roles, "git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    after = {**linked_roles, "git_dir/index": "file:dev=1:ino=2:mode=0644:size=1:nlink=1:sha256=" + "b" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, after, canonical_index_identity_before="X", canonical_index_identity_after="X"
+        )
+        is True
+    )
+
+
+def test_protected_git_metadata_preserved_linked_worktree_common_index_change_rejected() -> None:
+    """(F03.B, synthetic) A difference confined to git_common_dir/index in a
+    linked worktree must NOT be tolerated, even though the current
+    worktree's own canonical index identity is unchanged -- it belongs to a
+    different worktree's index and must remain strict."""
+
+    linked_roles = {"@git_dir": "path:/repo/.git/worktrees/linked", "@git_common_dir": "path:/repo/.git"}
+    before = {**linked_roles, "git_common_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    after = {**linked_roles, "git_common_dir/index": "file:dev=1:ino=2:mode=0644:size=1:nlink=1:sha256=" + "b" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, after, canonical_index_identity_before="X", canonical_index_identity_after="X"
+        )
+        is False
+    )
+
+
+def test_canonical_index_identity_real_linked_worktree_tolerates_own_representation_refresh(
+    tmp_path: Path,
+) -> None:
+    """(F03.A, real linked worktree) The linked worktree's own canonical
+    index identity tolerates a benign stat-cache refresh confined to ITS OWN
+    (git_dir/index) representation, exactly like the ordinary-repository
+    case, with git_dir != git_common_dir genuinely observed."""
+
+    primary, linked = make_linked_workspace(tmp_path)
+    _git(["add", "-A"], linked)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "linked"], linked)
+
+    metadata_before = run_review.protected_git_metadata_snapshot(linked)
+    assert metadata_before["@git_dir"] != metadata_before["@git_common_dir"]
+    index_identity_before = run_review.git_index_identity(linked)
+    assert index_identity_before is not None
+
+    os.utime(linked / "app.txt", (time.time() + 5, time.time() + 5))
+    subprocess.run(["git", "status"], cwd=str(linked), capture_output=True, check=True)
+
+    metadata_after = run_review.protected_git_metadata_snapshot(linked, trusted_baseline=metadata_before)
+    index_identity_after = run_review.git_index_identity(linked)
+
+    assert metadata_before["git_dir/index"] != metadata_after["git_dir/index"]
+    assert index_identity_after is not None
+    assert index_identity_after == index_identity_before
+    assert (
+        run_review.protected_git_metadata_preserved(
+            metadata_before,
+            metadata_after,
+            canonical_index_identity_before=index_identity_before,
+            canonical_index_identity_after=index_identity_after,
+        )
+        is True
+    )
+
+
+def test_canonical_index_identity_real_linked_worktree_common_dir_change_rejected(
+    tmp_path: Path,
+) -> None:
+    """(F03.B, real linked worktree) A raw representation-only change to
+    the PRIMARY worktree's own index -- which is exactly what
+    git_common_dir/index represents from the linked worktree's perspective
+    -- must still block: it is a different worktree's index, never eligible
+    for the current worktree's canonical-identity exception, restoring the
+    previously-intended strict behavior Codex flagged as regressed."""
+
+    primary, linked = make_linked_workspace(tmp_path)
+    _git(["add", "-A"], linked)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "linked"], linked)
+
+    metadata_before = run_review.protected_git_metadata_snapshot(linked)
+    assert metadata_before["@git_dir"] != metadata_before["@git_common_dir"]
+
+    # Refresh the PRIMARY worktree's own index (== linked's
+    # git_common_dir/index) -- never the linked worktree's own git_dir/index.
+    os.utime(primary / "app.txt", (time.time() + 5, time.time() + 5))
+    subprocess.run(["git", "status"], cwd=str(primary), capture_output=True, check=True)
+
+    metadata_after = run_review.protected_git_metadata_snapshot(linked, trusted_baseline=metadata_before)
+    assert metadata_before["git_common_dir/index"] != metadata_after["git_common_dir/index"]
+    assert metadata_before.get("git_dir/index") == metadata_after.get("git_dir/index")
+
+    index_identity_before = run_review.git_index_identity(linked)
+    index_identity_after = run_review.git_index_identity(linked)
+    assert index_identity_before is not None
+    assert index_identity_before == index_identity_after
+
+    assert (
+        run_review.protected_git_metadata_preserved(
+            metadata_before,
+            metadata_after,
+            canonical_index_identity_before=index_identity_before,
+            canonical_index_identity_after=index_identity_after,
+        )
+        is False
+    )
+
+
+# ---------------------------------------------------------------------------
+# F04 (Section 10-15/21): strict, complete validation of every canonical
+# index query source -- no record is ever silently skipped; anything not
+# fully recognized fails the whole observation closed.
+# ---------------------------------------------------------------------------
+
+
+def _patch_canonical_index_queries(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    stage_stdout: bytes | None = None,
+    status_stdout: bytes | None = None,
+    undo_stdout: bytes | None = None,
+) -> None:
+    """Override one or more of the three canonical-index git queries'
+    stdout with fixed bytes; anything not overridden runs for real against
+    the fixture workspace."""
+
+    real_run_git_bytes = run_review._run_git_bytes
+
+    def faking(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["ls-files", "--stage"] and stage_stdout is not None:
+            return subprocess.CompletedProcess(args=["git", *args], returncode=0, stdout=stage_stdout, stderr=b"")
+        if args[:2] == ["status", "--porcelain=v2"] and status_stdout is not None:
+            return subprocess.CompletedProcess(args=["git", *args], returncode=0, stdout=status_stdout, stderr=b"")
+        if args[:2] == ["ls-files", "--resolve-undo"] and undo_stdout is not None:
+            return subprocess.CompletedProcess(args=["git", *args], returncode=0, stdout=undo_stdout, stderr=b"")
+        return real_run_git_bytes(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git_bytes", faking)
+
+
+def test_build_canonical_index_projection_rejects_unexpected_status_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) An unrecognized porcelain-v2 record type (e.g. "?" untracked,
+    never expected under `--untracked-files=no`) must never be silently
+    skipped."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, status_stdout=b"? a.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_incomplete_status_framing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) Status output not ending with the terminating NUL is
+    truncated/incomplete framing."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=b"1 .A N... 000000 000000 100644 " + b"0" * 40 + b" " + b"0" * 40 + b" a.txt",
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_noncanonical_stage_spelling(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) A noncanonical stage spelling such as "00" must not become a
+    canonical record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"a" * 40 + b" 00\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_invalid_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) An invalid Git mode must not become a canonical record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 999999 " + b"a" * 40 + b" 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_invalid_object_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) An invalid full object id must not become a canonical
+    record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 not-a-valid-object-id 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_empty_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) An empty path must not become a canonical record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"a" * 40 + b" 0\t\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_incomplete_stage_framing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) Stage output not ending with the terminating NUL is a
+    truncated/incomplete record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"a" * 40 + b" 0\ta.txt")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_intent_to_add_missing_stage_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04/Section 13) status indicates intent-to-add for a path with no
+    matching effective stage-0 entry at all -> unavailable."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 .A N... 000000 000000 100644 " + b"0" * 40 + b" " + b"0" * 40 + b" nonexistent.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_intent_to_add_incompatible_object(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04/Section 13) status indicates intent-to-add for a path but its
+    matching stage-0 entry has a real, non-empty-blob object id ->
+    unavailable. The exact "impossible hybrid" Codex originally found."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        stage_stdout=b"H 100644 " + b"a" * 40 + b" 0\ta.txt\x00",
+        status_stdout=(
+            b"1 .A N... 000000 000000 100644 " + b"0" * 40 + b" " + b"0" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_incomplete_resolve_undo_framing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04) Resolve-undo output not ending with the terminating NUL is a
+    truncated/incomplete record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, undo_stdout=b"100644 " + b"a" * 40 + b" 1\ta.txt")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

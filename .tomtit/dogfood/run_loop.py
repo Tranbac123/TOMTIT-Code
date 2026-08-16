@@ -946,6 +946,16 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
     # exactly like `baseline_git_metadata` above -- both are captured at
     # the same L1/L2 authority boundary, before any untrusted subprocess.
     baseline_index_identity = capability_probe_before[4]
+    # Must never become authoritative as None: block HERE, before the
+    # first untrusted subprocess (`resolve_codex_contract` below), rather
+    # than let an unavailable canonical index identity flow downstream,
+    # where a later before/after comparison could otherwise see two
+    # unavailable (`None`) readings compare equal to each other.
+    if baseline_index_identity is None:
+        raise PreflightBlocked(
+            "GIT_INDEX_IDENTITY_UNAVAILABLE",
+            "canonical effective Git index identity could not be established",
+        )
     codex_contract: tuple[str, dict[str, bool], tuple[str, str]] | None = None
     codex_contract_failure: run_review.PreflightFailure | None = None
     try:
@@ -1895,6 +1905,9 @@ def _review_preservation_evidence(
             workspace_hash(after[5]) if after[5] else None
         ),
         "protected_git_metadata_preserved": metadata_preserved,
+        "protected_git_metadata_raw_representation_preserved": (
+            not metadata_changed_paths
+        ),
         "index_representation_diagnostic": index_representation_diagnostic,
         "workspace_git_entry_hash_before": (
             run_review.workspace_git_entry_hash_from_snapshot(before[5])
