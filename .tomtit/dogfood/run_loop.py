@@ -178,6 +178,7 @@ def _derive_final_workspace_evidence(
     allowed_source_paths: tuple[str, ...],
     allowed_side_effect_paths: tuple[str, ...],
     baseline_git_metadata: dict[str, str] | None = None,
+    baseline_index_identity: str | None = None,
 ) -> dict[str, Any]:
     """Measure the actual terminal workspace, independent of child receipts."""
 
@@ -217,15 +218,20 @@ def _derive_final_workspace_evidence(
         )
     except run_review.EvidenceIntegrityFailure:
         final_git_metadata = {}
+    final_index_identity = run_review.git_index_identity(workspace)
     git_metadata_changed_paths = (
         run_review.diff_workspace_hashes(baseline_git_metadata, final_git_metadata)
         if baseline_git_metadata is not None
         else ()
     )
     git_metadata_preserved = (
-        bool(final_git_metadata)
-        and baseline_git_metadata is not None
-        and not git_metadata_changed_paths
+        baseline_git_metadata is not None
+        and run_review.protected_git_metadata_preserved(
+            baseline_git_metadata,
+            final_git_metadata,
+            canonical_index_identity_before=baseline_index_identity,
+            canonical_index_identity_after=final_index_identity,
+        )
     )
     final_git_entry_hash = (
         run_review.workspace_git_entry_hash_from_snapshot(final_git_metadata)
@@ -935,6 +941,11 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
     capability_probe_before = _snapshot_workspace_for_review(
         workspace, trusted_git_metadata_baseline=baseline_git_metadata
     )
+    # The canonical effective index identity anchored here is reused for
+    # the whole run's lifetime (see `_derive_final_workspace_evidence`),
+    # exactly like `baseline_git_metadata` above -- both are captured at
+    # the same L1/L2 authority boundary, before any untrusted subprocess.
+    baseline_index_identity = capability_probe_before[4]
     codex_contract: tuple[str, dict[str, bool], tuple[str, str]] | None = None
     codex_contract_failure: run_review.PreflightFailure | None = None
     try:
@@ -947,7 +958,25 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
     capability_probe_after = _snapshot_workspace_for_review(
         workspace, trusted_git_metadata_baseline=capability_probe_before[5]
     )
-    if capability_probe_after != capability_probe_before:
+    # Elements 0-4 (head, workspace file hashes, index-clean state, special
+    # Git operation state, canonical index identity) must be exactly
+    # unchanged, as before. Element 5 (the full protected Git metadata
+    # projection) uses the index-tolerant comparison: a raw `.git/index`
+    # descriptor difference confined to that one key does not by itself
+    # indicate drift when the canonical index identity (already required
+    # equal above) is unchanged -- see
+    # `run_review.protected_git_metadata_preserved` and
+    # TARGET04_CANONICAL_INDEX_IDENTITY_FIX_REPORT.md.
+    capability_probe_metadata_preserved = run_review.protected_git_metadata_preserved(
+        capability_probe_before[5],
+        capability_probe_after[5],
+        canonical_index_identity_before=capability_probe_before[4],
+        canonical_index_identity_after=capability_probe_after[4],
+    )
+    if (
+        capability_probe_after[:5] != capability_probe_before[:5]
+        or not capability_probe_metadata_preserved
+    ):
         raise PreflightBlocked(
             "IMMUTABILITY_VIOLATION",
             "Codex capability probes changed workspace or repository state",
@@ -972,6 +1001,7 @@ def _deep_preflight(args: argparse.Namespace, workspace: Path, loop_dir: Path) -
         "codex_executable": codex_executable,
         "children_root": children_root,
         "baseline_git_metadata": baseline_git_metadata,
+        "baseline_index_identity": baseline_index_identity,
     }
 
 
@@ -1042,6 +1072,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
     baseline_commit_for_final: str | None = None
     workspace_baseline_hashes: dict[str, str] | None = None
     baseline_git_metadata: dict[str, str] | None = None
+    baseline_index_identity: str | None = None
     allowed_paths_for_final: tuple[str, ...] = ()
     model_invocation_count = 0
     provider_invocation_observations: list[dict[str, Any]] = []
@@ -1077,6 +1108,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             baseline_commit=baseline_commit_for_final,
             workspace_baseline_hashes=workspace_baseline_hashes,
             baseline_git_metadata=baseline_git_metadata,
+            baseline_index_identity=baseline_index_identity,
             allowed_side_effect_paths=allowed_side_effect_paths,
             model_invocation_count=model_invocation_count,
             provider_invocation_observations=provider_invocation_observations,
@@ -1144,6 +1176,7 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         workspace_baseline_hashes = snapshot_workspace_hashes(workspace)
         allowed_paths_for_final = allowed_paths
         baseline_git_metadata = phase_b["baseline_git_metadata"]
+        baseline_index_identity = phase_b["baseline_index_identity"]
         claude_executable: str = phase_b["claude_executable"]
         codex_executable: str = phase_b["codex_executable"]
         children_root: Path = phase_b["children_root"]
@@ -1797,6 +1830,20 @@ def _review_preservation_evidence(
         allowed_side_effect_paths=allowed_side_effect_paths,
         workspace=workspace,
     )
+    # A raw `.git/index` descriptor difference confined to that one
+    # protected key does not by itself indicate real repository drift when
+    # the canonical effective index identity (before[4]/after[4], required
+    # equal just below) is itself unchanged -- see
+    # `run_review.protected_git_metadata_preserved` and
+    # TARGET04_CANONICAL_INDEX_IDENTITY_FIX_REPORT.md. Every other protected
+    # key, and the canonical index identity itself, remain exactly as
+    # strict as before.
+    metadata_preserved = run_review.protected_git_metadata_preserved(
+        before[5],
+        after[5],
+        canonical_index_identity_before=before[4],
+        canonical_index_identity_after=after[4],
+    )
     repository_identity_preserved = (
         before[0] == after[0]
         and before[2]
@@ -1805,13 +1852,29 @@ def _review_preservation_evidence(
         and after[3] is None
         and before[4] is not None
         and before[4] == after[4]
-        and bool(before[5])
-        and before[5] == after[5]
+        and metadata_preserved
     )
     workspace_preserved = observation.workspace_preserved and repository_identity_preserved
     side_effect_counts, side_effect_sample = summarize_side_effect_paths(
         observation.authorized_side_effect_changed_paths,
         allowed_side_effect_paths,
+    )
+    metadata_changed_paths = run_review.diff_workspace_hashes(before[5], after[5])
+    # Bounded diagnostic only (Section 15): when a raw `.git/index`
+    # descriptor is among the changed protected keys, report which
+    # specific stable-projected fields differed -- never an unbounded dump
+    # -- so a future mismatch (tolerated or not) can be explained without
+    # re-deriving it from raw evidence after the fact.
+    index_changed_key = next(
+        (key for key in metadata_changed_paths if key in run_review._GIT_INDEX_METADATA_KEYS),
+        None,
+    )
+    index_representation_diagnostic = (
+        run_review.describe_index_representation_diff(
+            before[5].get(index_changed_key), after[5].get(index_changed_key)
+        )
+        if index_changed_key is not None
+        else None
     )
     return {
         "attempt": attempt,
@@ -1831,7 +1894,8 @@ def _review_preservation_evidence(
         "protected_git_metadata_hash_after": (
             workspace_hash(after[5]) if after[5] else None
         ),
-        "protected_git_metadata_preserved": bool(before[5]) and before[5] == after[5],
+        "protected_git_metadata_preserved": metadata_preserved,
+        "index_representation_diagnostic": index_representation_diagnostic,
         "workspace_git_entry_hash_before": (
             run_review.workspace_git_entry_hash_from_snapshot(before[5])
             if before[5]
@@ -1895,6 +1959,7 @@ def _finalize(
     baseline_commit: str | None = None,
     workspace_baseline_hashes: dict[str, str] | None = None,
     baseline_git_metadata: dict[str, str] | None = None,
+    baseline_index_identity: str | None = None,
     allowed_side_effect_paths: tuple[str, ...] = (),
     model_invocation_count: int = 0,
     provider_invocation_observations: list[dict[str, Any]] | None = None,
@@ -1923,6 +1988,7 @@ def _finalize(
         )
     except run_review.EvidenceIntegrityFailure:
         fallback_final_git_metadata = {}
+    fallback_final_index_identity = run_review.git_index_identity(workspace)
     fallback_git_metadata_changes = (
         run_review.diff_workspace_hashes(
             baseline_git_metadata,
@@ -1964,9 +2030,13 @@ def _finalize(
             else None
         ),
         "protected_git_metadata_preserved": (
-            bool(fallback_final_git_metadata)
-            and baseline_git_metadata is not None
-            and not fallback_git_metadata_changes
+            baseline_git_metadata is not None
+            and run_review.protected_git_metadata_preserved(
+                baseline_git_metadata,
+                fallback_final_git_metadata,
+                canonical_index_identity_before=baseline_index_identity,
+                canonical_index_identity_after=fallback_final_index_identity,
+            )
         ),
         "workspace_git_entry_final_hash": fallback_final_git_entry_hash,
         "workspace_git_entry_baseline_hash": fallback_baseline_git_entry_hash,
@@ -1990,6 +2060,7 @@ def _finalize(
             allowed_source_paths=allowed_paths,
             allowed_side_effect_paths=allowed_side_effect_paths,
             baseline_git_metadata=baseline_git_metadata,
+            baseline_index_identity=baseline_index_identity,
         )
 
     if accepted and final_workspace["protected_git_metadata_preserved"] is not True:

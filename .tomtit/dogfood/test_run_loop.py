@@ -2682,3 +2682,201 @@ def test_loop_rejects_unsafe_side_effect_path_before_any_attempt(tmp_path: Path)
         "--loop-run-id", "loop-se-2",
     ]
     assert run_loop.main(argv) == 4  # ConfigFailure
+
+
+# ---------------------------------------------------------------------------
+# Canonical effective-index identity, outer Review1 preservation lifecycle
+# (TARGET04_CANONICAL_INDEX_IDENTITY_FIX, Section 8: the exact Run-004
+# path -- outer pre-Review1 observation -> Review1 child -> outer
+# post-Review1 observation).
+# ---------------------------------------------------------------------------
+
+
+def test_review_preservation_evidence_tolerates_index_only_representation_change(
+    tmp_path: Path,
+) -> None:
+    """(Section 10, Run-004 class) The outer pre-Review1/post-Review1
+    preservation decision must tolerate a raw `.git/index` descriptor
+    difference confined to that one protected key when the canonical
+    effective index identity is unchanged."""
+
+    ws = make_clean_workspace(tmp_path)
+    head = run_review.git_rev_parse(ws, "HEAD") or ""
+    hashes = snapshot_workspace_hashes(ws)
+    canonical_identity = run_review.git_index_identity(ws)
+    assert canonical_identity is not None
+
+    workspace_git_entry = {
+        "@workspace_git_entry_path": f"path:{ws / '.git'}",
+        "@workspace_git_entry": run_review._directory_descriptor((ws / ".git").stat()),
+    }
+    before_metadata = {
+        "git_dir/index": "file:dev=1:ino=100:mode=0644:size=137:nlink=1:sha256=" + "a" * 64,
+        "git_dir/HEAD": "file:dev=1:ino=200:mode=0644:size=41:nlink=1:sha256=" + "b" * 64,
+        **workspace_git_entry,
+    }
+    after_metadata = dict(before_metadata)
+    after_metadata["git_dir/index"] = (
+        "file:dev=1:ino=101:mode=0644:size=137:nlink=1:sha256=" + "c" * 64
+    )
+
+    before = (head, hashes, True, None, canonical_identity, before_metadata)
+    after = (head, hashes, True, None, canonical_identity, after_metadata)
+
+    evidence = run_loop._review_preservation_evidence(
+        attempt=1,
+        workspace=ws,
+        before=before,
+        after=after,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+    )
+
+    assert evidence["repository_identity_preserved"] is True
+    assert evidence["workspace_preserved"] is True
+    assert evidence["protected_git_metadata_preserved"] is True
+    assert evidence["protected_git_metadata_changed_path_count"] == 1
+    assert evidence["index_representation_diagnostic"] == {
+        "dev_changed": False,
+        "ino_changed": True,
+        "mode_changed": False,
+        "size_changed": False,
+        "nlink_changed": False,
+        "sha256_changed": True,
+    }
+
+
+def test_review_preservation_evidence_rejects_semantic_index_drift(tmp_path: Path) -> None:
+    """A genuine semantic index change (different canonical identity) must
+    still block, even alongside a raw descriptor difference."""
+
+    ws = make_clean_workspace(tmp_path)
+    head = run_review.git_rev_parse(ws, "HEAD") or ""
+    hashes = snapshot_workspace_hashes(ws)
+
+    workspace_git_entry = {
+        "@workspace_git_entry_path": f"path:{ws / '.git'}",
+        "@workspace_git_entry": run_review._directory_descriptor((ws / ".git").stat()),
+    }
+    before_metadata = {
+        "git_dir/index": "file:dev=1:ino=100:mode=0644:size=137:nlink=1:sha256=" + "a" * 64,
+        **workspace_git_entry,
+    }
+    after_metadata = {
+        "git_dir/index": "file:dev=1:ino=101:mode=0644:size=137:nlink=1:sha256=" + "c" * 64,
+        **workspace_git_entry,
+    }
+
+    before = (head, hashes, True, None, "identity-X", before_metadata)
+    after = (head, hashes, True, None, "identity-Y", after_metadata)
+
+    evidence = run_loop._review_preservation_evidence(
+        attempt=1,
+        workspace=ws,
+        before=before,
+        after=after,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+    )
+
+    assert evidence["repository_identity_preserved"] is False
+    assert evidence["workspace_preserved"] is False
+
+
+def test_review_preservation_evidence_rejects_non_index_drift_alongside_index_drift(
+    tmp_path: Path,
+) -> None:
+    """A non-index protected key changing must still block even when the
+    index-only portion would otherwise be tolerated."""
+
+    ws = make_clean_workspace(tmp_path)
+    head = run_review.git_rev_parse(ws, "HEAD") or ""
+    hashes = snapshot_workspace_hashes(ws)
+    canonical_identity = run_review.git_index_identity(ws)
+    assert canonical_identity is not None
+
+    workspace_git_entry = {
+        "@workspace_git_entry_path": f"path:{ws / '.git'}",
+        "@workspace_git_entry": run_review._directory_descriptor((ws / ".git").stat()),
+    }
+    before_metadata = {
+        "git_dir/index": "file:dev=1:ino=100:mode=0644:size=137:nlink=1:sha256=" + "a" * 64,
+        "git_dir/HEAD": "file:dev=1:ino=200:mode=0644:size=41:nlink=1:sha256=" + "b" * 64,
+        **workspace_git_entry,
+    }
+    after_metadata = {
+        "git_dir/index": "file:dev=1:ino=101:mode=0644:size=137:nlink=1:sha256=" + "c" * 64,
+        "git_dir/HEAD": "file:dev=1:ino=200:mode=0644:size=41:nlink=1:sha256=" + "d" * 64,
+        **workspace_git_entry,
+    }
+
+    before = (head, hashes, True, None, canonical_identity, before_metadata)
+    after = (head, hashes, True, None, canonical_identity, after_metadata)
+
+    evidence = run_loop._review_preservation_evidence(
+        attempt=1,
+        workspace=ws,
+        before=before,
+        after=after,
+        allowed_source_paths=("app.txt",),
+        allowed_side_effect_paths=(),
+    )
+
+    assert evidence["repository_identity_preserved"] is False
+    assert evidence["protected_git_metadata_preserved"] is False
+
+
+def test_target04_canonical_index_identity_lifecycle_tolerates_natural_refresh(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(Section 16, full lifecycle) A benign Git index stat-cache refresh
+    (a real `git status` invocation, the exact Run-004 mechanism) landing
+    between the outer pre-Review1 and post-Review1 observations must not
+    block the loop -- it must reach a normal APPROVE completion."""
+
+    ws = make_clean_workspace(tmp_path)
+    claude = write_fake_claude(tmp_path, name="claude-index-refresh")
+    codex = write_fake_codex(
+        tmp_path, name="codex-index-refresh", verdict_json=approve_verdict_json()
+    )
+
+    real_snapshot_for_review = run_loop._snapshot_workspace_for_review
+    call_count = {"n": 0}
+    refreshed = {"done": False}
+
+    def refreshing_snapshot(workspace: Path, **kwargs: object) -> tuple:
+        call_count["n"] += 1
+        # Calls 1-2 are the L2/L3 capability-probe pair inside
+        # _deep_preflight (before Attempt 1 runs). Call 3 is
+        # pre_review1_snapshot (right after Attempt 1 changed app.txt's
+        # mtime, but before anything re-inspects the tree). Call 4 is
+        # post_review1_snapshot, after the real Review 1 child process has
+        # run. Triggering the refresh right there -- immediately before
+        # call 4's own measurement -- lands it strictly between
+        # pre_review1_snapshot and post_review1_snapshot, exactly like
+        # Run 004.
+        if call_count["n"] == 4 and not refreshed["done"]:
+            refreshed["done"] = True
+            subprocess.run(["git", "status"], cwd=str(workspace), capture_output=True)
+        return real_snapshot_for_review(workspace, **kwargs)
+
+    monkeypatch.setattr(run_loop, "_snapshot_workspace_for_review", refreshing_snapshot)
+
+    loop_id = "loop-canonical-index-refresh"
+    loop_root = tmp_path / "loops"
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, loop_run_id=loop_id, evidence_directory=loop_root
+    )
+
+    assert refreshed["done"] is True
+    assert exit_code == 0
+    result = load_result(loop_root / loop_id)
+    assert result["final_verdict"] == "APPROVE"
+    assert result["terminal_outcome"] == "COMPLETED"
+    # Confirm the tolerance path was genuinely exercised -- a real raw
+    # index-descriptor difference was observed (not merely absent) and
+    # still counted as preserved.
+    review1_observation = result["review_workspace_observations"][0]
+    assert review1_observation["protected_git_metadata_changed_path_count"] >= 1
+    assert review1_observation["protected_git_metadata_preserved"] is True
+    assert review1_observation["index_representation_diagnostic"] is not None

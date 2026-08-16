@@ -3372,5 +3372,397 @@ def test_falsy_workspace_cannot_authorize_side_effects(tmp_path: Path) -> None:
     assert excinfo.value.category == "IMPLEMENTATION_WORKSPACE_MISMATCH"
 
 
+# ---------------------------------------------------------------------------
+# Canonical effective-index identity (TARGET04_CANONICAL_INDEX_IDENTITY_FIX):
+# `canonical_index_projection`, `git_index_identity`,
+# `protected_git_metadata_preserved`, `describe_index_representation_diff`.
+# ---------------------------------------------------------------------------
+
+
+def make_committed_workspace(tmp_path: Path, files: dict[str, str] | None = None) -> Path:
+    """A tiny Git repo with everything committed -- a clean, matching index/HEAD/worktree."""
+
+    ws = tmp_path / "index-workspace"
+    ws.mkdir()
+    payload = files if files is not None else {"a.txt": "content-a\n", "b.txt": "content-b\n"}
+    for rel, content in payload.items():
+        path = ws / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+    _git(["init", "-q"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], ws)
+    return ws
+
+
+def _rev_parse(ws: Path, ref: str = "HEAD") -> str:
+    return subprocess.run(
+        ["git", "rev-parse", ref], cwd=str(ws), capture_output=True, text=True, check=True
+    ).stdout.strip()
+
+
+def test_canonical_index_identity_tolerates_git_stat_cache_refresh(tmp_path: Path) -> None:
+    """(Section 10, positive) Reproduces the exact Run-004 class: a benign
+    Git stat-cache refresh (the first `git` command to inspect a tree whose
+    tracked file mtime changed since the index was last written) rewrites
+    `.git/index`'s raw physical bytes, with every repository-relevant index
+    semantic unchanged. Canonical identity must be equal even though the
+    raw descriptor differs."""
+
+    ws = make_committed_workspace(tmp_path)
+    before_projection = run_review.canonical_index_projection(ws)
+    before_identity = run_review.git_index_identity(ws)
+    index_path = run_review.git_dir(ws) / "index"
+    before_raw_index_bytes = index_path.read_bytes()
+
+    os.utime(ws / "a.txt", (time.time() + 5, time.time() + 5))
+    subprocess.run(["git", "status"], cwd=str(ws), capture_output=True, check=True)
+
+    after_projection = run_review.canonical_index_projection(ws)
+    after_identity = run_review.git_index_identity(ws)
+    after_raw_index_bytes = index_path.read_bytes()
+
+    assert before_raw_index_bytes != after_raw_index_bytes, (
+        "test setup must actually trigger a raw index rewrite"
+    )
+    assert before_projection is not None
+    assert after_projection == before_projection
+    assert after_identity is not None
+    assert after_identity == before_identity
+
+
+def test_protected_git_metadata_preserved_tolerates_index_only_representation_change(
+    tmp_path: Path,
+) -> None:
+    """(Section 10, end-to-end) CANONICAL_INDEX_EQUAL=YES,
+    RAW_INDEX_DESCRIPTOR_EQUAL=NO, REPOSITORY_IDENTITY_PRESERVED=YES. No
+    source/product change should be attributed to this."""
+
+    ws = make_committed_workspace(tmp_path)
+    before_metadata = run_review.protected_git_metadata_snapshot(ws)
+    before_index_identity = run_review.git_index_identity(ws)
+
+    os.utime(ws / "a.txt", (time.time() + 5, time.time() + 5))
+    subprocess.run(["git", "status"], cwd=str(ws), capture_output=True, check=True)
+
+    after_metadata = run_review.protected_git_metadata_snapshot(
+        ws, trusted_baseline=before_metadata
+    )
+    after_index_identity = run_review.git_index_identity(ws)
+
+    assert before_metadata["git_dir/index"] != after_metadata["git_dir/index"]
+    assert before_index_identity == after_index_identity
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before_metadata,
+            after_metadata,
+            canonical_index_identity_before=before_index_identity,
+            canonical_index_identity_after=after_index_identity,
+        )
+        is True
+    )
+
+
+def test_canonical_index_identity_changes_when_path_added(tmp_path: Path) -> None:
+    """(Section 11.A) staged path added."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    _git(["add", "new.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_when_path_removed(tmp_path: Path) -> None:
+    """(Section 11.B) staged path removed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    _git(["rm", "-q", "a.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_when_staged_object_id_changes(tmp_path: Path) -> None:
+    """(Section 11.C) staged object id changed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    (ws / "a.txt").write_text("different content\n", encoding="utf-8")
+    _git(["add", "a.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_when_mode_changes(tmp_path: Path) -> None:
+    """(Section 11.D) staged mode changed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    (ws / "a.txt").chmod(0o755)
+    _git(["add", "a.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_with_unmerged_stages(tmp_path: Path) -> None:
+    """(Section 11.E) stage number changed (an unresolved merge conflict
+    introduces stage 1/2/3 entries in place of the single stage-0 entry)."""
+
+    ws = tmp_path / "conflict-ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("base\n", encoding="utf-8")
+    _git(["init", "-q"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "base"], ws)
+    base_commit = _rev_parse(ws)
+    before = run_review.git_index_identity(ws)
+
+    _git(["checkout", "-q", "-b", "branch-a", base_commit], ws)
+    (ws / "f.txt").write_text("a-version\n", encoding="utf-8")
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-am", "a"], ws)
+    _git(["checkout", "-q", "-b", "branch-b", base_commit], ws)
+    (ws / "f.txt").write_text("b-version\n", encoding="utf-8")
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-am", "b"], ws)
+    subprocess.run(["git", "merge", "branch-a", "-q"], cwd=str(ws), capture_output=True)
+
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+    projection = run_review.canonical_index_projection(ws)
+    assert projection is not None
+    assert any(
+        key.startswith("entry:") and key.rsplit(":", 1)[-1] in ("1", "2", "3")
+        for key in projection
+    )
+
+
+def test_canonical_index_identity_changes_with_assume_unchanged_toggle(tmp_path: Path) -> None:
+    """(Section 11.F) assume-unchanged semantic state changed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    _git(["update-index", "--assume-unchanged", "a.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_with_skip_worktree_toggle(tmp_path: Path) -> None:
+    """(Section 11.G) skip-worktree semantic state changed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    _git(["update-index", "--skip-worktree", "a.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_identity_changes_with_intent_to_add(tmp_path: Path) -> None:
+    """(Section 11.H) intent-to-add state changed."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    _git(["add", "-N", "new.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+    projection = run_review.canonical_index_projection(ws)
+    assert projection is not None
+    assert any(
+        key.startswith("entry:") and "intent_to_add=1" in value
+        for key, value in projection.items()
+    )
+
+
+def test_canonical_index_identity_changes_with_resolve_undo_state(tmp_path: Path) -> None:
+    """(Section 11.I) resolve-undo canonical state changed: resolving a
+    merge conflict (which records resolve-undo information) changes the
+    identity relative to the still-unmerged state, and the resolve-undo
+    record is present in the projection."""
+
+    ws = tmp_path / "resolve-undo-ws"
+    ws.mkdir()
+    (ws / "f.txt").write_text("base\n", encoding="utf-8")
+    _git(["init", "-q"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "base"], ws)
+    base_commit = _rev_parse(ws)
+
+    _git(["checkout", "-q", "-b", "branch-a", base_commit], ws)
+    (ws / "f.txt").write_text("a-version\n", encoding="utf-8")
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-am", "a"], ws)
+    _git(["checkout", "-q", "-b", "branch-b", base_commit], ws)
+    (ws / "f.txt").write_text("b-version\n", encoding="utf-8")
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-am", "b"], ws)
+    subprocess.run(["git", "merge", "branch-a", "-q"], cwd=str(ws), capture_output=True)
+    before = run_review.git_index_identity(ws)
+
+    subprocess.run(["git", "checkout", "--ours", "--", "f.txt"], cwd=str(ws), capture_output=True, check=True)
+    _git(["add", "f.txt"], ws)
+
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+    projection = run_review.canonical_index_projection(ws)
+    assert projection is not None
+    assert any(key.startswith("resolve_undo:") for key in projection)
+
+
+def test_canonical_index_identity_changes_when_path_bytes_change(tmp_path: Path) -> None:
+    """(Section 11.J) path bytes changed (a rename)."""
+
+    ws = make_committed_workspace(tmp_path)
+    before = run_review.git_index_identity(ws)
+    _git(["mv", "a.txt", "a-renamed.txt"], ws)
+    after = run_review.git_index_identity(ws)
+    assert before is not None and after is not None and before != after
+
+
+def test_canonical_index_projection_blocks_on_unclassified_tag(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(Section 11.K) An unrecognized/unclassified index state -- here, a
+    tag letter `ls-files --stage -t -v -z` would only ever emit for
+    -d/-m/-o/-k/--resolve-undo listing modes this query never requests --
+    must block (return None), never be silently accepted."""
+
+    ws = make_committed_workspace(tmp_path)
+    real_run_git_bytes = run_review._run_git_bytes
+
+    def faking(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["ls-files", "--stage"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=b"? 100644 " + b"0" * 40 + b" 0\tweird.txt\x00",
+                stderr=b"",
+            )
+        return real_run_git_bytes(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git_bytes", faking)
+
+    assert run_review.canonical_index_projection(ws) is None
+    assert run_review.git_index_identity(ws) is None
+
+
+def test_canonical_index_projection_blocks_on_duplicate_entry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(Section 11.K) A duplicate (path, stage) pair is an internally
+    inconsistent observation and must block."""
+
+    ws = make_committed_workspace(tmp_path)
+    real_run_git_bytes = run_review._run_git_bytes
+    duplicate_record = b"H 100644 " + b"a" * 40 + b" 0\ta.txt\x00"
+
+    def faking(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["ls-files", "--stage"]:
+            return subprocess.CompletedProcess(
+                args=["git", *args],
+                returncode=0,
+                stdout=duplicate_record + duplicate_record,
+                stderr=b"",
+            )
+        return real_run_git_bytes(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git_bytes", faking)
+
+    assert run_review.canonical_index_projection(ws) is None
+
+
+def test_canonical_index_projection_is_byte_safe_for_non_utf8_paths() -> None:
+    """Byte-safe path handling: a raw path byte sequence that is not valid
+    UTF-8 parses without loss, and different raw bytes never collapse to
+    the same canonical identity."""
+
+    record_a = b"H 100644 " + b"a" * 40 + b" 0\tweird-\xff-name.txt"
+    record_b = b"H 100644 " + b"a" * 40 + b" 0\tweird-\xfe-name.txt"
+    parsed_a = run_review._parse_canonical_index_stage_record(record_a)
+    parsed_b = run_review._parse_canonical_index_stage_record(record_b)
+    assert parsed_a is not None and parsed_b is not None
+    assert parsed_a[0] == b"weird-\xff-name.txt"
+    assert parsed_a[0].hex() != parsed_b[0].hex()
+
+
+def test_protected_git_metadata_preserved_rejects_non_index_key_change() -> None:
+    """(Section 7) A change to any NON-index protected key must still
+    block, even when canonical index identity matches -- this correction
+    only tolerates the index representation issue, nothing else."""
+
+    before = {
+        "git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64,
+        "git_dir/HEAD": "file:dev=1:ino=2:mode=0644:size=1:nlink=1:sha256=" + "b" * 64,
+    }
+    after = dict(before)
+    after["git_dir/HEAD"] = "file:dev=1:ino=2:mode=0644:size=1:nlink=1:sha256=" + "c" * 64
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, after, canonical_index_identity_before="same", canonical_index_identity_after="same"
+        )
+        is False
+    )
+
+
+def test_protected_git_metadata_preserved_rejects_when_canonical_index_identity_differs() -> None:
+    """(Section 6) A raw index descriptor difference is only tolerated when
+    the canonical index identity itself is proven unchanged."""
+
+    before = {"git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    after = {"git_dir/index": "file:dev=1:ino=2:mode=0644:size=1:nlink=1:sha256=" + "b" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, after, canonical_index_identity_before="X", canonical_index_identity_after="Y"
+        )
+        is False
+    )
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, after, canonical_index_identity_before=None, canonical_index_identity_after=None
+        )
+        is False
+    )
+
+
+def test_protected_git_metadata_preserved_true_when_nothing_changed() -> None:
+    same = {"git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            same, dict(same), canonical_index_identity_before="X", canonical_index_identity_after="X"
+        )
+        is True
+    )
+
+
+def test_protected_git_metadata_preserved_false_on_empty_snapshot() -> None:
+    before = {"git_dir/index": "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64}
+    assert (
+        run_review.protected_git_metadata_preserved(
+            before, {}, canonical_index_identity_before="X", canonical_index_identity_after="X"
+        )
+        is False
+    )
+
+
+def test_describe_index_representation_diff_reports_bounded_fields() -> None:
+    """(Section 15) Bounded diagnostic: reports exactly which stable fields
+    differ, never an unbounded dump."""
+
+    before = "file:dev=1:ino=100:mode=0644:size=10:nlink=1:sha256=" + "a" * 64
+    after = "file:dev=1:ino=200:mode=0644:size=10:nlink=1:sha256=" + "b" * 64
+    diff = run_review.describe_index_representation_diff(before, after)
+    assert diff == {
+        "dev_changed": False,
+        "ino_changed": True,
+        "mode_changed": False,
+        "size_changed": False,
+        "nlink_changed": False,
+        "sha256_changed": True,
+    }
+
+
+def test_describe_index_representation_diff_none_on_non_matching_descriptor() -> None:
+    assert run_review.describe_index_representation_diff(None, "file:dev=1:ino=1:mode=0644:size=1:nlink=1:sha256=" + "a" * 64) is None
+    assert run_review.describe_index_representation_diff("not-a-descriptor", "also-not-one") is None
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))

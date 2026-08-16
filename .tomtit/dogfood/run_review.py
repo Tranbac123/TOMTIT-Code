@@ -122,6 +122,20 @@ _STABLE_FILE_DESCRIPTOR_RE = re.compile(
     r"sha256=(?P<sha256>[0-9a-f]{64})"
 )
 
+# Canonical effective-index identity (see `canonical_index_projection`,
+# `git_index_identity`). Byte-safe: built from `-z`-terminated, byte-mode
+# subprocess output (`_run_git_bytes`), never text-mode, so no path byte
+# sequence is lost or collapsed through a lossy Unicode round-trip. Every
+# parsed field must fullmatch these grammars or the whole observation is
+# unclassified.
+_INDEX_MODE_RE = re.compile(rb"[0-7]{6}")
+_INDEX_OBJECT_ID_RE = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+# `git ls-files --stage -t -v -z` tag letters for a plain `--stage` (cached)
+# listing: H = ordinary cached entry, S = skip-worktree, M = unmerged.
+# R/C/K/?/U only appear when -d/-m/-o/-k/--resolve-undo are also requested,
+# which this query never does -- any other letter is unclassified.
+_INDEX_STAGE_BASE_TAGS = frozenset({b"H", b"S", b"M"})
+
 VALID_VERDICTS = ("APPROVE", "REQUEST_CHANGES", "BLOCKED")
 VALID_SEVERITIES = ("HIGH", "MEDIUM", "LOW")
 
@@ -906,6 +920,31 @@ def _run_git(args: list[str], cwd: Path, *, timeout: float = 30.0) -> subprocess
     )
 
 
+def _run_git_bytes(args: list[str], cwd: Path, *, timeout: float = 30.0) -> subprocess.CompletedProcess:
+    """Byte-oriented variant of `_run_git` for output that may contain
+    arbitrary path bytes (e.g. `ls-files -z`). Text-mode subprocess capture
+    round-trips through the process's locale encoding, which is lossy for
+    path bytes that are not valid text in that encoding; canonical index
+    identity must not depend on that round-trip. Narrow and index-specific
+    -- `_run_git` itself is unchanged and remains the right choice for
+    output that is genuinely text (revisions, refs, porcelain summaries).
+    """
+
+    env = os.environ.copy()
+    env["GIT_OPTIONAL_LOCKS"] = "0"
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        env=env,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=False,
+        timeout=timeout,
+        check=False,
+    )
+
+
 def git_rev_parse(cwd: Path, ref: str) -> str | None:
     completed = _run_git(["rev-parse", "--verify", ref], cwd)
     if completed.returncode != 0:
@@ -1368,13 +1407,265 @@ def git_index_clean(cwd: Path) -> bool:
     return completed.returncode == 0
 
 
-def git_index_identity(cwd: Path) -> str | None:
-    """Hash index entries, stages, modes, blob ids, paths, and semantic flags."""
+def _parse_canonical_index_stage_record(
+    record: bytes,
+) -> tuple[bytes, int, bytes, bytes, bool, bool] | None:
+    """Parse one `git ls-files --stage -t -v -z` NUL-delimited record.
 
-    completed = _run_git(["ls-files", "--stage", "-v", "-z"], cwd)
-    if completed.returncode != 0:
+    Returns `(path_bytes, stage, mode, object_id, skip_worktree,
+    assume_unchanged)`, or `None` if the record is not a fully recognized
+    cached-index entry -- an unsupported/unclassified tag letter, a
+    malformed mode/object id/stage, or an unexpected field count are all
+    treated identically: cannot classify, caller must fail closed.
+    """
+
+    try:
+        prefix, path_bytes = record.split(b"\t", 1)
+    except ValueError:
         return None
-    return _sha256(completed.stdout.encode("utf-8", errors="surrogateescape"))
+    fields = prefix.split(b" ")
+    if len(fields) != 4:
+        return None
+    tag, mode, object_id, stage_bytes = fields
+    if len(tag) != 1 or not tag.isalpha():
+        return None
+    assume_unchanged = tag.islower()
+    base_tag = tag.upper()
+    if base_tag not in _INDEX_STAGE_BASE_TAGS:
+        return None
+    if not _INDEX_MODE_RE.fullmatch(mode):
+        return None
+    if not _INDEX_OBJECT_ID_RE.fullmatch(object_id):
+        return None
+    if not stage_bytes.isdigit():
+        return None
+    stage = int(stage_bytes)
+    if stage not in (0, 1, 2, 3):
+        return None
+    return (path_bytes, stage, mode, object_id, base_tag == b"S", assume_unchanged)
+
+
+def _parse_canonical_resolve_undo_record(
+    record: bytes,
+) -> tuple[bytes, int, bytes, bytes] | None:
+    """Parse one `git ls-files --resolve-undo -z` NUL-delimited record."""
+
+    try:
+        prefix, path_bytes = record.split(b"\t", 1)
+    except ValueError:
+        return None
+    fields = prefix.split(b" ")
+    if len(fields) != 3:
+        return None
+    mode, object_id, stage_bytes = fields
+    if not _INDEX_MODE_RE.fullmatch(mode) or not _INDEX_OBJECT_ID_RE.fullmatch(object_id):
+        return None
+    if not stage_bytes.isdigit():
+        return None
+    stage = int(stage_bytes)
+    if stage not in (1, 2, 3):
+        return None
+    return (path_bytes, stage, mode, object_id)
+
+
+def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
+    """Parse `git status --porcelain=v2 --untracked-files=no -z` output for
+    intent-to-add paths: an ordinary changed entry (`1 ...`) whose index
+    mode (`mI`) and HEAD mode (`mH`) are both `000000` is a path staged only
+    via `git add -N` -- a real cached-index entry exists for it (see
+    `canonical_index_projection`, which sees an ordinary `H`-tagged entry
+    with the empty-blob object id and cannot distinguish it from a
+    genuinely empty tracked file on its own), but with no real staged
+    content yet. Porcelain v2 is git's own documented, stable,
+    script-oriented plumbing format -- not the explicitly unstable
+    `--debug` output.
+
+    Returns `None` if any record cannot be confidently parsed (fails closed).
+    """
+
+    paths: set[bytes] = set()
+    for record in stdout.split(b"\x00"):
+        if not record or not record.startswith(b"1 "):
+            continue
+        fields = record.split(b" ", 8)
+        if len(fields) != 9:
+            return None
+        _marker, xy, sub, mode_head, mode_index, _mode_worktree, _hash_head, _hash_index, path_bytes = fields
+        if len(xy) != 2 or len(sub) != 4:
+            return None
+        if not _INDEX_MODE_RE.fullmatch(mode_head) or not _INDEX_MODE_RE.fullmatch(mode_index):
+            return None
+        if mode_index == b"000000" and mode_head == b"000000":
+            paths.add(path_bytes)
+    return paths
+
+
+def canonical_index_projection(cwd: Path) -> dict[str, str] | None:
+    """Build the canonical effective-index identity.
+
+    For every index entry: its exact byte-safe path, stage, Git mode, full
+    object id, and assume-unchanged/skip-worktree/intent-to-add state. For
+    every resolve-undo record: its path, stage, mode, and object id. This
+    represents the repository-relevant *meaning* of the index, not a
+    particular physical on-disk encoding -- an ordinary index, a
+    split-index layout, and a sparse-index physical compaction that resolve
+    to the same effective per-path state produce the same projection here,
+    because `git ls-files` itself already resolves all of those into one
+    logical listing (no `--sparse` flag is passed, so sparse directories
+    are always expanded to their contained files rather than left
+    compacted).
+
+    Returns `None` -- fails closed -- on any git command failure, any
+    unparseable/unclassified record (an unsupported tag letter, a malformed
+    mode/object id/stage, an unexpected field count), or a duplicate
+    (path, stage) pair (an internally inconsistent observation). Never
+    guesses at an unrecognized state.
+
+    The three underlying git invocations (`ls-files --stage`, `status
+    --porcelain=v2`, `ls-files --resolve-undo`) run back-to-back with no
+    intervening work, which is as coherent an observation boundary as a
+    CLI-based query can practically offer; TOMTIT's own controlled
+    execution model never mutates the index concurrently with this call.
+    """
+
+    stage_completed = _run_git_bytes(["ls-files", "--stage", "-t", "-v", "-z"], cwd)
+    if stage_completed.returncode != 0:
+        return None
+    status_completed = _run_git_bytes(
+        ["status", "--porcelain=v2", "--untracked-files=no", "-z"], cwd
+    )
+    if status_completed.returncode != 0:
+        return None
+    undo_completed = _run_git_bytes(["ls-files", "--resolve-undo", "-z"], cwd)
+    if undo_completed.returncode != 0:
+        return None
+
+    intent_to_add_paths = _intent_to_add_paths_from_status_v2(status_completed.stdout)
+    if intent_to_add_paths is None:
+        return None
+
+    projection: dict[str, str] = {}
+    for record in stage_completed.stdout.split(b"\x00"):
+        if not record:
+            continue
+        parsed = _parse_canonical_index_stage_record(record)
+        if parsed is None:
+            return None
+        path_bytes, stage, mode, object_id, skip_worktree, assume_unchanged = parsed
+        key = f"entry:{path_bytes.hex()}:{stage}"
+        if key in projection:
+            return None
+        intent_to_add = path_bytes in intent_to_add_paths
+        projection[key] = (
+            f"mode={mode.decode('ascii')}:object={object_id.decode('ascii')}:"
+            f"skip_worktree={int(skip_worktree)}:assume_unchanged={int(assume_unchanged)}:"
+            f"intent_to_add={int(intent_to_add)}"
+        )
+
+    for record in undo_completed.stdout.split(b"\x00"):
+        if not record:
+            continue
+        parsed_undo = _parse_canonical_resolve_undo_record(record)
+        if parsed_undo is None:
+            return None
+        undo_path_bytes, undo_stage, undo_mode, undo_object_id = parsed_undo
+        key = f"resolve_undo:{undo_path_bytes.hex()}:{undo_stage}"
+        if key in projection:
+            return None
+        projection[key] = f"mode={undo_mode.decode('ascii')}:object={undo_object_id.decode('ascii')}"
+
+    return projection
+
+
+def git_index_identity(cwd: Path) -> str | None:
+    """Canonical effective-index identity hash (see
+    `canonical_index_projection`): exact byte-safe path, stage, mode, full
+    object id, assume-unchanged, skip-worktree, intent-to-add, and
+    resolve-undo state for every index entry. Equivalent effective index
+    states (ordinary/split/sparse index layouts) hash identically; any
+    parse failure or unrecognized/unclassified index state returns `None`,
+    which fails closed at every comparison site that requires equality
+    against a real hash.
+    """
+
+    projection = canonical_index_projection(cwd)
+    if projection is None:
+        return None
+    return workspace_hash(projection)
+
+
+# The two possible protected-metadata keys for the physical `.git/index`
+# file (see `snapshot_type_aware_tree`'s `f"{role}/{relative}"` key
+# convention): "index" is always at the root of `git_dir`, and -- only for
+# an ordinary non-linked-worktree repository, where `git_common_dir`
+# resolves to the same directory as `git_dir` -- also at the root of
+# `git_common_dir`.
+_GIT_INDEX_METADATA_KEYS = frozenset({"git_dir/index", "git_common_dir/index"})
+
+
+def protected_git_metadata_preserved(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    *,
+    canonical_index_identity_before: str | None,
+    canonical_index_identity_after: str | None,
+) -> bool:
+    """Whether protected Git metadata is preserved between two coherent
+    `protected_git_metadata_snapshot()`-shaped observations.
+
+    A raw `.git/index` descriptor difference confined *exactly* to the
+    index key(s) -- with every other protected key byte-for-byte unchanged
+    -- does not by itself indicate real repository drift, provided the
+    canonical effective index identity (`git_index_identity`,
+    `canonical_index_projection`) is itself unchanged: Git may rewrite the
+    index's physical bytes as a routine, harmless stat-cache refresh (the
+    first `git` command that inspects a tree whose file mtimes changed
+    since the index was last written) with no semantic effect at all.
+
+    Any OTHER protected key changing, or the canonical index identity
+    itself changing, still fails this closed exactly as before -- this
+    never weakens protection for HEAD, refs, config, gitdir/common-dir role
+    identity, or any other protected path; see
+    TARGET04_CANONICAL_INDEX_IDENTITY_FIX_REPORT.md.
+    """
+
+    if not before or not after:
+        return False
+    changed = diff_workspace_hashes(before, after)
+    if not changed:
+        return True
+    if any(key not in _GIT_INDEX_METADATA_KEYS for key in changed):
+        return False
+    return (
+        canonical_index_identity_before is not None
+        and canonical_index_identity_before == canonical_index_identity_after
+    )
+
+
+def describe_index_representation_diff(
+    before_descriptor: str | None,
+    after_descriptor: str | None,
+) -> dict[str, bool] | None:
+    """Bounded diagnostic only: when a raw `.git/index` descriptor differs
+    but is being tolerated because the canonical effective index identity
+    is unchanged, report which specific stable-projected fields actually
+    differed -- never an unbounded dump. Returns `None` if either
+    descriptor is missing or does not match the exact stable `file:`
+    descriptor grammar (see `_STABLE_FILE_DESCRIPTOR_RE`).
+    """
+
+    if before_descriptor is None or after_descriptor is None:
+        return None
+    before_match = _STABLE_FILE_DESCRIPTOR_RE.fullmatch(before_descriptor)
+    after_match = _STABLE_FILE_DESCRIPTOR_RE.fullmatch(after_descriptor)
+    if before_match is None or after_match is None:
+        return None
+    before_fields = before_match.groupdict()
+    after_fields = after_match.groupdict()
+    return {
+        f"{field}_changed": before_fields[field] != after_fields[field]
+        for field in ("dev", "ino", "mode", "size", "nlink", "sha256")
+    }
 
 
 def git_status_porcelain(cwd: Path) -> str:
@@ -1560,23 +1851,34 @@ def review_repository_identity_preserved(
     baseline_commit: str,
     expected_head: str,
     expected_index_identity: str,
-    expected_git_metadata_hash: str,
-    actual_git_metadata_hash: str | None = None,
+    expected_git_metadata: Mapping[str, str],
+    actual_git_metadata: Mapping[str, str],
 ) -> bool:
-    """Require the complete repository identity used by review/repair preflight."""
+    """Require the complete repository identity used by review/repair preflight.
 
-    if actual_git_metadata_hash is None:
-        try:
-            actual_git_metadata_hash = protected_git_metadata_hash(workspace)
-        except EvidenceIntegrityFailure:
-            return False
+    `expected_git_metadata`/`actual_git_metadata` are full protected Git
+    metadata projections (not pre-hashed): a raw `.git/index` descriptor
+    difference confined to that one protected key can be tolerated when the
+    canonical effective index identity (`expected_index_identity` vs the
+    freshly measured `git_index_identity(workspace)`, already required to
+    match immediately below) is itself unchanged -- see
+    `protected_git_metadata_preserved`. Every other protected key, and the
+    canonical index identity itself, remain exactly as strict as before.
+    """
+
+    actual_index_identity = git_index_identity(workspace)
     return (
         (git_rev_parse(workspace, "HEAD") or "") == expected_head
         and git_index_clean(workspace)
-        and git_index_identity(workspace) == expected_index_identity
+        and actual_index_identity == expected_index_identity
         and git_special_state(workspace) is None
         and git_rev_parse(workspace, baseline_ref) == baseline_commit
-        and actual_git_metadata_hash == expected_git_metadata_hash
+        and protected_git_metadata_preserved(
+            expected_git_metadata,
+            actual_git_metadata,
+            canonical_index_identity_before=expected_index_identity,
+            canonical_index_identity_after=actual_index_identity,
+        )
     )
 
 
@@ -2604,7 +2906,6 @@ def main(
         print(f"MESSAGE={exc}")
         return 3
     review_entry_git_metadata = review_entry_baseline.stable_projection
-    review_entry_git_metadata_hash = workspace_hash(review_entry_git_metadata)
     review_entry_git_entry_hash = workspace_git_entry_hash_from_snapshot(
         review_entry_git_metadata
     )
@@ -2630,7 +2931,6 @@ def main(
         )
     except EvidenceIntegrityFailure:
         capability_probe_git_metadata = {}
-    capability_probe_git_metadata_hash = workspace_hash(capability_probe_git_metadata)
     capability_probe_git_entry_hash = (
         workspace_git_entry_hash_from_snapshot(capability_probe_git_metadata)
         if capability_probe_git_metadata
@@ -2643,8 +2943,8 @@ def main(
             baseline_commit=baseline_commit,
             expected_head=review_entry_head,
             expected_index_identity=review_entry_index_identity,
-            expected_git_metadata_hash=review_entry_git_metadata_hash,
-            actual_git_metadata_hash=capability_probe_git_metadata_hash,
+            expected_git_metadata=review_entry_git_metadata,
+            actual_git_metadata=capability_probe_git_metadata,
         )
     )
     if (
@@ -2682,7 +2982,6 @@ def main(
         )
     except EvidenceIntegrityFailure:
         post_check_git_metadata = {}
-    post_check_git_metadata_hash = workspace_hash(post_check_git_metadata)
     post_check_git_entry_hash = (
         workspace_git_entry_hash_from_snapshot(post_check_git_metadata)
         if post_check_git_metadata
@@ -2701,8 +3000,8 @@ def main(
         baseline_commit=baseline_commit,
         expected_head=review_entry_head,
         expected_index_identity=review_entry_index_identity,
-        expected_git_metadata_hash=review_entry_git_metadata_hash,
-        actual_git_metadata_hash=post_check_git_metadata_hash,
+        expected_git_metadata=review_entry_git_metadata,
+        actual_git_metadata=post_check_git_metadata,
     )
     if not check_repository_identity_preserved or not check_preservation.workspace_preserved:
         if provider_observer is not None:
@@ -2802,8 +3101,8 @@ def main(
             baseline_commit=baseline_commit,
             expected_head=post_check_head,
             expected_index_identity=post_check_index_identity,
-            expected_git_metadata_hash=post_check_git_metadata_hash,
-            actual_git_metadata_hash=review_exit_git_metadata_hash,
+            expected_git_metadata=post_check_git_metadata,
+            actual_git_metadata=review_exit_git_metadata,
         )
         repository_identity_preserved = review_repository_identity_preserved(
             workspace,
@@ -2811,8 +3110,8 @@ def main(
             baseline_commit=baseline_commit,
             expected_head=review_entry_head,
             expected_index_identity=review_entry_index_identity,
-            expected_git_metadata_hash=review_entry_git_metadata_hash,
-            actual_git_metadata_hash=review_exit_git_metadata_hash,
+            expected_git_metadata=review_entry_git_metadata,
+            actual_git_metadata=review_exit_git_metadata,
         )
         workspace_unchanged = (
             preservation.workspace_preserved
