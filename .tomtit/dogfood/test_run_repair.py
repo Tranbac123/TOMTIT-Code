@@ -340,6 +340,7 @@ def run_repair_cli(
     evidence_directory: Path | None = None,
     implementation_run_id: str = "impl-1",
     implementation_attempt: int = 1,
+    expected_review_run_id: str = "review-1",
 ) -> int:
     argv = [
         "--workspace",
@@ -350,6 +351,8 @@ def run_repair_cli(
         str(implementation_run_directory),
         "--review-run-directory",
         str(review_run_directory),
+        "--expected-review-run-id",
+        expected_review_run_id,
         "--timeout-seconds",
         str(timeout_seconds),
         "--claude-executable",
@@ -1520,6 +1523,7 @@ def preflight_for(
     review_run_directory: Path,
     implementation_run_id: str = "impl-1",
     implementation_attempt: int = 1,
+    expected_review_run_id: str = "review-1",
     allowed_paths: list[str],
     allowed_side_effect_paths: list[str] | None = None,
     task_prompt_file: Path | None = None,
@@ -1533,6 +1537,8 @@ def preflight_for(
         str(implementation_run_directory),
         "--review-run-directory",
         str(review_run_directory),
+        "--expected-review-run-id",
+        expected_review_run_id,
         "--timeout-seconds",
         "30",
         "--implementation-run-id",
@@ -2719,7 +2725,12 @@ def test_repair_rejects_semantic_git_metadata_drift_even_with_matching_stat_fiel
 
 
 def test_repair_blocks_when_reviewed_projection_missing(tmp_path: Path) -> None:
-    """(Section 9.A) Missing full projection -> repair blocks."""
+    """(Section 9.A) Missing full projection -> repair blocks. The
+    projection is itself a modern-evidence marker field (see B02): removing
+    it alone -- while every other modern field stays present -- is caught
+    by the modern-schema-completeness check, not by
+    `_load_trusted_review_projection()` (which is now unreachable for this
+    exact case, but kept as defense in depth)."""
 
     ctx = standard_setup(tmp_path, partitioned_identity=True)
     receipt_path = ctx["review_dir"] / "review-receipt.json"
@@ -2736,11 +2747,14 @@ def test_repair_blocks_when_reviewed_projection_missing(tmp_path: Path) -> None:
             allowed_paths=["app.txt"],
         )
 
-    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MISSING"
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
 
 
 def test_repair_blocks_when_reviewed_projection_malformed(tmp_path: Path) -> None:
-    """(Section 9.B) Malformed projection (not a string-mapping) -> repair blocks."""
+    """(Section 9.B) Malformed projection (not a string-mapping) -> repair
+    blocks at the modern-schema-completeness check (shared shape check with
+    `_load_trusted_review_projection()`), not silently downgraded to the
+    legacy whole-workspace-hash path."""
 
     ctx = standard_setup(tmp_path, partitioned_identity=True)
     receipt_path = ctx["review_dir"] / "review-receipt.json"
@@ -2757,7 +2771,7 @@ def test_repair_blocks_when_reviewed_projection_malformed(tmp_path: Path) -> Non
             allowed_paths=["app.txt"],
         )
 
-    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MALFORMED"
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
 
 
 def test_repair_blocks_when_reviewed_projection_empty(tmp_path: Path) -> None:
@@ -2779,7 +2793,7 @@ def test_repair_blocks_when_reviewed_projection_empty(tmp_path: Path) -> None:
             allowed_paths=["app.txt"],
         )
 
-    assert excinfo.value.category == "REVIEWED_PROTECTED_PROJECTION_MALFORMED"
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
 
 
 def test_repair_blocks_when_reviewed_projection_hash_mismatch(tmp_path: Path) -> None:
@@ -2870,6 +2884,267 @@ def test_target04_repair_lifecycle_semantic_drift_blocks_attempt2(tmp_path: Path
     Attempt 2 model must never be invoked."""
 
     ctx = standard_setup(tmp_path, partitioned_identity=True)
+    description_path = run_review.git_dir(ctx["ws"]) / "description"
+    mutated = bytearray(description_path.read_bytes())
+    mutated[0] ^= 0xFF
+    description_path.write_bytes(bytes(mutated))
+
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 3
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+# ---------------------------------------------------------------------------
+# B01_EXPECTED_REVIEW1_ID_UNBOUND -- repair must receive and verify the
+# parent loop's own authoritative Review1 run id, explicitly, before
+# trusting anything else in the review evidence. Never inferred from a
+# directory name, the receipt's own contents, the implementation identity,
+# or filesystem ordering.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_accepts_matching_expected_review_run_id(tmp_path: Path) -> None:
+    """(Section 4.A) The parent loop's expected Review1 id matches the
+    receipt's own review_run_id -> the normal trusted path continues."""
+
+    ws, baseline_commit, after_hash = make_reviewed_workspace(tmp_path)
+    impl_dir = make_implementation_evidence(tmp_path, workspace=ws, after_hash=after_hash)
+    review_dir = make_review_evidence(
+        tmp_path,
+        workspace=ws,
+        baseline_commit=baseline_commit,
+        review_run_id="review-authoritative-1",
+        partitioned_identity=True,
+    )
+
+    pre = preflight_for(
+        tmp_path,
+        ws,
+        implementation_run_directory=impl_dir,
+        review_run_directory=review_dir,
+        expected_review_run_id="review-authoritative-1",
+        allowed_paths=["app.txt"],
+    )
+
+    assert pre["fingerprint"].workspace == str(ws)
+
+
+def test_repair_blocks_when_expected_review_run_id_differs(tmp_path: Path) -> None:
+    """(Section 4.B / lifecycle CASE 2) receipt review_run_id differs from
+    the parent loop's expected Review1 id -> repair blocks before Attempt 2."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            expected_review_run_id="review-1-WRONG",
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEW_RUN_ID_MISMATCH"
+
+
+def test_repair_blocks_when_receipt_review_run_id_missing(tmp_path: Path) -> None:
+    """(Section 4.C) Modern repair evidence with no review_run_id at all
+    -> repair blocks. Every real receipt (legacy or modern) has always set
+    this field unconditionally, so its absence can only mean a tampered or
+    corrupt receipt -- never a genuine historical evidence shape."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    del receipt["review_run_id"]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEW_RUN_ID_MISSING"
+
+
+def test_repair_blocks_foreign_self_consistent_review_with_wrong_id(
+    tmp_path: Path,
+) -> None:
+    """(Section 4.D / lifecycle CASE 3) A foreign review receipt bound to
+    the exact same implementation run/attempt/workspace/baseline, with its
+    own internally self-consistent projection and hash, must still be
+    rejected -- because it is not the Review1 the parent loop actually
+    selected. Repair authority is which review, never merely whether a
+    review is internally valid."""
+
+    ws, baseline_commit, after_hash = make_reviewed_workspace(tmp_path)
+    impl_dir = make_implementation_evidence(tmp_path, workspace=ws, after_hash=after_hash)
+    genuine_review1_dir = make_review_evidence(
+        tmp_path,
+        workspace=ws,
+        baseline_commit=baseline_commit,
+        review_run_id="review-1",
+        partitioned_identity=True,
+        name="review-1-run",
+    )
+    foreign_review2_dir = make_review_evidence(
+        tmp_path,
+        workspace=ws,
+        baseline_commit=baseline_commit,
+        review_run_id="review-2",
+        partitioned_identity=True,
+        name="review-2-run",
+    )
+    assert (
+        json.loads((genuine_review1_dir / "review-receipt.json").read_text())["reviewed_protected_git_metadata_hash"]
+        == json.loads((foreign_review2_dir / "review-receipt.json").read_text())["reviewed_protected_git_metadata_hash"]
+    ), "the foreign review's own projection/hash must be internally self-consistent to make this a meaningful test"
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ws,
+            implementation_run_directory=impl_dir,
+            review_run_directory=foreign_review2_dir,
+            expected_review_run_id="review-1",
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "REVIEW_RUN_ID_MISMATCH"
+
+
+def test_target04_repair_lifecycle_wrong_review_id_blocks_attempt2(tmp_path: Path) -> None:
+    """(Section 16 CASE 2) Exact parent-loop lifecycle: the parent selected
+    review1_id=A, but the review evidence now carries review_run_id=B ->
+    the fake Attempt 2 model must NOT run."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    assert receipt["review_run_id"] == "review-1"
+    receipt["review_run_id"] = "review-1-REPLACED"
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+        expected_review_run_id="review-1",
+    )
+
+    assert exit_code == 3
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+# ---------------------------------------------------------------------------
+# B02_MODERN_EVIDENCE_CAN_DOWNGRADE_TO_LEGACY -- a receipt carrying the
+# modern trusted-projection marker field must always be treated as modern
+# evidence, and must never be able to shed the rest of the modern schema to
+# fall back to the legacy whole-workspace-hash path.
+# ---------------------------------------------------------------------------
+
+
+def test_repair_blocks_modern_marker_with_all_other_modern_fields_removed(
+    tmp_path: Path,
+) -> None:
+    """(Section 9, exact Codex B02 reproduction) Retain the trusted
+    projection (a modern-evidence marker on its own) while removing every
+    one of the other 13 partitioned-identity fields, and change the live
+    protected state to a same-length but semantically different value.
+    Expected: the receipt is recognized as incomplete modern evidence (never
+    silently reclassified as legacy), repair blocks, and the legacy
+    whole-workspace-hash path is never reached."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    projection = receipt["reviewed_protected_git_metadata_projection"]
+    assert isinstance(projection, dict) and projection
+
+    other_modern_only_fields = (
+        "reviewed_head",
+        "reviewed_index_clean",
+        "reviewed_index_identity",
+        "reviewed_protected_git_metadata_hash",
+        "reviewed_workspace_git_entry_hash",
+        "reviewed_git_special_state",
+        "reviewed_baseline_commit",
+        "reviewed_allowed_source_paths",
+        "reviewed_workspace_integrity_hash",
+        "reviewed_product_state_hash",
+        "reviewed_authorized_side_effect_state_hash",
+        "reviewed_unexpected_state_hash",
+        "reviewed_workspace_full_hash",
+    )
+    for field in other_modern_only_fields:
+        assert field in receipt
+        del receipt[field]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
+    description_path = run_review.git_dir(ctx["ws"]) / "description"
+    mutated = bytearray(description_path.read_bytes())
+    mutated[0] ^= 0xFF
+    description_path.write_bytes(bytes(mutated))
+
+    with pytest.raises(run_repair.IntegrityFailure) as excinfo:
+        preflight_for(
+            tmp_path,
+            ctx["ws"],
+            implementation_run_directory=ctx["impl_dir"],
+            review_run_directory=ctx["review_dir"],
+            allowed_paths=["app.txt"],
+        )
+
+    assert excinfo.value.category == "PREVIOUS_EVIDENCE_INCOMPLETE"
+
+
+def test_target04_repair_lifecycle_malformed_modern_downgrade_blocks_attempt2(
+    tmp_path: Path,
+) -> None:
+    """(Section 16 CASE 4) Full lifecycle version of the B02 reproduction:
+    the trusted projection is retained, every other modern field is
+    removed, live protected state differs -- modern classification is
+    retained (never downgraded to legacy), repair blocks, and the fake
+    Attempt 2 model is never invoked."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["review_dir"] / "review-receipt.json"
+    receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    other_modern_only_fields = (
+        "reviewed_head",
+        "reviewed_index_clean",
+        "reviewed_index_identity",
+        "reviewed_protected_git_metadata_hash",
+        "reviewed_workspace_git_entry_hash",
+        "reviewed_git_special_state",
+        "reviewed_baseline_commit",
+        "reviewed_allowed_source_paths",
+        "reviewed_workspace_integrity_hash",
+        "reviewed_product_state_hash",
+        "reviewed_authorized_side_effect_state_hash",
+        "reviewed_unexpected_state_hash",
+        "reviewed_workspace_full_hash",
+    )
+    for field in other_modern_only_fields:
+        del receipt[field]
+    receipt_path.write_text(json.dumps(receipt, indent=2), encoding="utf-8")
+
     description_path = run_review.git_dir(ctx["ws"]) / "description"
     mutated = bytearray(description_path.read_bytes())
     mutated[0] ^= 0xFF

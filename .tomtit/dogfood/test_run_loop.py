@@ -895,6 +895,7 @@ def test_workspace_drift_before_repair_rejected(tmp_path: Path) -> None:
         implementation_run_id="drift-impl-1",
         implementation_attempt=1,
         review_run_directory=review1["run_directory"],
+        expected_review_run_id="drift-review-1",
         allowed_paths=("app.txt",),
         check_commands=[],
         timeout_seconds=30,

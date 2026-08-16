@@ -23,6 +23,7 @@ Owner rerun example:
       --original-task-prompt-file .tomtit/dogfood/tasks/task.md \\
       --previous-implementation-run-directory .tomtit/dogfood/runs/<impl-run-id> \\
       --review-run-directory .tomtit/dogfood/reviews/<review-run-id> \\
+      --expected-review-run-id <review-run-id> \\
       --allowed-path app/page.tsx \\
       --check-command "npm run lint" \\
       --check-command "npm run build" \\
@@ -263,6 +264,38 @@ def _commit_object_exists(workspace: Path, commit: str) -> bool:
     return completed.returncode == 0
 
 
+def bind_review_to_expected_review_run(
+    review_receipt: dict[str, Any],
+    expected_review_run_id: str,
+) -> None:
+    """The parent run loop, never this tool, selects exactly which Review 1
+    evidence authorizes a repair -- `expected_review_run_id` is threaded in
+    explicitly from that selection (see `run_loop.invoke_repair()`), never
+    inferred from a directory name, the receipt's own contents, the
+    implementation identity, or filesystem ordering.
+
+    Must run before ANYTHING in `review_receipt` is trusted -- verdict,
+    findings, the reviewed protected projection, reviewed state hashes, or
+    repair authorization state -- because a receipt bound to the exact same
+    implementation run/attempt/workspace/baseline can still be a *different,
+    self-consistent* review (e.g. a foreign or superseded Review 2) that
+    must never substitute for the Review 1 the parent loop actually
+    selected.
+    """
+
+    actual_review_run_id = review_receipt.get("review_run_id")
+    if not isinstance(actual_review_run_id, str) or not actual_review_run_id:
+        raise IntegrityFailure(
+            "REVIEW_RUN_ID_MISSING",
+            "review evidence has no review_run_id",
+        )
+    if actual_review_run_id != expected_review_run_id:
+        raise IntegrityFailure(
+            "REVIEW_RUN_ID_MISMATCH",
+            "review evidence review_run_id does not match the expected Review 1 run id",
+        )
+
+
 def bind_review_to_implementation(
     *,
     review_receipt: dict[str, Any],
@@ -456,6 +489,23 @@ def _legacy_workspace_hash_with_root_gitfile(
     return workspace_hash(historical_hashes)
 
 
+def _is_stable_projection_mapping(value: object) -> bool:
+    """Shallow schema check for a stable protected-Git-metadata projection:
+    a non-empty mapping of string path/role keys to string descriptor
+    values. Shared between modern-evidence classification (which must
+    reject an incomplete/malformed projection as malformed modern evidence,
+    never silently fall back to legacy) and `_load_trusted_review_projection()`'s
+    deeper hash-bound verification, so the two can never disagree about
+    what "well-formed" means.
+    """
+
+    return (
+        isinstance(value, dict)
+        and bool(value)
+        and all(isinstance(key, str) and isinstance(item, str) for key, item in value.items())
+    )
+
+
 def _load_trusted_review_projection(
     review_receipt: dict[str, Any],
     *,
@@ -488,14 +538,7 @@ def _load_trusted_review_projection(
             "REVIEWED_PROTECTED_PROJECTION_MISSING",
             "review evidence has no reviewed protected Git metadata projection",
         )
-    if (
-        not isinstance(projection, dict)
-        or not projection
-        or not all(
-            isinstance(key, str) and isinstance(value, str)
-            for key, value in projection.items()
-        )
-    ):
+    if not _is_stable_projection_mapping(projection):
         raise IntegrityFailure(
             "REVIEWED_PROTECTED_PROJECTION_MALFORMED",
             "review evidence protected Git metadata projection is not a well-formed string mapping",
@@ -584,11 +627,24 @@ def prove_reviewed_state(
     )
     expected_unexpected_hash = review_receipt.get("reviewed_unexpected_state_hash")
     expected_full_hash = review_receipt.get("reviewed_workspace_full_hash")
+    expected_git_metadata_projection = review_receipt.get(
+        "reviewed_protected_git_metadata_projection"
+    )
+    # `reviewed_protected_git_metadata_projection` is a MODERN-EVIDENCE
+    # MARKER field, exactly like the other 12 partitioned-identity fields
+    # below: if it -- or any one of them -- is present at all, this receipt
+    # is modern evidence and the *complete* modern schema is required. There
+    # is no partial-modern state: a receipt can never keep the projection
+    # while silently losing enough of the rest to be treated as legacy (or
+    # vice versa). `_is_stable_projection_mapping` here is the same shallow
+    # shape check `_load_trusted_review_projection()` uses later for its own
+    # deeper hash-bound verification -- the two can never disagree.
     partitioned_identity_fields = (
         "reviewed_head",
         "reviewed_index_clean",
         "reviewed_index_identity",
         "reviewed_protected_git_metadata_hash",
+        "reviewed_protected_git_metadata_projection",
         "reviewed_workspace_git_entry_hash",
         "reviewed_git_special_state",
         "reviewed_baseline_commit",
@@ -609,6 +665,7 @@ def prove_reviewed_state(
         and expected_index_clean is True
         and _is_sha256(expected_index_identity)
         and _is_sha256(expected_git_metadata_hash)
+        and _is_stable_projection_mapping(expected_git_metadata_projection)
         and _is_sha256(expected_git_entry_hash)
         and expected_git_special_state is None
         and isinstance(expected_baseline_commit, str)
@@ -953,6 +1010,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--evidence-directory", metavar="PATH")
     parser.add_argument("--implementation-run-id", required=True, metavar="TEXT")
     parser.add_argument("--implementation-attempt", type=int, required=True, metavar="INTEGER")
+    parser.add_argument("--expected-review-run-id", required=True, metavar="TEXT")
     return parser.parse_args(argv)
 
 
@@ -1045,6 +1103,12 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
             "INVALID_IMPLEMENTATION_ATTEMPT", "--implementation-attempt must be a positive integer"
         )
 
+    expected_review_run_id = args.expected_review_run_id
+    if not isinstance(expected_review_run_id, str) or not expected_review_run_id.strip():
+        raise PreflightFailure(
+            "INVALID_EXPECTED_REVIEW_RUN_ID", "--expected-review-run-id must be a non-empty string"
+        )
+
     previous_run_directory = Path(args.previous_implementation_run_directory).expanduser()
     if not previous_run_directory.is_absolute():
         previous_run_directory = (Path.cwd() / previous_run_directory).resolve(strict=False)
@@ -1062,6 +1126,12 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
     if not review_directory.is_absolute():
         review_directory = (Path.cwd() / review_directory).resolve(strict=False)
     review_evidence = load_review_evidence(review_directory)
+
+    # Which review authorizes this repair is decided by the parent run
+    # loop's own Review 1 selection, never by anything in this receipt
+    # itself -- this must be verified before any of the receipt's content
+    # (verdict, findings, reviewed projection, reviewed state) is trusted.
+    bind_review_to_expected_review_run(review_evidence["receipt"], expected_review_run_id)
 
     require_request_changes_verdict(review_evidence["result"])
     finding_ids = validate_findings_content(review_evidence["result"]["findings"])
