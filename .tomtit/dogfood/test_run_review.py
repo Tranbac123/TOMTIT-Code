@@ -3676,8 +3676,8 @@ def test_canonical_index_projection_is_byte_safe_for_non_utf8_paths() -> None:
 
     record_a = b"H 100644 " + b"a" * 40 + b" 0\tweird-\xff-name.txt"
     record_b = b"H 100644 " + b"a" * 40 + b" 0\tweird-\xfe-name.txt"
-    parsed_a = run_review._parse_canonical_index_stage_record(record_a)
-    parsed_b = run_review._parse_canonical_index_stage_record(record_b)
+    parsed_a = run_review._parse_canonical_index_stage_record(record_a, 40)
+    parsed_b = run_review._parse_canonical_index_stage_record(record_b, 40)
     assert parsed_a is not None and parsed_b is not None
     assert parsed_a[0] == b"weird-\xff-name.txt"
     assert parsed_a[0].hex() != parsed_b[0].hex()
@@ -3977,6 +3977,36 @@ def test_index_metadata_exception_keys_missing_role_info_applies_nothing() -> No
     assert run_review._index_metadata_exception_keys({"@git_dir": "path:/x"}) == frozenset()
 
 
+def test_index_metadata_exception_keys_unequal_non_nested_paths_yields_empty_set() -> None:
+    """(F03-R1) The exact Codex-reproduced fail-open case: two PRESENT,
+    UNEQUAL role paths that are not proven to be a supported linked-worktree
+    nesting must yield an EMPTY exception set -- not even `git_dir/index`
+    alone may be granted merely because a "@git_dir"/"@git_common_dir" pair
+    is present and differs. No index representation exception may be added
+    until the physical Git-role relationship has been positively
+    established (either equal, or a proven strict nesting)."""
+
+    metadata = {"@git_dir": "path:/x", "@git_common_dir": "path:/y"}
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset()
+
+
+def test_index_metadata_exception_keys_misleading_textual_prefix_yields_empty_set() -> None:
+    """(F03-R1) A textual common prefix is not real path containment:
+    "/repo/.git-other/..." is not nested inside "/repo/.git" even though
+    the strings share a prefix -- proves the check uses resolved path
+    relationships (pathlib `Path.relative_to`), never string-prefix
+    matching."""
+
+    metadata = {
+        "@git_dir": "path:/repo/.git-other/worktrees/linked",
+        "@git_common_dir": "path:/repo/.git",
+    }
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset()
+
+    metadata_flat = {"@git_dir": "path:/repo/.gitignore-junk", "@git_common_dir": "path:/repo/.git"}
+    assert run_review._index_metadata_exception_keys(metadata_flat) == frozenset()
+
+
 def test_protected_git_metadata_preserved_linked_worktree_current_index_change_tolerated() -> None:
     """(F03.A, synthetic) A raw representation-only change confined to the
     CURRENT linked worktree's own index may still be tolerated."""
@@ -4241,6 +4271,400 @@ def test_build_canonical_index_projection_rejects_incomplete_resolve_undo_framin
 
     ws = make_committed_workspace(tmp_path)
     _patch_canonical_index_queries(monkeypatch, undo_stdout=b"100644 " + b"a" * 40 + b" 1\ta.txt")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+# ---------------------------------------------------------------------------
+# F04-R1 (Sections 6-16/22): repository object format binding, real Git
+# modes, tag/stage relationship, and full porcelain-v2 grammar validation.
+# ---------------------------------------------------------------------------
+
+
+def test_repository_object_format_sha1_repository(tmp_path: Path) -> None:
+    ws = make_committed_workspace(tmp_path)
+    assert run_review._repository_object_format(ws) == ("sha1", 40)
+
+
+def test_repository_object_format_returns_none_on_command_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 6) An unavailable object-format query (e.g. an
+    older Git that does not support the flag) must make the canonical
+    projection unavailable, never fall back to guessing a width."""
+
+    ws = make_committed_workspace(tmp_path)
+    real_run_git = run_review._run_git
+
+    def failing(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["rev-parse", "--show-object-format"]:
+            return subprocess.CompletedProcess(args=["git", *args], returncode=1, stdout="", stderr="error")
+        return real_run_git(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git", failing)
+    assert run_review._repository_object_format(ws) is None
+    assert run_review._build_canonical_index_projection_once(ws) is None
+    assert run_review.canonical_index_projection(ws) is None
+
+
+def test_repository_object_format_returns_none_on_unrecognized_format(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = make_committed_workspace(tmp_path)
+    real_run_git = run_review._run_git
+
+    def faking(args: list[str], cwd: Path, **kwargs: object) -> subprocess.CompletedProcess:
+        if args[:2] == ["rev-parse", "--show-object-format"]:
+            return subprocess.CompletedProcess(args=["git", *args], returncode=0, stdout="sha3\n", stderr="")
+        return real_run_git(args, cwd, **kwargs)
+
+    monkeypatch.setattr(run_review, "_run_git", faking)
+    assert run_review._repository_object_format(ws) is None
+
+
+def test_canonical_index_identity_real_sha256_repository(tmp_path: Path) -> None:
+    """(F04-R1/Section 7, real Git) A genuine SHA-256 object-format
+    repository is fully supported: the object format is positively
+    detected as sha256, canonical identity establishes normally with
+    64-char object ids, and a genuine `git add -N` intent-to-add entry
+    validates against the SHA-256 empty-blob id -- never the SHA-1 one."""
+
+    ws = tmp_path / "sha256-workspace"
+    ws.mkdir()
+    (ws / "a.txt").write_text("content-a\n", encoding="utf-8")
+    subprocess.run(["git", "init", "-q", "--object-format=sha256"], cwd=str(ws), check=True)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], ws)
+
+    assert run_review._repository_object_format(ws) == ("sha256", 64)
+
+    identity_before = run_review.git_index_identity(ws)
+    assert identity_before is not None
+    projection = run_review.canonical_index_projection(ws)
+    assert projection is not None
+    assert projection["@object_format"] == "sha256"
+    entry_object_ids = [
+        value.split("object=", 1)[1].split(":", 1)[0]
+        for key, value in projection.items()
+        if key.startswith("entry:")
+    ]
+    assert entry_object_ids and all(len(oid) == 64 for oid in entry_object_ids)
+
+    (ws / "new.txt").write_text("new\n", encoding="utf-8")
+    _git(["add", "-N", "new.txt"], ws)
+    identity_after = run_review.git_index_identity(ws)
+    assert identity_after is not None and identity_after != identity_before
+    projection_after = run_review.canonical_index_projection(ws)
+    assert projection_after is not None
+    assert any(
+        key.startswith("entry:") and "intent_to_add=1" in value
+        for key, value in projection_after.items()
+    )
+
+
+def test_valid_stage_tag_combination_positive_cases() -> None:
+    """(F04-R1/Section 9) Every real, Git-producible (tag, assume-unchanged,
+    stage) combination this Runtime must keep accepting."""
+
+    assert run_review._valid_stage_tag_combination(b"H", False, 0) is True
+    assert run_review._valid_stage_tag_combination(b"H", True, 0) is True
+    assert run_review._valid_stage_tag_combination(b"S", False, 0) is True
+    assert run_review._valid_stage_tag_combination(b"S", True, 0) is True
+    assert run_review._valid_stage_tag_combination(b"M", False, 1) is True
+    assert run_review._valid_stage_tag_combination(b"M", False, 2) is True
+    assert run_review._valid_stage_tag_combination(b"M", False, 3) is True
+
+
+def test_valid_stage_tag_combination_rejects_impossible_cases() -> None:
+    """(F04-R1/Section 9) Codex's exact reproduced impossible combinations,
+    plus the lowercase-m (unmerged + assume-unchanged) variant."""
+
+    assert run_review._valid_stage_tag_combination(b"H", False, 1) is False
+    assert run_review._valid_stage_tag_combination(b"M", False, 0) is False
+    assert run_review._valid_stage_tag_combination(b"M", True, 1) is False
+    assert run_review._valid_stage_tag_combination(b"S", False, 2) is False
+
+
+def test_build_canonical_index_projection_rejects_stage_mode_777777(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 8/22) mode "777777" is lexically valid six-digit
+    octal but not a real Git index mode -- must be rejected."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 777777 " + b"a" * 40 + b" 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_resolve_undo_mode_777777(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, undo_stdout=b"777777 " + b"a" * 40 + b" 1\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_h_tag_with_nonzero_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 9/22) Codex's exact reproduced "H ... stage 1"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"a" * 40 + b" 1\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_m_tag_with_zero_stage(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 9/22) Codex's exact reproduced "M ... stage 0"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"M 100644 " + b"a" * 40 + b" 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_lowercase_m_unmerged_assume_unchanged(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 9/22) Codex's exact reproduced "m ... stage 1"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"m 100644 " + b"a" * 40 + b" 1\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_sha256_width_oid_in_sha1_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 6/22) A SHA-256-width OID must never become
+    canonical merely because it is itself well-formed hex of SOME
+    recognized width -- the width must match the repository's own
+    positively-determined object format."""
+
+    ws = make_committed_workspace(tmp_path)
+    assert run_review._repository_object_format(ws) == ("sha1", 40)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"a" * 64 + b" 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_mixed_oid_widths_within_one_observation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 6/22) A stage record using the repository's real
+    (40-char) width alongside a resolve-undo record using a DIFFERENT
+    (64-char) width within the SAME observation must reject the whole
+    projection -- one repository, one bound object format, applied
+    consistently across every source in the same attempt, never decided
+    source-by-source."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        stage_stdout=b"H 100644 " + b"a" * 40 + b" 0\ta.txt\x00",
+        undo_stdout=b"100644 " + b"b" * 64 + b" 1\tb.txt\x00",
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_sha256_empty_blob_in_sha1_repo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 7/22) SHA-256-width empty-blob placeholder data
+    must never validate inside a SHA-1 repository, even though it is a
+    real, well-formed empty-blob id under ITS OWN object format."""
+
+    ws = make_committed_workspace(tmp_path)
+    sha256_empty_blob = run_review._EMPTY_BLOB_OBJECT_ID_BY_FORMAT["sha256"]
+    _patch_canonical_index_queries(
+        monkeypatch, stage_stdout=b"H 100644 " + sha256_empty_blob + b" 0\ta.txt\x00"
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_xy_zz(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 11/22) Codex's exact reproduced "XY=ZZ"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 ZZ N... 100644 100644 100644 " + b"0" * 40 + b" " + b"0" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_submodule_field_xxxx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 12/22) Codex's exact reproduced "sub=xxxx"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 .M xxxx 100644 100644 100644 " + b"0" * 40 + b" " + b"0" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_type1_malformed_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 14/22) A malformed (non-hex) status OID field."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 .M N... 100644 100644 100644 not-an-oid " + b"0" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_oid_wrong_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 14/22) A status OID field that is valid hex but the
+    WRONG width for this repository's object format."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 .M N... 100644 100644 100644 " + b"0" * 64 + b" " + b"0" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_type2_invalid_score(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 13/22) Codex's exact reproduced "Xbad" score."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"2 R. N... 100644 100644 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" Xbad a-renamed.txt\x00a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_type2_malformed_fixed_fields(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 10/22) A type-2 record with an invalid mode field."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"2 R. N... 999999 100644 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" R100 a-renamed.txt\x00a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_invalid_xy_pair(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 10/22) An unmerged record's XY must be one of the
+    seven documented pairs -- an arbitrary pair must be rejected."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u ZZ N... 100644 100644 100644 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_invalid_submodule_field(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u UU xxxx 100644 100644 100644 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_invalid_mode(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u UU N... 777777 100644 100644 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_invalid_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u UU N... 100644 100644 100644 100644 not-an-oid "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_resolve_undo_oid_wrong_width(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R1/Section 16/22) A resolve-undo OID of the wrong width for
+    this repository's object format."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, undo_stdout=b"100644 " + b"a" * 64 + b" 1\ta.txt\x00")
     assert run_review._build_canonical_index_projection_once(ws) is None
 
 

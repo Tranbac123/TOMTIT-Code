@@ -128,8 +128,24 @@ _STABLE_FILE_DESCRIPTOR_RE = re.compile(
 # sequence is lost or collapsed through a lossy Unicode round-trip. Every
 # parsed field must fullmatch these grammars or the whole observation is
 # unclassified.
-_INDEX_MODE_RE = re.compile(rb"[0-7]{6}")
-_INDEX_OBJECT_ID_RE = re.compile(rb"[0-9a-f]{40}|[0-9a-f]{64}")
+_HEX_DIGITS_RE = re.compile(rb"[0-9a-f]+")
+# Every Git object-storage format this Runtime recognizes, and the exact
+# hex-digest width a full object id must have under that format (see
+# `_repository_object_format`). This is POSITIVELY determined once per
+# complete projection attempt via a read-only Git plumbing query -- never
+# inferred per-record from a presented OID's own length, which would let a
+# SHA-256-width id become "valid" inside a SHA-1 repository or vice versa.
+_REPOSITORY_OBJECT_FORMAT_HEX_LENGTH = {"sha1": 40, "sha256": 64}
+# The well-known empty-blob object id for each Git object format this
+# runner recognizes -- `sha1("blob 0\0")` / `sha256("blob 0\0")`. Used only
+# for the intent-to-add cross-check (Section 13/15): the *only* thing that
+# makes an `add -N` entry visible to `ls-files --stage` distinguishable from
+# a genuinely empty tracked file. Selected by the repository's own
+# positively-determined object format, never by a presented OID's length.
+_EMPTY_BLOB_OBJECT_ID_BY_FORMAT = {
+    "sha1": b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+    "sha256": b"473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+}
 # Exact canonical stage spelling: a single digit, never "00", "+0", etc.
 _INDEX_STAGE_RE = re.compile(rb"[0-3]")
 _INDEX_RESOLVE_UNDO_STAGE_RE = re.compile(rb"[1-3]")
@@ -138,16 +154,52 @@ _INDEX_RESOLVE_UNDO_STAGE_RE = re.compile(rb"[1-3]")
 # R/C/K/?/U only appear when -d/-m/-o/-k/--resolve-undo are also requested,
 # which this query never does -- any other letter is unclassified.
 _INDEX_STAGE_BASE_TAGS = frozenset({b"H", b"S", b"M"})
-# The well-known empty-blob object id for each Git object format this
-# runner recognizes (see `_INDEX_OBJECT_ID_RE`), keyed by hex-digest
-# length -- `sha1("blob 0\0")` / `sha256("blob 0\0")`. Used only for the
-# intent-to-add cross-check (Section 13): the *only* thing that makes an
-# `add -N` entry visible to `ls-files --stage` distinguishable from a
-# genuinely empty tracked file.
-_EMPTY_BLOB_OBJECT_ID_BY_LENGTH = {
-    40: b"e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
-    64: b"473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
-}
+# The exact set of Git modes a real cached index entry (a stage record or a
+# resolve-undo record) can ever have: regular file, executable file,
+# symlink, gitlink/submodule. `git ls-files` without `--sparse` never emits
+# a tree-mode (040000) entry (sparse directories are always expanded to
+# their contained files), and no *cached* entry is ever mode 000000 -- that
+# value only ever means "absent" in porcelain-v2's HEAD/index/worktree mode
+# triplet (see `_STATUS_VALID_MODES`). A lexically six-digit octal string
+# such as "777777" matches a bare `[0-7]{6}` pattern but is not a real Git
+# mode and must never be accepted merely for looking octal-shaped.
+_INDEX_ENTRY_VALID_MODES = frozenset({b"100644", b"100755", b"120000", b"160000"})
+_STATUS_MODE_ABSENT = b"000000"
+_STATUS_VALID_MODES = _INDEX_ENTRY_VALID_MODES | {_STATUS_MODE_ABSENT}
+# Porcelain-v2 XY alphabets, empirically confirmed against real
+# `git status --porcelain=v2` output for every state exercised by this
+# Runtime's own regression matrix (ordinary/staged/worktree modify, add,
+# delete, typechange, rename, copy, intent-to-add -- including the
+# `add -N` case, which emits Y="A" (worktree "added" relative to the
+# index's empty placeholder), confirmed by direct experiment -- and every
+# unmerged combination). Type "1" (ordinary changed) entries: X (index vs
+# HEAD) is never R/C (those are always emitted as type "2" instead) and
+# never U (unmerged entries are always emitted as type "u" instead). Type
+# "2" (renamed/copied) entries: X is always exactly R or C. Y (worktree vs
+# index) uses the same alphabet as X for both record types.
+# NOTE: `frozenset(b".MTAD")` would iterate the bytes object into its
+# integer byte codes, not single-byte `bytes` objects -- never a match
+# against a `xy[0:1]`-style single-byte slice. Every alphabet below is
+# built from explicit single-byte `bytes` literals instead.
+_STATUS_TYPE1_X_CHARS = frozenset({b".", b"M", b"T", b"A", b"D"})
+_STATUS_TYPE1_Y_CHARS = frozenset({b".", b"M", b"T", b"A", b"D"})
+_STATUS_TYPE2_X_CHARS = frozenset({b"R", b"C"})
+# The seven, and only seven, XY pairs Git documents for an unmerged ("u")
+# entry -- unlike type 1/2's Y column, X and Y are not independently valid
+# here; only these exact pairs correspond to a real unmerged state.
+_STATUS_UNMERGED_XY_PAIRS = frozenset({b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"})
+# `<sub>` submodule-state field grammar: "N..." for a non-submodule path, or
+# "S<c><m><u>" for a submodule, where each of c/m/u is either its own
+# documented letter or "." (empirically confirmed: a non-submodule change
+# shows exactly "N...", a submodule with no state change shows "S...").
+_STATUS_SUBMODULE_NOT_A_SUBMODULE = b"N..."
+_STATUS_SUBMODULE_RE = re.compile(rb"S[C.][M.][U.]")
+# `<X><score>` rename/copy score grammar for a type "2" entry: the same
+# single letter as the record's own XY.X value, followed by a similarity
+# percentage with no leading zero (empirically confirmed via `git mv`:
+# "R100"). Codex's reproduced malformed example "Xbad" is rejected by this
+# pattern (wrong letter, non-digit score).
+_STATUS_TYPE2_SCORE_RE = re.compile(rb"[RC](0|[1-9][0-9]*)")
 # Bounded observation budget for establishing ONE coherent canonical index
 # projection (see `canonical_index_projection`). No single Git command can
 # produce the complete canonical index state atomically -- the projection
@@ -1448,17 +1500,78 @@ def _split_nul_terminated_records(data: bytes) -> list[bytes] | None:
     return records[:-1]
 
 
+def _repository_object_format(cwd: Path) -> tuple[str, int] | None:
+    """Positively determine this repository's Git object storage format via
+    a read-only Git plumbing query (`git rev-parse --show-object-format`,
+    supported by the installed Git version), never inferred per-record from
+    a presented object id's own length.
+
+    Returns `(format_name, hex_id_length)` for a recognized format
+    (`_REPOSITORY_OBJECT_FORMAT_HEX_LENGTH`), or `None` if the command
+    fails (including on an older Git that does not support the flag) or
+    reports anything unrecognized -- callers must treat that identically to
+    every other "canonical projection unavailable" case, never fall back to
+    guessing a width from the data itself.
+    """
+
+    completed = _run_git(["rev-parse", "--show-object-format"], cwd)
+    if completed.returncode != 0:
+        return None
+    format_name = completed.stdout.strip()
+    hex_length = _REPOSITORY_OBJECT_FORMAT_HEX_LENGTH.get(format_name)
+    if hex_length is None:
+        return None
+    return (format_name, hex_length)
+
+
+def _valid_object_id(object_id: bytes, expected_hex_length: int) -> bool:
+    """Whether `object_id` is a full, canonically-spelled object id of
+    EXACTLY `expected_hex_length` hex digits -- the repository's own
+    positively-determined object-format width, never merely "40 or 64". A
+    documented zero-placeholder id (e.g. porcelain-v2's `hH` for a path
+    absent from HEAD) is itself a valid hex string of that same width and
+    needs no separate branch: an all-zero id of the wrong width is still
+    correctly rejected here.
+    """
+
+    return len(object_id) == expected_hex_length and _HEX_DIGITS_RE.fullmatch(object_id) is not None
+
+
+def _valid_stage_tag_combination(base_tag: bytes, assume_unchanged: bool, stage: int) -> bool:
+    """Whether this exact (tag, assume-unchanged, stage) combination is one
+    Git can actually emit from `git ls-files --stage -t -v -z` (Section 9),
+    validated as ONE semantic relationship rather than three independently
+    valid fields cross-producted together.
+
+    Real, Git-producible combinations: an ordinary cached entry (`H`/`h`)
+    or a skip-worktree entry (`S`/`s`) is always stage 0, with the
+    assume-unchanged bit free to be set or not; an unmerged entry (`M`) is
+    always stage 1, 2, or 3, and never carries the assume-unchanged bit
+    (Codex's reproduced "m ... stage 1" is exactly this impossible
+    combination). Anything else -- `H`/`S` at a nonzero stage, `M` at stage
+    0, or `M` with assume-unchanged set -- is rejected.
+    """
+
+    if base_tag == b"M":
+        return not assume_unchanged and stage in (1, 2, 3)
+    if base_tag in (b"H", b"S"):
+        return stage == 0
+    return False
+
+
 def _parse_canonical_index_stage_record(
-    record: bytes,
+    record: bytes, expected_oid_length: int
 ) -> tuple[bytes, int, bytes, bytes, bool, bool] | None:
     """Parse one `git ls-files --stage -t -v -z` NUL-delimited record.
 
     Returns `(path_bytes, stage, mode, object_id, skip_worktree,
     assume_unchanged)`, or `None` if the record is not a fully recognized
-    cached-index entry -- an unsupported/unclassified tag letter, a
-    malformed mode/object id/stage (including a non-canonical spelling like
-    `"00"`), an empty path, or an unexpected field count are all treated
-    identically: cannot classify, caller must fail closed.
+    cached-index entry -- an unsupported/unclassified tag letter, an
+    invalid Git mode, an object id not matching the repository's own
+    positively-determined object format width, a malformed stage (including
+    a non-canonical spelling like `"00"`), an impossible tag/stage
+    combination, an empty path, or an unexpected field count are all
+    treated identically: cannot classify, caller must fail closed.
     """
 
     try:
@@ -1477,18 +1590,20 @@ def _parse_canonical_index_stage_record(
     base_tag = tag.upper()
     if base_tag not in _INDEX_STAGE_BASE_TAGS:
         return None
-    if not _INDEX_MODE_RE.fullmatch(mode):
+    if mode not in _INDEX_ENTRY_VALID_MODES:
         return None
-    if not _INDEX_OBJECT_ID_RE.fullmatch(object_id):
+    if not _valid_object_id(object_id, expected_oid_length):
         return None
     if not _INDEX_STAGE_RE.fullmatch(stage_bytes):
         return None
     stage = int(stage_bytes)
+    if not _valid_stage_tag_combination(base_tag, assume_unchanged, stage):
+        return None
     return (path_bytes, stage, mode, object_id, base_tag == b"S", assume_unchanged)
 
 
 def _parse_canonical_resolve_undo_record(
-    record: bytes,
+    record: bytes, expected_oid_length: int
 ) -> tuple[bytes, int, bytes, bytes] | None:
     """Parse one `git ls-files --resolve-undo -z` NUL-delimited record."""
 
@@ -1502,7 +1617,9 @@ def _parse_canonical_resolve_undo_record(
     if len(fields) != 3:
         return None
     mode, object_id, stage_bytes = fields
-    if not _INDEX_MODE_RE.fullmatch(mode) or not _INDEX_OBJECT_ID_RE.fullmatch(object_id):
+    if mode not in _INDEX_ENTRY_VALID_MODES:
+        return None
+    if not _valid_object_id(object_id, expected_oid_length):
         return None
     if not _INDEX_RESOLVE_UNDO_STAGE_RE.fullmatch(stage_bytes):
         return None
@@ -1510,7 +1627,46 @@ def _parse_canonical_resolve_undo_record(
     return (path_bytes, stage, mode, object_id)
 
 
-def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
+def _valid_status_type1_or_type2_fixed_fields(
+    xy: bytes,
+    sub: bytes,
+    mode_head: bytes,
+    mode_index: bytes,
+    mode_worktree: bytes,
+    hash_head: bytes,
+    hash_index: bytes,
+    *,
+    expected_oid_length: int,
+    x_alphabet: frozenset[bytes],
+) -> bool:
+    """Shared fixed-field grammar for a porcelain-v2 type "1" or type "2"
+    record (Section 10/11/12/14): XY drawn from the record-specific X
+    alphabet and the shared Y alphabet, `<sub>` a valid submodule-state
+    field, every mode a real Git mode (or the documented `000000` absence
+    placeholder), and every OID either a real object id or a
+    zero-placeholder -- both cases exactly the repository's own object
+    format width.
+    """
+
+    if len(xy) != 2:
+        return False
+    x_char, y_char = xy[0:1], xy[1:2]
+    if x_char not in x_alphabet or y_char not in _STATUS_TYPE1_Y_CHARS:
+        return False
+    if sub != _STATUS_SUBMODULE_NOT_A_SUBMODULE and not _STATUS_SUBMODULE_RE.fullmatch(sub):
+        return False
+    if not (
+        mode_head in _STATUS_VALID_MODES
+        and mode_index in _STATUS_VALID_MODES
+        and mode_worktree in _STATUS_VALID_MODES
+    ):
+        return False
+    return _valid_object_id(hash_head, expected_oid_length) and _valid_object_id(
+        hash_index, expected_oid_length
+    )
+
+
+def _intent_to_add_paths_from_status_v2(stdout: bytes, expected_oid_length: int) -> set[bytes] | None:
     """Parse `git status --porcelain=v2 --untracked-files=no -z` output for
     intent-to-add paths: an ordinary changed entry (`1 ...`) whose index
     mode (`mI`) and HEAD mode (`mH`) are both `000000` is a path staged only
@@ -1521,12 +1677,15 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
     the explicitly unstable `--debug` output.
 
     Every record type porcelain v2 can emit under this exact command
-    configuration is either parsed completely (`1` ordinary-changed,
-    `2` renamed/copied -- consuming its extra NUL-delimited origPath
-    continuation, `u` unmerged) or, for anything else, treated as
-    unsupported for this canonicalization. Returns `None` -- fails closed
-    -- on incomplete NUL framing, any unrecognized/malformed record, or an
-    unsupported record type; never silently skipped.
+    configuration is either FULLY validated against its documented fixed
+    grammar (`1` ordinary-changed, `2` renamed/copied -- consuming its
+    extra NUL-delimited origPath continuation and its own rename/copy score
+    grammar, `u` unmerged, validated against its documented XY pairs) or,
+    for anything else, treated as unsupported for this canonicalization.
+    Returns `None` -- fails closed -- on incomplete NUL framing, any
+    unrecognized/malformed field (XY, submodule state, mode, OID, or
+    rename/copy score), or an unsupported record type; never silently
+    skipped.
     """
 
     records = _split_nul_terminated_records(stdout)
@@ -1541,29 +1700,39 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
             fields = record.split(b" ", 8)
             if len(fields) != 9:
                 return None
-            _marker, xy, sub, mode_head, mode_index, mode_worktree, _h_head, _h_index, path_bytes = fields
-            if len(xy) != 2 or len(sub) != 4 or not path_bytes:
+            _marker, xy, sub, mode_head, mode_index, mode_worktree, h_head, h_index, path_bytes = fields
+            if not path_bytes:
                 return None
-            if not (
-                _INDEX_MODE_RE.fullmatch(mode_head)
-                and _INDEX_MODE_RE.fullmatch(mode_index)
-                and _INDEX_MODE_RE.fullmatch(mode_worktree)
+            if not _valid_status_type1_or_type2_fixed_fields(
+                xy,
+                sub,
+                mode_head,
+                mode_index,
+                mode_worktree,
+                h_head,
+                h_index,
+                expected_oid_length=expected_oid_length,
+                x_alphabet=_STATUS_TYPE1_X_CHARS,
             ):
                 return None
-            if mode_index == b"000000" and mode_head == b"000000":
+            if mode_index == _STATUS_MODE_ABSENT and mode_head == _STATUS_MODE_ABSENT:
                 paths.add(path_bytes)
             i += 1
         elif record.startswith(b"2 "):
             fields = record.split(b" ", 8)
             if len(fields) != 9:
                 return None
-            _marker, xy, sub, mode_head, mode_index, mode_worktree, _h_head, _h_index, rest = fields
-            if len(xy) != 2 or len(sub) != 4:
-                return None
-            if not (
-                _INDEX_MODE_RE.fullmatch(mode_head)
-                and _INDEX_MODE_RE.fullmatch(mode_index)
-                and _INDEX_MODE_RE.fullmatch(mode_worktree)
+            _marker, xy, sub, mode_head, mode_index, mode_worktree, h_head, h_index, rest = fields
+            if not _valid_status_type1_or_type2_fixed_fields(
+                xy,
+                sub,
+                mode_head,
+                mode_index,
+                mode_worktree,
+                h_head,
+                h_index,
+                expected_oid_length=expected_oid_length,
+                x_alphabet=_STATUS_TYPE2_X_CHARS,
             ):
                 return None
             # rest = "<X><score> <path>"; the origPath is the *next*
@@ -1572,7 +1741,11 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
             if b" " not in rest:
                 return None
             score_field, path_bytes = rest.split(b" ", 1)
-            if not score_field or not path_bytes:
+            if not path_bytes:
+                return None
+            if not _STATUS_TYPE2_SCORE_RE.fullmatch(score_field):
+                return None
+            if score_field[0:1] != xy[0:1]:
                 return None
             if i + 1 >= len(records) or not records[i + 1]:
                 return None
@@ -1582,10 +1755,16 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes) -> set[bytes] | None:
             fields = record.split(b" ", 10)
             if len(fields) != 11:
                 return None
-            _marker, xy, sub, m1, m2, m3, mw, _h1, _h2, _h3, path_bytes = fields
-            if len(xy) != 2 or len(sub) != 4 or not path_bytes:
+            _marker, xy, sub, m1, m2, m3, mw, h1, h2, h3, path_bytes = fields
+            if not path_bytes:
                 return None
-            if not all(_INDEX_MODE_RE.fullmatch(m) for m in (m1, m2, m3, mw)):
+            if xy not in _STATUS_UNMERGED_XY_PAIRS:
+                return None
+            if sub != _STATUS_SUBMODULE_NOT_A_SUBMODULE and not _STATUS_SUBMODULE_RE.fullmatch(sub):
+                return None
+            if not all(m in _STATUS_VALID_MODES for m in (m1, m2, m3, mw)):
+                return None
+            if not all(_valid_object_id(h, expected_oid_length) for h in (h1, h2, h3)):
                 return None
             # an unmerged entry is never intent-to-add; nothing to record.
             i += 1
@@ -1615,14 +1794,21 @@ def _build_canonical_index_projection_once(cwd: Path) -> dict[str, str] | None:
     are always expanded to their contained files rather than left
     compacted).
 
-    Returns `None` -- fails closed -- on any git command failure, incomplete
-    NUL framing, any unparseable/unclassified record, a duplicate (path,
-    stage) pair, or an intent-to-add path whose status classification
-    disagrees with its own effective stage-0 entry (neither present, nor
-    holding the exact empty-blob placeholder object id for the object
-    format in use) -- query outputs that correspond to inconsistent logical
-    states must never be combined into one projection. Never guesses at an
-    unrecognized state.
+    Returns `None` -- fails closed -- on any git command failure, an
+    unavailable/unrecognized repository object format, incomplete NUL
+    framing, any unparseable/unclassified record (bound to the repository's
+    own positively-determined object-format width, never inferred per
+    record), a duplicate (path, stage) pair, or an intent-to-add path whose
+    status classification disagrees with its own effective stage-0 entry
+    (neither present, nor holding the exact empty-blob placeholder object
+    id for the repository's object format) -- query outputs that
+    correspond to inconsistent logical states must never be combined into
+    one projection. Never guesses at an unrecognized state.
+
+    The repository's object format is determined exactly once per attempt,
+    before any of the three queries run, and that SAME validated width and
+    empty-blob id are used for every OID this attempt parses from any of
+    the three sources -- never inferred separately per record.
 
     The three underlying git invocations (`ls-files --stage`, `status
     --porcelain=v2`, `ls-files --resolve-undo`) run back-to-back with no
@@ -1632,6 +1818,12 @@ def _build_canonical_index_projection_once(cwd: Path) -> dict[str, str] | None:
     consecutive-match coherence proof across independently rebuilt
     attempts of this whole function.
     """
+
+    object_format = _repository_object_format(cwd)
+    if object_format is None:
+        return None
+    format_name, expected_oid_length = object_format
+    empty_blob_object_id = _EMPTY_BLOB_OBJECT_ID_BY_FORMAT[format_name]
 
     stage_completed = _run_git_bytes(["ls-files", "--stage", "-t", "-v", "-z"], cwd)
     if stage_completed.returncode != 0:
@@ -1651,13 +1843,15 @@ def _build_canonical_index_projection_once(cwd: Path) -> dict[str, str] | None:
     undo_records = _split_nul_terminated_records(undo_completed.stdout)
     if undo_records is None:
         return None
-    intent_to_add_paths = _intent_to_add_paths_from_status_v2(status_completed.stdout)
+    intent_to_add_paths = _intent_to_add_paths_from_status_v2(
+        status_completed.stdout, expected_oid_length
+    )
     if intent_to_add_paths is None:
         return None
 
     stage_entries: dict[tuple[bytes, int], tuple[bytes, bytes, bool, bool]] = {}
     for record in stage_records:
-        parsed = _parse_canonical_index_stage_record(record)
+        parsed = _parse_canonical_index_stage_record(record, expected_oid_length)
         if parsed is None:
             return None
         path_bytes, stage, mode, object_id, skip_worktree, assume_unchanged = parsed
@@ -1666,24 +1860,25 @@ def _build_canonical_index_projection_once(cwd: Path) -> dict[str, str] | None:
             return None
         stage_entries[entry_key] = (mode, object_id, skip_worktree, assume_unchanged)
 
-    # Intent-to-add cross-check (F04/Section 13): every path status
+    # Intent-to-add cross-check (F04/Section 13/15): every path status
     # classifies as intent-to-add must have a matching effective stage-0
-    # entry whose object id is *exactly* the empty-blob placeholder for the
-    # object format in use (inferred from that entry's own object-id
-    # length) -- never accepted on status's say-so alone, nor on stage's
-    # say-so alone. This is precisely what rejects the "impossible hybrid"
-    # case: a non-empty staged object at a path status also calls
-    # intent-to-add can never be combined into one coherent projection.
+    # entry whose object id is *exactly* the empty-blob placeholder for
+    # THIS repository's own positively-determined object format -- never
+    # accepted on status's say-so alone, nor on stage's say-so alone, and
+    # never selected by the presented object id's own length. This is
+    # precisely what rejects the "impossible hybrid" case: a non-empty
+    # staged object (or one from a different object format) at a path
+    # status also calls intent-to-add can never be combined into one
+    # coherent projection.
     for intent_path in intent_to_add_paths:
         stage_zero = stage_entries.get((intent_path, 0))
         if stage_zero is None:
             return None
         mode, object_id, _skip_worktree, _assume_unchanged = stage_zero
-        expected_empty_blob = _EMPTY_BLOB_OBJECT_ID_BY_LENGTH.get(len(object_id))
-        if expected_empty_blob is None or object_id != expected_empty_blob:
+        if object_id != empty_blob_object_id:
             return None
 
-    projection: dict[str, str] = {}
+    projection: dict[str, str] = {"@object_format": format_name}
     for (path_bytes, stage), (mode, object_id, skip_worktree, assume_unchanged) in stage_entries.items():
         intent_to_add = stage == 0 and path_bytes in intent_to_add_paths
         key = f"entry:{path_bytes.hex()}:{stage}"
@@ -1694,7 +1889,7 @@ def _build_canonical_index_projection_once(cwd: Path) -> dict[str, str] | None:
         )
 
     for record in undo_records:
-        parsed_undo = _parse_canonical_resolve_undo_record(record)
+        parsed_undo = _parse_canonical_resolve_undo_record(record, expected_oid_length)
         if parsed_undo is None:
             return None
         undo_path_bytes, undo_stage, undo_mode, undo_object_id = parsed_undo
@@ -1826,7 +2021,16 @@ def _index_metadata_exception_keys(metadata: Mapping[str, str]) -> frozenset[str
     eligible for the exception.
 
     If the role paths are missing or cannot be compared, the exception is
-    not applied to anything (fails closed, not open).
+    not applied to anything (fails closed, not open). Critically, an
+    unequal pair of role paths is *not* by itself sufficient: no exception
+    key is added -- not even `git_dir/index` alone -- until the physical
+    relationship between them has been positively proven to be either the
+    ordinary case (equal) or a genuine linked-worktree nesting (`git_dir` a
+    resolved strict descendant of `git_common_dir`, proven via
+    `_common_dir_relative_alias_for_nested_git_dir`'s real path-containment
+    check, never string-prefix matching). Two unequal, non-nested,
+    malformed, or otherwise incomparable role paths -- even ones that share
+    a misleading textual prefix -- yield an empty set.
     """
 
     git_dir_path = metadata.get("@git_dir")
@@ -1835,11 +2039,10 @@ def _index_metadata_exception_keys(metadata: Mapping[str, str]) -> frozenset[str
         return frozenset()
     if git_dir_path == git_common_dir_path:
         return frozenset({_GIT_DIR_INDEX_KEY, _GIT_COMMON_DIR_INDEX_KEY})
-    exception_keys = {_GIT_DIR_INDEX_KEY}
     nested_relative = _common_dir_relative_alias_for_nested_git_dir(git_dir_path, git_common_dir_path)
-    if nested_relative is not None:
-        exception_keys.add(f"git_common_dir/{nested_relative}/index")
-    return frozenset(exception_keys)
+    if nested_relative is None:
+        return frozenset()
+    return frozenset({_GIT_DIR_INDEX_KEY, f"git_common_dir/{nested_relative}/index"})
 
 
 def protected_git_metadata_preserved(
