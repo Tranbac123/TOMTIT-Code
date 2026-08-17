@@ -4007,6 +4007,45 @@ def test_index_metadata_exception_keys_misleading_textual_prefix_yields_empty_se
     assert run_review._index_metadata_exception_keys(metadata_flat) == frozenset()
 
 
+def test_index_metadata_exception_keys_relative_role_descriptors_yield_empty_set() -> None:
+    """(F03-R2/Section 1/5.A) Codex's exact reproduced relative-descriptor
+    case: neither role path is absolute, so neither is eligible for role
+    reasoning at all -- must yield an empty set, even though a lexical
+    `Path.relative_to()` on the raw strings would otherwise "succeed"."""
+
+    metadata = {"@git_dir": "path:common/worktrees/w", "@git_common_dir": "path:common"}
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset()
+
+
+def test_index_metadata_exception_keys_traversal_bearing_git_dir_yields_empty_set() -> None:
+    """(F03-R2/Section 1/5.B) Codex's exact reproduced traversal-bearing
+    case: `git_dir` contains an unresolved ".." segment. A bare lexical
+    `Path("/common/../elsewhere").relative_to(Path("/common"))` succeeds
+    (it never touches the filesystem), so this must be rejected BEFORE
+    that comparison is even attempted -- must yield an empty set."""
+
+    metadata = {"@git_dir": "path:/common/../elsewhere", "@git_common_dir": "path:/common"}
+    assert run_review._index_metadata_exception_keys(metadata) == frozenset()
+
+
+def test_canonical_absolute_path_descriptor_validation() -> None:
+    """(F03-R2) Direct unit coverage of the role-descriptor canonical-path
+    gate: relative paths, ".."-traversal-bearing paths (context-dependent
+    and genuinely ambiguous under symlinks -- rejected), a non-`path:`
+    descriptor, and an empty path portion are all ineligible; a genuinely
+    absolute, already-normalized path is eligible. A "."-bearing path is
+    NOT ambiguous the way ".." is -- pathlib's own parsing already drops
+    it unconditionally with no dependency on what the parent actually is,
+    so it normalizes transparently rather than being rejected."""
+
+    assert run_review._canonical_absolute_path_descriptor("path:relative/dir") is None
+    assert run_review._canonical_absolute_path_descriptor("path:/a/../b") is None
+    assert run_review._canonical_absolute_path_descriptor("not-a-path-descriptor") is None
+    assert run_review._canonical_absolute_path_descriptor("path:") is None
+    assert run_review._canonical_absolute_path_descriptor("path:/a/b") == Path("/a/b")
+    assert run_review._canonical_absolute_path_descriptor("path:/a/./b") == Path("/a/b")
+
+
 def test_protected_git_metadata_preserved_linked_worktree_current_index_change_tolerated() -> None:
     """(F03.A, synthetic) A raw representation-only change confined to the
     CURRENT linked worktree's own index may still be tolerated."""
@@ -4666,6 +4705,247 @@ def test_build_canonical_index_projection_rejects_resolve_undo_oid_wrong_width(
     ws = make_committed_workspace(tmp_path)
     _patch_canonical_index_queries(monkeypatch, undo_stdout=b"100644 " + b"a" * 64 + b" 1\ta.txt\x00")
     assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+# ---------------------------------------------------------------------------
+# F04-R2 (Sections 6-16/17/22): cross-field semantic completeness -- field
+# shape alone is not enough; recognized records must represent a state Git
+# can actually emit.
+# ---------------------------------------------------------------------------
+
+
+def test_build_canonical_index_projection_rejects_stage_zero_object_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 7/22.5) A cached index entry with a valid mode but
+    an all-zero object id is not a real Git state -- the zero placeholder
+    is only ever legitimate in specific porcelain-v2 absence contexts."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, stage_stdout=b"H 100644 " + b"0" * 40 + b" 0\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_resolve_undo_zero_object_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 13/22.6) Same rejection for a resolve-undo record."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(monkeypatch, undo_stdout=b"100644 " + b"0" * 40 + b" 1\ta.txt\x00")
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_type1_xy_dotdot(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 9/22.7) Codex's exact reproduced "XY=.." on a
+    type-1 record -- git never emits a changed-path record for an
+    unchanged path."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 .. N... 100644 100644 100644 " + b"a" * 40 + b" " + b"a" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_type1_xy_aa(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 9/22.8) Codex's exact reproduced "XY=AA" on a
+    type-1 record -- "AA" (added by both) is an unmerged state, always
+    emitted as record type "u", never type "1"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 AA N... 100644 100644 100644 " + b"a" * 40 + b" " + b"a" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_type1_present_mode_zero_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 8/22.9) Codex's exact reproduced "present HEAD/index
+    modes but all-zero hH/hI object IDs"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 M. N... 100644 100644 100644 " + b"0" * 40 + b" " + b"a" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_status_type1_absent_mode_nonzero_oid(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 8/22.10) An absent mode (000000) paired with a
+    nonzero, non-placeholder object id is equally impossible."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"1 A. N... 000000 100644 100644 " + b"a" * 40 + b" " + b"a" * 40 + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_type2_score_101(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 10/22.11) Codex's exact reproduced "R101" -- the
+    similarity score is a percentage and cannot exceed 100."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"2 R. N... 100644 100644 100644 "
+            + b"a" * 40
+            + b" "
+            + b"a" * 40
+            + b" R101 a-renamed.txt\x00a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_type2_score_999(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 10/22.12) Codex's exact reproduced "R999"."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"2 R. N... 100644 100644 100644 "
+            + b"a" * 40
+            + b" "
+            + b"a" * 40
+            + b" R999 a-renamed.txt\x00a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_uu_all_absent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 11/22.15) Codex's exact reproduced "u UU" with all
+    four modes 000000 and all three stage OIDs the zero placeholder -- UU
+    (both modified) requires stage 1/2/3 all PRESENT; an all-absent record
+    cannot represent that state."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u UU N... 000000 000000 000000 100644 "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" "
+            + b"0" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_unmerged_dd_all_present(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 11/22.16) A second impossible XY/stage-presence
+    combination: DD (both deleted) requires stage 2 and stage 3 ABSENT --
+    a record presenting real content for all three stages cannot represent
+    that state."""
+
+    ws = make_committed_workspace(tmp_path)
+    _patch_canonical_index_queries(
+        monkeypatch,
+        status_stdout=(
+            b"u DD N... 100644 100644 100644 100644 "
+            + b"a" * 40
+            + b" "
+            + b"b" * 40
+            + b" "
+            + b"c" * 40
+            + b" a.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_build_canonical_index_projection_rejects_intent_to_add_with_invalid_status_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """(F04-R2/Section 12/18/22.18) Codex's exact reproduced case: absent
+    HEAD/index modes paired with NONZERO HEAD/index object IDs is itself an
+    impossible type-1 state, even though a matching stage-0 empty-blob
+    entry exists -- intent-to-add classification must start from a fully
+    valid record, never from `mH == mI == 000000` alone."""
+
+    ws = make_committed_workspace(tmp_path)
+    empty_blob = run_review._EMPTY_BLOB_OBJECT_ID_BY_FORMAT["sha1"]
+    _patch_canonical_index_queries(
+        monkeypatch,
+        stage_stdout=b"H 100644 " + empty_blob + b" 0\tnew.txt\x00",
+        status_stdout=(
+            b"1 .A N... 000000 000000 100644 " + b"a" * 40 + b" " + b"b" * 40 + b" new.txt\x00"
+        ),
+    )
+    assert run_review._build_canonical_index_projection_once(ws) is None
+
+
+def test_canonical_index_identity_real_split_index_and_sparse_checkout(tmp_path: Path) -> None:
+    """(Section 18/19 positive matrix) split-index and sparse-checkout are
+    purely physical index layout/worktree-narrowing features; `git
+    ls-files --stage` (no `--sparse` flag) always resolves them into the
+    same full per-path logical listing this Runtime already canonicalizes,
+    with out-of-cone paths simply marked skip-worktree -- confirmed here
+    with both features enabled together on a real repository, never
+    producing an unavailable canonical projection."""
+
+    ws = tmp_path / "split-sparse-workspace"
+    ws.mkdir()
+    (ws / "dirA").mkdir()
+    (ws / "dirB").mkdir()
+    (ws / "dirA" / "a.txt").write_text("a\n", encoding="utf-8")
+    (ws / "dirB" / "b.txt").write_text("b\n", encoding="utf-8")
+    _git(["init", "-q"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "add", "-A"], ws)
+    _git(["-c", "user.name=t", "-c", "user.email=t@t.invalid", "commit", "-q", "-m", "baseline"], ws)
+
+    before = run_review.git_index_identity(ws)
+    assert before is not None
+
+    _git(["update-index", "--split-index"], ws)
+    _git(["config", "index.sparse", "true"], ws)
+    subprocess.run(
+        ["git", "sparse-checkout", "init", "--cone"], cwd=str(ws), check=True, capture_output=True
+    )
+    subprocess.run(["git", "sparse-checkout", "set", "dirA"], cwd=str(ws), check=True, capture_output=True)
+
+    after = run_review.git_index_identity(ws)
+    assert after is not None
+    projection = run_review.canonical_index_projection(ws)
+    assert projection is not None
+    assert any(
+        key.startswith("entry:") and "skip_worktree=1" in value for key, value in projection.items()
+    )
 
 
 if __name__ == "__main__":

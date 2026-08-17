@@ -184,10 +184,41 @@ _STATUS_VALID_MODES = _INDEX_ENTRY_VALID_MODES | {_STATUS_MODE_ABSENT}
 _STATUS_TYPE1_X_CHARS = frozenset({b".", b"M", b"T", b"A", b"D"})
 _STATUS_TYPE1_Y_CHARS = frozenset({b".", b"M", b"T", b"A", b"D"})
 _STATUS_TYPE2_X_CHARS = frozenset({b"R", b"C"})
-# The seven, and only seven, XY pairs Git documents for an unmerged ("u")
-# entry -- unlike type 1/2's Y column, X and Y are not independently valid
-# here; only these exact pairs correspond to a real unmerged state.
-_STATUS_UNMERGED_XY_PAIRS = frozenset({b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"})
+# A type "1" (ordinary changed) record can never legitimately carry
+# ".." (nothing changed -- git never emits a changed-path record for an
+# unchanged path) or any of the seven documented unmerged XY pairs (those
+# states are always emitted as type "u", never type "1"). Type "2"'s X is
+# always drawn from `_STATUS_TYPE2_X_CHARS` above, which never overlaps
+# this set, so the check is a no-op there but applied uniformly for clarity
+# (F04-R2/Section 9, Codex's exact reproduced "XY=.." and "XY=AA" on a
+# type-1 record).
+_STATUS_TYPE1_TYPE2_FORBIDDEN_XY = frozenset({b".."}) | frozenset(
+    {b"DD", b"AU", b"UD", b"UA", b"DU", b"AA", b"UU"}
+)
+# For each of the seven documented unmerged ("u") XY pairs: whether stage 1
+# (common ancestor), stage 2 (ours/HEAD), and stage 3 (theirs/MERGE_HEAD)
+# is PRESENT in that state (F04-R2/Section 11). Empirically confirmed by
+# direct real-conflict experiment for UU (all three present -- both sides
+# modified), AA (stage 1 absent -- both sides independently added the same
+# new path, so no common-ancestor entry exists), DU (stage 2 absent --
+# deleted by us, real `modify/delete` conflict), and UD (stage 3 absent --
+# deleted by them, the same conflict from the other branch's perspective).
+# DD/AU/UA are derived from the single consistent positional rule those
+# four confirmations establish: "A" at a position means no common-ancestor
+# entry exists (stage 1 absent); "D" at a position means that side's own
+# stage is absent; "U" at a position means that side's own stage is
+# present. This is not an independent per-character alphabet check (unlike
+# type 1/2's XY) -- only these exact seven pairs, each with its own fixed
+# stage-presence pattern, are real Git states.
+_UNMERGED_STAGE_PRESENCE: dict[bytes, tuple[bool, bool, bool]] = {
+    b"DD": (True, False, False),
+    b"AU": (False, True, True),
+    b"UD": (True, True, False),
+    b"UA": (False, True, True),
+    b"DU": (True, False, True),
+    b"AA": (False, True, True),
+    b"UU": (True, True, True),
+}
 # `<sub>` submodule-state field grammar: "N..." for a non-submodule path, or
 # "S<c><m><u>" for a submodule, where each of c/m/u is either its own
 # documented letter or "." (empirically confirmed: a non-submodule change
@@ -196,9 +227,13 @@ _STATUS_SUBMODULE_NOT_A_SUBMODULE = b"N..."
 _STATUS_SUBMODULE_RE = re.compile(rb"S[C.][M.][U.]")
 # `<X><score>` rename/copy score grammar for a type "2" entry: the same
 # single letter as the record's own XY.X value, followed by a similarity
-# percentage with no leading zero (empirically confirmed via `git mv`:
-# "R100"). Codex's reproduced malformed example "Xbad" is rejected by this
-# pattern (wrong letter, non-digit score).
+# PERCENTAGE (0-100 inclusive; range enforced separately in
+# `_valid_type2_score`, since a regex alone cannot bound a variable-length
+# decimal) with no leading zero (empirically confirmed via `git mv`:
+# "R100"). Codex's reproduced malformed examples "Xbad" (rejected by this
+# pattern: wrong letter, non-digit score) and "R101"/"R999" (lexically
+# match this pattern but are out of the valid percentage range, rejected by
+# `_valid_type2_score`) are both covered.
 _STATUS_TYPE2_SCORE_RE = re.compile(rb"[RC](0|[1-9][0-9]*)")
 # Bounded observation budget for establishing ONE coherent canonical index
 # projection (see `canonical_index_projection`). No single Git command can
@@ -1524,17 +1559,82 @@ def _repository_object_format(cwd: Path) -> tuple[str, int] | None:
     return (format_name, hex_length)
 
 
-def _valid_object_id(object_id: bytes, expected_hex_length: int) -> bool:
-    """Whether `object_id` is a full, canonically-spelled object id of
+def _valid_object_id_shape(object_id: bytes, expected_hex_length: int) -> bool:
+    """Whether `object_id` is a syntactically well-formed object id of
     EXACTLY `expected_hex_length` hex digits -- the repository's own
-    positively-determined object-format width, never merely "40 or 64". A
-    documented zero-placeholder id (e.g. porcelain-v2's `hH` for a path
-    absent from HEAD) is itself a valid hex string of that same width and
-    needs no separate branch: an all-zero id of the wrong width is still
-    correctly rejected here.
+    positively-determined object-format width, never merely "40 or 64".
+    This is shape only: it says nothing about whether the id names a real
+    object or the documented all-zero absence placeholder -- see
+    `_valid_real_object_id`/`_valid_zero_placeholder_object_id`, the two
+    field-context-aware predicates every caller must actually use
+    (F04-R2/Section 7/14). Never called directly by a record parser.
     """
 
     return len(object_id) == expected_hex_length and _HEX_DIGITS_RE.fullmatch(object_id) is not None
+
+
+def _valid_real_object_id(object_id: bytes, expected_hex_length: int) -> bool:
+    """Whether `object_id` is a REAL object id: correct repository-format
+    width, hexadecimal, and NOT all-zero (F04-R2/Section 7). A cached index
+    entry (`ls-files --stage`), a resolve-undo (REUC) record, and a
+    porcelain-v2 mode/OID pair whose mode indicates the state is PRESENT
+    must always carry a real object id -- the all-zero value is never a
+    legitimate object id, only a documented absence placeholder in the
+    specific fields where Git defines one (see
+    `_valid_zero_placeholder_object_id`)."""
+
+    if not _valid_object_id_shape(object_id, expected_hex_length):
+        return False
+    return object_id != b"0" * expected_hex_length
+
+
+def _valid_zero_placeholder_object_id(object_id: bytes, expected_hex_length: int) -> bool:
+    """Whether `object_id` is EXACTLY the documented all-zero absence
+    placeholder, at the repository's own object-format width (F04-R2/
+    Section 7/8) -- used only for porcelain-v2 fields whose associated mode
+    indicates the corresponding HEAD/index/stage entry is genuinely
+    absent."""
+
+    return object_id == b"0" * expected_hex_length
+
+
+def _valid_status_mode_oid_pair(mode: bytes, object_id: bytes, expected_oid_length: int) -> bool:
+    """Whether one porcelain-v2 HEAD/index mode+OID pair (or one type-u
+    per-stage mode+OID pair) represents a coherent presence/absence state
+    (F04-R2/Section 8): a PRESENT state requires a real Git mode
+    (`_INDEX_ENTRY_VALID_MODES`) paired with a real, nonzero object id of
+    the repository's own width; an ABSENT state requires the documented
+    `000000` mode paired with the documented all-zero placeholder of that
+    same width. A present mode with a zero OID, or an absent mode with a
+    nonzero OID, is never a real Git state -- Codex's exact reproduced
+    "present HEAD/index modes but all-zero hH/hI object IDs" -- and is
+    rejected here, not merely bound unchecked.
+    """
+
+    if mode == _STATUS_MODE_ABSENT:
+        return _valid_zero_placeholder_object_id(object_id, expected_oid_length)
+    if mode not in _INDEX_ENTRY_VALID_MODES:
+        return False
+    return _valid_real_object_id(object_id, expected_oid_length)
+
+
+def _valid_type2_score(score_field: bytes, expected_x: bytes) -> bool:
+    """Whether a type-"2" rename/copy `<X><score>` token is valid
+    (F04-R2/Section 10): the same letter as the record's own XY.X value,
+    followed by a similarity PERCENTAGE strictly between 0 and 100
+    inclusive -- the lexical grammar alone (`_STATUS_TYPE2_SCORE_RE`)
+    cannot bound a variable-length decimal, so the numeric value is checked
+    separately. Codex's exact reproduced `R101` and `R999` (lexically valid,
+    semantically impossible) are rejected here; real Git-produced `R100`
+    remains valid.
+    """
+
+    match = _STATUS_TYPE2_SCORE_RE.fullmatch(score_field)
+    if match is None:
+        return False
+    if score_field[0:1] != expected_x:
+        return False
+    return 0 <= int(match.group(1)) <= 100
 
 
 def _valid_stage_tag_combination(base_tag: bytes, assume_unchanged: bool, stage: int) -> bool:
@@ -1592,7 +1692,10 @@ def _parse_canonical_index_stage_record(
         return None
     if mode not in _INDEX_ENTRY_VALID_MODES:
         return None
-    if not _valid_object_id(object_id, expected_oid_length):
+    # A cached index entry always carries a REAL object id -- never the
+    # all-zero absence placeholder, which only ever means anything in
+    # specific porcelain-v2 fields (F04-R2/Section 7).
+    if not _valid_real_object_id(object_id, expected_oid_length):
         return None
     if not _INDEX_STAGE_RE.fullmatch(stage_bytes):
         return None
@@ -1619,7 +1722,10 @@ def _parse_canonical_resolve_undo_record(
     mode, object_id, stage_bytes = fields
     if mode not in _INDEX_ENTRY_VALID_MODES:
         return None
-    if not _valid_object_id(object_id, expected_oid_length):
+    # A resolve-undo (REUC) record always carries a REAL conflicted blob
+    # object id -- never the all-zero absence placeholder (F04-R2/
+    # Section 13).
+    if not _valid_real_object_id(object_id, expected_oid_length):
         return None
     if not _INDEX_RESOLVE_UNDO_STAGE_RE.fullmatch(stage_bytes):
         return None
@@ -1640,30 +1746,32 @@ def _valid_status_type1_or_type2_fixed_fields(
     x_alphabet: frozenset[bytes],
 ) -> bool:
     """Shared fixed-field grammar for a porcelain-v2 type "1" or type "2"
-    record (Section 10/11/12/14): XY drawn from the record-specific X
-    alphabet and the shared Y alphabet, `<sub>` a valid submodule-state
-    field, every mode a real Git mode (or the documented `000000` absence
-    placeholder), and every OID either a real object id or a
-    zero-placeholder -- both cases exactly the repository's own object
-    format width.
+    record (Section 10/11/12/14, F04-R2/Section 9): XY drawn from the
+    record-specific X alphabet and the shared Y alphabet, and never one of
+    the forbidden combinations no real type-1/type-2 record can carry
+    (`".."`, or any of the seven unmerged-only pairs -- Codex's exact
+    reproduced "XY=.." and "XY=AA"); `<sub>` a valid submodule-state field;
+    `mW` any valid status mode; and each of the HEAD/index mode+OID PAIRS
+    validated as one coherent presence/absence relationship
+    (`_valid_status_mode_oid_pair`), not as independently-shaped fields --
+    Codex's exact reproduced "present HEAD/index modes but all-zero
+    hH/hI object IDs" is rejected here.
     """
 
     if len(xy) != 2:
+        return False
+    if xy in _STATUS_TYPE1_TYPE2_FORBIDDEN_XY:
         return False
     x_char, y_char = xy[0:1], xy[1:2]
     if x_char not in x_alphabet or y_char not in _STATUS_TYPE1_Y_CHARS:
         return False
     if sub != _STATUS_SUBMODULE_NOT_A_SUBMODULE and not _STATUS_SUBMODULE_RE.fullmatch(sub):
         return False
-    if not (
-        mode_head in _STATUS_VALID_MODES
-        and mode_index in _STATUS_VALID_MODES
-        and mode_worktree in _STATUS_VALID_MODES
-    ):
+    if mode_worktree not in _STATUS_VALID_MODES:
         return False
-    return _valid_object_id(hash_head, expected_oid_length) and _valid_object_id(
-        hash_index, expected_oid_length
-    )
+    return _valid_status_mode_oid_pair(
+        mode_head, hash_head, expected_oid_length
+    ) and _valid_status_mode_oid_pair(mode_index, hash_index, expected_oid_length)
 
 
 def _intent_to_add_paths_from_status_v2(stdout: bytes, expected_oid_length: int) -> set[bytes] | None:
@@ -1743,9 +1851,7 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes, expected_oid_length: int)
             score_field, path_bytes = rest.split(b" ", 1)
             if not path_bytes:
                 return None
-            if not _STATUS_TYPE2_SCORE_RE.fullmatch(score_field):
-                return None
-            if score_field[0:1] != xy[0:1]:
+            if not _valid_type2_score(score_field, xy[0:1]):
                 return None
             if i + 1 >= len(records) or not records[i + 1]:
                 return None
@@ -1758,14 +1864,30 @@ def _intent_to_add_paths_from_status_v2(stdout: bytes, expected_oid_length: int)
             _marker, xy, sub, m1, m2, m3, mw, h1, h2, h3, path_bytes = fields
             if not path_bytes:
                 return None
-            if xy not in _STATUS_UNMERGED_XY_PAIRS:
+            # Only the seven documented pairs are real unmerged states, each
+            # with its OWN fixed per-stage presence pattern (F04-R2/
+            # Section 11) -- not independently-valid XY characters.
+            stage_presence = _UNMERGED_STAGE_PRESENCE.get(xy)
+            if stage_presence is None:
                 return None
             if sub != _STATUS_SUBMODULE_NOT_A_SUBMODULE and not _STATUS_SUBMODULE_RE.fullmatch(sub):
                 return None
-            if not all(m in _STATUS_VALID_MODES for m in (m1, m2, m3, mw)):
+            if mw not in _STATUS_VALID_MODES:
                 return None
-            if not all(_valid_object_id(h, expected_oid_length) for h in (h1, h2, h3)):
-                return None
+            for stage_present, stage_mode, stage_oid in (
+                (stage_presence[0], m1, h1),
+                (stage_presence[1], m2, h2),
+                (stage_presence[2], m3, h3),
+            ):
+                if stage_present:
+                    if stage_mode not in _INDEX_ENTRY_VALID_MODES or not _valid_real_object_id(
+                        stage_oid, expected_oid_length
+                    ):
+                        return None
+                elif stage_mode != _STATUS_MODE_ABSENT or not _valid_zero_placeholder_object_id(
+                    stage_oid, expected_oid_length
+                ):
+                    return None
             # an unmerged entry is never intent-to-add; nothing to record.
             i += 1
         else:
@@ -1971,30 +2093,36 @@ _GIT_INDEX_METADATA_KEYS = frozenset({_GIT_DIR_INDEX_KEY, _GIT_COMMON_DIR_INDEX_
 _PATH_DESCRIPTOR_PREFIX = "path:"
 
 
-def _common_dir_relative_alias_for_nested_git_dir(
-    git_dir_path: str, git_common_dir_path: str
-) -> str | None:
-    """If `git_dir_path` names a filesystem path strictly nested inside
-    `git_common_dir_path` (Git's own `<common>/worktrees/<name>` layout for
-    a linked worktree), return the POSIX-joined path of that nesting --
-    matching `snapshot_type_aware_tree`'s own `f"{role}/{relative}"` key
-    convention exactly, so the caller can name the second, common-dir-tree-
-    walk-discovered key that aliases the exact same physical `git_dir`
-    files. Returns `None` if either descriptor is not a `path:` descriptor
-    or `git_dir_path` is not nested inside `git_common_dir_path`.
+def _canonical_absolute_path_descriptor(path_descriptor: str) -> Path | None:
+    """Validate a `"path:"` role descriptor as eligible to participate in
+    role-relationship reasoning at all (F03-R2/Section 1): it must have the
+    exact expected `path:` prefix, and the path portion must be absolute
+    with no unresolved `".."` traversal segment -- i.e. it must already be
+    in the same normalized, resolved form
+    `_build_provisional_protected_git_metadata_observation`'s real snapshot
+    producer writes (`directory.resolve()`/`common_directory.resolve()`).
+    Returns the parsed `Path` when eligible, `None` otherwise. Callers must
+    treat `None` as "cannot participate in role reasoning at all" -- never
+    fall back to lexical/string comparison on the raw descriptor.
+
+    A `"."` segment is not checked for separately: unlike `".."`, it is
+    never context-dependent or ambiguous under symlinks -- `pathlib.Path`
+    itself unconditionally drops it while parsing (`Path("/a/./b").parts ==
+    ("/", "a", "b")`, with no literal `"."` ever appearing), so it
+    normalizes away transparently rather than needing to be rejected.
     """
 
-    if not git_dir_path.startswith(_PATH_DESCRIPTOR_PREFIX) or not git_common_dir_path.startswith(
-        _PATH_DESCRIPTOR_PREFIX
-    ):
+    if not path_descriptor.startswith(_PATH_DESCRIPTOR_PREFIX):
         return None
-    try:
-        relative = Path(git_dir_path[len(_PATH_DESCRIPTOR_PREFIX):]).relative_to(
-            Path(git_common_dir_path[len(_PATH_DESCRIPTOR_PREFIX):])
-        )
-    except ValueError:
+    raw = path_descriptor[len(_PATH_DESCRIPTOR_PREFIX):]
+    if not raw:
         return None
-    return relative.as_posix()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        return None
+    if ".." in candidate.parts:
+        return None
+    return candidate
 
 
 def _index_metadata_exception_keys(metadata: Mapping[str, str]) -> frozenset[str]:
@@ -2020,27 +2148,33 @@ def _index_metadata_exception_keys(metadata: Mapping[str, str]) -> frozenset[str
     `git_dir/index` -- never a different worktree's -- and is exactly as
     eligible for the exception.
 
-    If the role paths are missing or cannot be compared, the exception is
-    not applied to anything (fails closed, not open). Critically, an
-    unequal pair of role paths is *not* by itself sufficient: no exception
-    key is added -- not even `git_dir/index` alone -- until the physical
-    relationship between them has been positively proven to be either the
-    ordinary case (equal) or a genuine linked-worktree nesting (`git_dir` a
-    resolved strict descendant of `git_common_dir`, proven via
-    `_common_dir_relative_alias_for_nested_git_dir`'s real path-containment
-    check, never string-prefix matching). Two unequal, non-nested,
-    malformed, or otherwise incomparable role paths -- even ones that share
-    a misleading textual prefix -- yield an empty set.
+    Required order (F03-R2/Section 2): parse the two role descriptors ->
+    validate BOTH as canonical, absolute, already-resolved paths via
+    `_canonical_absolute_path_descriptor` -> only then compare them (for the
+    ordinary equal-path case) or prove a strict-descendant nesting (for the
+    linked-worktree case) -> only then derive exception keys. If EITHER
+    descriptor is missing, not a `path:` descriptor, relative, or contains
+    an unresolved `.`/`..` traversal segment, no exception key is added at
+    all -- not even `git_dir/index` alone -- regardless of what the raw
+    strings happen to look like lexically (fails closed, not open). This
+    also naturally rejects a misleading textual prefix with no real path
+    containment, since containment is proven via `Path.relative_to` on the
+    canonicalized operands, never string-prefix matching.
     """
 
     git_dir_path = metadata.get("@git_dir")
     git_common_dir_path = metadata.get("@git_common_dir")
     if not git_dir_path or not git_common_dir_path:
         return frozenset()
-    if git_dir_path == git_common_dir_path:
+    canonical_git_dir = _canonical_absolute_path_descriptor(git_dir_path)
+    canonical_git_common_dir = _canonical_absolute_path_descriptor(git_common_dir_path)
+    if canonical_git_dir is None or canonical_git_common_dir is None:
+        return frozenset()
+    if canonical_git_dir == canonical_git_common_dir:
         return frozenset({_GIT_DIR_INDEX_KEY, _GIT_COMMON_DIR_INDEX_KEY})
-    nested_relative = _common_dir_relative_alias_for_nested_git_dir(git_dir_path, git_common_dir_path)
-    if nested_relative is None:
+    try:
+        nested_relative = canonical_git_dir.relative_to(canonical_git_common_dir).as_posix()
+    except ValueError:
         return frozenset()
     return frozenset({_GIT_DIR_INDEX_KEY, f"git_common_dir/{nested_relative}/index"})
 
