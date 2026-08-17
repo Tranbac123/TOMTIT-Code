@@ -331,6 +331,67 @@ def test_full_repair_cycle_to_approve(tmp_path: Path) -> None:
     assert result["final_verdict"] == "APPROVE"
 
 
+def _stateful_claude_touching_evidence(tmp_path: Path, *, touch_paths: list[Path]) -> Path:
+    """Like `_stateful_claude`, but on its SECOND invocation (the repair
+    attempt) also touches (mtime/ctime only, via `os.utime`) each of
+    `touch_paths` -- simulating benign external metadata churn on the
+    trusted Attempt1/Review1 evidence directories landing strictly during
+    the repair attempt (F-RUN005-class, TARGET04_RUN005_PRIOR_EVIDENCE_STABLE_IDENTITY_FIX_REPORT.md)."""
+
+    touch_literals = ", ".join(repr(str(p)) for p in touch_paths)
+    src = f'''#!/usr/bin/env python3
+import os, pathlib, time
+marker = pathlib.Path({str(tmp_path / "stateful-marker-touch-evidence.txt")!r})
+count = int(marker.read_text()) if marker.exists() else 0
+marker.write_text(str(count + 1))
+if count == 0:
+    pathlib.Path("app.txt").write_text("implemented\\n", encoding="utf-8")
+else:
+    pathlib.Path("app.txt").write_text("repaired\\n", encoding="utf-8")
+    now = time.time() + 5
+    for p in [{touch_literals}]:
+        os.utime(p, (now, now))
+raise SystemExit(0)
+'''
+    p = tmp_path / "claude-stateful-touch-evidence"
+    p.write_text(src, encoding="utf-8")
+    p.chmod(0o755)
+    return p
+
+
+def test_full_repair_cycle_tolerates_prior_evidence_timestamp_only_change(tmp_path: Path) -> None:
+    """(F-RUN005/Section 6, outer alignment) The exact Run005 class
+    reproduced at the OUTER run_loop.py layer: the Attempt1/Review1
+    evidence directories' own mtime_ns/ctime_ns change (benign external
+    metadata churn) strictly during the repair attempt, with every member
+    file's content and membership completely unchanged. The loop's own
+    outer `_verify_previous_evidence_unchanged` check must not treat this
+    as drift -- the loop must still reach ACCEPTED, exactly like the
+    no-churn case (`test_full_repair_cycle_to_approve` above)."""
+
+    ws = make_clean_workspace(tmp_path)
+    loop_run_id = "loop-run005-class"
+    evidence_root = tmp_path / "loops"
+    loop_dir = evidence_root / loop_run_id
+    impl1_dir = loop_dir / "children" / f"{loop_run_id}-impl-1"
+    review1_dir = loop_dir / "children" / f"{loop_run_id}-review-1"
+    claude = _stateful_claude_touching_evidence(tmp_path, touch_paths=[impl1_dir, review1_dir])
+    codex = _adaptive_codex_script(tmp_path, workspace=ws, second_verdict_json=approve_verdict_json())
+
+    exit_code = run_loop_cli(
+        tmp_path, ws, claude, codex, allow_one_repair=True, loop_run_id=loop_run_id, evidence_directory=evidence_root
+    )
+
+    assert exit_code == 0
+    result = load_result(loop_dir)
+    assert result["run_state"] == "COMPLETED"
+    assert result["accepted"] is True
+    assert result["stop_reason"] == "REVIEW_APPROVED"
+    assert result["repair_rounds"] == 1
+    assert result["final_verdict"] == "APPROVE"
+    assert result["previous_evidence_immutable"] is True
+
+
 # ---------------------------------------------------------------------------
 # M1 implementation-identity propagation from run_loop.
 # ---------------------------------------------------------------------------

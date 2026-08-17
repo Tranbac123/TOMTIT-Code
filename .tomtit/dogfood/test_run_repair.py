@@ -3161,3 +3161,198 @@ def test_target04_repair_lifecycle_malformed_modern_downgrade_blocks_attempt2(
 
     assert exit_code == 3
     assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "changed\n"
+
+
+# ---------------------------------------------------------------------------
+# F-RUN005 (TARGET04_RUN005_PRIOR_EVIDENCE_STABLE_IDENTITY_FIX): exact Run005
+# reproduction and the surrounding regression matrix for repair's own
+# previous-evidence cross-phase preservation check.
+# ---------------------------------------------------------------------------
+
+
+def _write_fake_claude_touching_paths(directory: Path, touch_paths: list[Path], *, name: str = "fake-claude-touch") -> Path:
+    """A fake claude executable that performs the ordinary repair write,
+    then touches (mtime/ctime only, via `os.utime`) each of `touch_paths` --
+    simulating benign external metadata churn on the trusted prior-evidence
+    tree landing strictly between repair's own before/after measurements.
+    """
+
+    script = directory / name
+    touch_literals = ", ".join(repr(str(p)) for p in touch_paths)
+    body = f'''#!/usr/bin/env python3
+import os, pathlib, time
+pathlib.Path("app.txt").write_text("repaired\\n", encoding="utf-8")
+now = time.time() + 5
+for p in [{touch_literals}]:
+    os.utime(p, (now, now))
+raise SystemExit(0)
+'''
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+    return script
+
+
+def test_repair_tolerates_prior_evidence_root_timestamp_only_change(tmp_path: Path) -> None:
+    """(F-RUN005/Section 1/7/11) Exact Run005-class reproduction: the
+    trusted Review1/Attempt1 evidence tree's ROOT DIRECTORY mtime_ns/
+    ctime_ns change during the repair run (e.g. benign external metadata
+    churn), with every member file's content, membership, and every other
+    identity field completely unchanged. Repair must succeed -- this exact
+    mismatch must never surface as PREVIOUS_EVIDENCE_MUTATED."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    claude = _write_fake_claude_touching_paths(tmp_path, [ctx["impl_dir"], ctx["review_dir"]])
+
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 0
+    assert (ctx["ws"] / "app.txt").read_text(encoding="utf-8") == "repaired\n"
+
+    receipt = json.loads((tmp_path / "runs" / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["previous_evidence_unchanged"] is True
+    assert receipt["error_category"] is None
+    # (Section 10) Raw vs stable diagnostics kept strictly separate: the raw
+    # representation genuinely changed (real mtime_ns/ctime_ns churn was
+    # applied), even though semantic preservation holds.
+    assert receipt["previous_evidence_raw_representation_unchanged"] is False
+
+
+def test_repair_persists_prior_evidence_observability_fields(tmp_path: Path) -> None:
+    """(F-RUN005/Section 9) Repair-start and repair-end stable hashes are
+    persisted on every run, whether or not a mismatch occurs, so a future
+    mismatch has enough bounded evidence to diagnose without needing to
+    reproduce it."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    claude = write_fake_claude(tmp_path)
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        claude,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+    assert exit_code == 0
+
+    receipt = json.loads((tmp_path / "runs" / "receipt.json").read_text(encoding="utf-8"))
+    assert isinstance(receipt["prior_evidence_stable_hash_start"], str) and receipt["prior_evidence_stable_hash_start"]
+    assert isinstance(receipt["prior_evidence_stable_hash_end"], str) and receipt["prior_evidence_stable_hash_end"]
+    assert receipt["prior_evidence_stable_hash_start"] == receipt["prior_evidence_stable_hash_end"]
+    assert receipt["prior_evidence_diagnostic"] is None  # nothing changed -- bounded, not unbounded
+
+    repair_context = json.loads((tmp_path / "runs" / "repair-context.json").read_text(encoding="utf-8"))
+    assert repair_context["prior_evidence_stable_hash_start"] == receipt["prior_evidence_stable_hash_start"]
+
+
+def test_repair_diagnostic_populated_on_real_mutation(tmp_path: Path) -> None:
+    """(F-RUN005/Section 9) When prior evidence genuinely mutates during
+    repair, the bounded diagnostic identifies which path and which field."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    receipt_path = ctx["impl_dir"] / "receipt.json"
+    script = tmp_path / "fake-claude-mutate-evidence"
+    body = f'''#!/usr/bin/env python3
+import pathlib
+pathlib.Path("app.txt").write_text("repaired\\n", encoding="utf-8")
+p = pathlib.Path({str(receipt_path)!r})
+p.write_text(p.read_text(encoding="utf-8") + " ", encoding="utf-8")
+raise SystemExit(0)
+'''
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        script,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 1
+    receipt = json.loads((tmp_path / "runs" / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["previous_evidence_unchanged"] is False
+    assert receipt["error_category"] == "PREVIOUS_EVIDENCE_MUTATED"
+    diagnostic = receipt["prior_evidence_diagnostic"]
+    assert diagnostic is not None
+    assert diagnostic["changed_path_count"] >= 1
+    impl_sample = diagnostic["previous_implementation_evidence"]["changed_paths_sample"]
+    assert any(
+        entry["path"] == "receipt.json" and "content_sha256" in entry["changed_fields"]
+        for entry in impl_sample
+    )
+
+
+def test_repair_rejects_prior_evidence_member_disappearance(tmp_path: Path) -> None:
+    """(F-RUN005/Section 5/12.G) A required prior-evidence member file
+    disappearing during repair must still reject -- directory-timestamp
+    tolerance never implies membership tolerance."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    # An extra, non-required member of the trusted evidence directory (the
+    # three REPAIR_EVIDENCE_FILES are required to exist -- deleting one of
+    # those is caught as a harder EvidenceIntegrityFailure, tested
+    # separately below; this exercises graceful membership-change
+    # rejection for a member outside that required set).
+    extra_path = ctx["impl_dir"] / "extra-note.txt"
+    extra_path.write_text("incidental\n", encoding="utf-8")
+    script = tmp_path / "fake-claude-delete-evidence-member"
+    body = f'''#!/usr/bin/env python3
+import pathlib
+pathlib.Path("app.txt").write_text("repaired\\n", encoding="utf-8")
+pathlib.Path({str(extra_path)!r}).unlink()
+raise SystemExit(0)
+'''
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        script,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 1
+    receipt = json.loads((tmp_path / "runs" / "receipt.json").read_text(encoding="utf-8"))
+    assert receipt["previous_evidence_unchanged"] is False
+    assert receipt["error_category"] == "PREVIOUS_EVIDENCE_MUTATED"
+    impl_sample = receipt["prior_evidence_diagnostic"]["previous_implementation_evidence"]["changed_paths_sample"]
+    assert any(entry["path"] == "extra-note.txt" and entry["disappeared"] is True for entry in impl_sample)
+
+
+def test_repair_raises_integrity_failure_when_required_evidence_file_disappears(tmp_path: Path) -> None:
+    """(F-RUN005/Section 5) A REQUIRED prior-evidence file (one of
+    REPAIR_EVIDENCE_FILES) disappearing during repair is caught by the
+    existing, stricter `read_canonical_evidence` required-file check
+    (a harder failure than a graceful PREVIOUS_EVIDENCE_MUTATED, but still
+    correctly fail-closed, not silently tolerated)."""
+
+    ctx = standard_setup(tmp_path, partitioned_identity=True)
+    patch_path = ctx["impl_dir"] / "diff.patch"
+    script = tmp_path / "fake-claude-delete-required-evidence-member"
+    body = f'''#!/usr/bin/env python3
+import pathlib
+pathlib.Path("app.txt").write_text("repaired\\n", encoding="utf-8")
+pathlib.Path({str(patch_path)!r}).unlink()
+raise SystemExit(0)
+'''
+    script.write_text(body, encoding="utf-8")
+    script.chmod(0o755)
+
+    exit_code = run_repair_cli(
+        tmp_path,
+        ctx["ws"],
+        script,
+        implementation_run_directory=ctx["impl_dir"],
+        review_run_directory=ctx["review_dir"],
+    )
+
+    assert exit_code == 3

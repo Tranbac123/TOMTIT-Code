@@ -1368,6 +1368,16 @@ def main(
 
     previous_impl_hashes_before = _hash_evidence_files(pre["previous_run_directory"], REPAIR_EVIDENCE_FILES)
     review_hashes_before = _hash_evidence_files(pre["review_directory"], REVIEW_EVIDENCE_FILES)
+    # The frozen authority baseline for this repair run (Section 7/8): derived
+    # once here, at repair start, from the raw measurement above, and never
+    # recomputed from a later reading -- repair-end is validated AGAINST this,
+    # never the other way around (no rebootstrap, no rollover).
+    previous_impl_stable_before = run_review._stable_cross_phase_projection(previous_impl_hashes_before)
+    review_stable_before = run_review._stable_cross_phase_projection(review_hashes_before)
+    prior_evidence_stable_hash_before = run_review.workspace_hash(
+        {f"impl/{k}": v for k, v in previous_impl_stable_before.items()}
+        | {f"review/{k}": v for k, v in review_stable_before.items()}
+    )
 
     prompt_text = build_repair_prompt(
         original_task_prompt=pre["original_task_prompt"],
@@ -1438,9 +1448,48 @@ def main(
 
         previous_impl_hashes_after = _hash_evidence_files(pre["previous_run_directory"], REPAIR_EVIDENCE_FILES)
         review_hashes_after = _hash_evidence_files(pre["review_directory"], REVIEW_EVIDENCE_FILES)
-        previous_evidence_unchanged = (
-            previous_impl_hashes_before == previous_impl_hashes_after and review_hashes_before == review_hashes_after
+        previous_impl_stable_after = run_review._stable_cross_phase_projection(previous_impl_hashes_after)
+        review_stable_after = run_review._stable_cross_phase_projection(review_hashes_after)
+        prior_evidence_stable_hash_after = run_review.workspace_hash(
+            {f"impl/{k}": v for k, v in previous_impl_stable_after.items()}
+            | {f"review/{k}": v for k, v in review_stable_after.items()}
         )
+
+        # Authority: cross-phase STABLE identity (Section 1/7) -- a benign
+        # mtime_ns/ctime_ns-only change (e.g. external metadata churn on the
+        # evidence tree) must never by itself reject repair. Every other
+        # load-bearing field (path/membership, type, device, inode, mode,
+        # size, nlink, content SHA-256) remains fully sensitive.
+        previous_evidence_unchanged = (
+            previous_impl_stable_before == previous_impl_stable_after
+            and review_stable_before == review_stable_after
+        )
+        # Raw diagnostic sibling only (Section 10) -- reports whether the
+        # RAW descriptors (including timestamps) were byte-for-byte
+        # identical, kept strictly separate from the authority decision
+        # above and never itself authoritative.
+        previous_evidence_raw_representation_unchanged = (
+            previous_impl_hashes_before == previous_impl_hashes_after
+            and review_hashes_before == review_hashes_after
+        )
+        # Bounded observability (Section 9): only materializes real content
+        # when the semantic comparison above actually disagrees; never an
+        # unbounded dump.
+        prior_evidence_diagnostic = None
+        if not previous_evidence_unchanged:
+            # Diagnostic uses the RAW (with-timestamp) descriptors, never the
+            # already-stripped stable projections -- the field-level parser
+            # needs the full canonical grammar to report exactly which named
+            # field changed (including mtime_ns/ctime_ns, when relevant).
+            impl_diff = run_review.describe_evidence_identity_diff(
+                previous_impl_hashes_before, previous_impl_hashes_after
+            )
+            review_diff = run_review.describe_evidence_identity_diff(review_hashes_before, review_hashes_after)
+            prior_evidence_diagnostic = {
+                "changed_path_count": impl_diff["changed_path_count"] + review_diff["changed_path_count"],
+                "previous_implementation_evidence": impl_diff,
+                "review_evidence": review_diff,
+            }
 
         repair_context = {
             "repair_run_id": repair_run_id,
@@ -1461,6 +1510,7 @@ def main(
                 compute_authorized_command_set_fingerprint(authorized_commands) if authorized_commands else None
             ),
             "authorized_command_count": len(authorized_commands),
+            "prior_evidence_stable_hash_start": prior_evidence_stable_hash_before,
         }
         (evidence_directory / "repair-context.json").write_text(
             json.dumps(repair_context, indent=2, sort_keys=True) + "\n", encoding="utf-8"
@@ -1511,6 +1561,10 @@ def main(
         "check_results": [c.to_dict() for c in check_results],
         "workspace_bound_to_reviewed_state": True,
         "previous_evidence_unchanged": previous_evidence_unchanged,
+        "previous_evidence_raw_representation_unchanged": previous_evidence_raw_representation_unchanged,
+        "prior_evidence_stable_hash_start": prior_evidence_stable_hash_before,
+        "prior_evidence_stable_hash_end": prior_evidence_stable_hash_after,
+        "prior_evidence_diagnostic": prior_evidence_diagnostic,
         "authorized_command_fingerprints": [
             compute_authorized_command_fingerprint(argv) for argv in authorized_commands
         ],

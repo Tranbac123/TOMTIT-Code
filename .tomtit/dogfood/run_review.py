@@ -100,13 +100,13 @@ _CANONICAL_DIR_DESCRIPTOR_RE = re.compile(
     r"dir:dev=(?P<dev>" + _CANONICAL_INT + r"):ino=(?P<ino>" + _CANONICAL_INT + r"):"
     r"mode=(?P<mode>[0-7]{4}):size=(?P<size>" + _CANONICAL_INT + r"):"
     r"nlink=(?P<nlink>" + _CANONICAL_INT + r"):"
-    r"mtime_ns=" + _CANONICAL_INT + r":ctime_ns=" + _CANONICAL_INT
+    r"mtime_ns=(?P<mtime_ns>" + _CANONICAL_INT + r"):ctime_ns=(?P<ctime_ns>" + _CANONICAL_INT + r")"
 )
 _CANONICAL_FILE_DESCRIPTOR_RE = re.compile(
     r"file:dev=(?P<dev>" + _CANONICAL_INT + r"):ino=(?P<ino>" + _CANONICAL_INT + r"):"
     r"mode=(?P<mode>[0-7]{4}):size=(?P<size>" + _CANONICAL_INT + r"):"
     r"nlink=(?P<nlink>" + _CANONICAL_INT + r"):"
-    r"mtime_ns=" + _CANONICAL_INT + r":ctime_ns=" + _CANONICAL_INT + r":"
+    r"mtime_ns=(?P<mtime_ns>" + _CANONICAL_INT + r"):ctime_ns=(?P<ctime_ns>" + _CANONICAL_INT + r"):"
     r"sha256=(?P<sha256>[0-9a-f]{64})"
 )
 # The *stable cross-phase projection* of a `file:` descriptor -- i.e. what
@@ -564,6 +564,103 @@ def _stable_cross_phase_projection(identity: Mapping[str, str]) -> dict[str, str
     """
 
     return {key: _strip_volatile_timestamp_fields(value) for key, value in identity.items()}
+
+
+# Bounded sample size for `describe_evidence_identity_diff` -- diagnostic
+# only, never authoritative, and never an unbounded dump of a mismatched
+# evidence tree (see TARGET04_RUN005_PRIOR_EVIDENCE_STABLE_IDENTITY_FIX_REPORT.md).
+_EVIDENCE_DIFF_BOUNDED_SAMPLE_SIZE = 10
+
+
+def _descriptor_type(descriptor: str) -> str:
+    prefix, _, _ = descriptor.partition(":")
+    return prefix
+
+
+def _parse_evidence_descriptor_fields(descriptor: str) -> dict[str, str] | None:
+    """Parse one canonical `dir:`/`file:` descriptor into its named fields,
+    for bounded field-level diagnostic comparison
+    (`describe_evidence_identity_diff`) only -- never used to decide
+    authority. Returns `None` for a `symlink:` descriptor or anything else
+    that does not `fullmatch` the canonical grammar; such values are
+    compared only as an opaque whole by the caller.
+    """
+
+    match = _CANONICAL_DIR_DESCRIPTOR_RE.fullmatch(descriptor)
+    if match is None:
+        match = _CANONICAL_FILE_DESCRIPTOR_RE.fullmatch(descriptor)
+    if match is None:
+        return None
+    fields = match.groupdict()
+    parsed = {
+        "device": fields["dev"],
+        "inode": fields["ino"],
+        "mode": fields["mode"],
+        "size": fields["size"],
+        "nlink": fields["nlink"],
+        "mtime_ns": fields["mtime_ns"],
+        "ctime_ns": fields["ctime_ns"],
+    }
+    if "sha256" in fields:
+        parsed["content_sha256"] = fields["sha256"]
+    return parsed
+
+
+def _describe_descriptor_field_diff(before_value: str, after_value: str) -> tuple[str, ...]:
+    """Bounded field-level diagnostic only: which named fields differ
+    between two raw canonical descriptors for the SAME path -- never used
+    to decide authority. Returns `("type",)` if the two descriptors are not
+    the same kind (`dir:`/`file:`/`symlink:`) or cannot both be parsed into
+    named fields; otherwise the sorted names of every field whose value
+    differs (from `device`, `inode`, `mode`, `size`, `nlink`, `mtime_ns`,
+    `ctime_ns`, `content_sha256`).
+    """
+
+    if _descriptor_type(before_value) != _descriptor_type(after_value):
+        return ("type",)
+    before_fields = _parse_evidence_descriptor_fields(before_value)
+    after_fields = _parse_evidence_descriptor_fields(after_value)
+    if before_fields is None or after_fields is None:
+        return () if before_value == after_value else ("type",)
+    return tuple(
+        sorted(name for name in before_fields if before_fields[name] != after_fields.get(name))
+    )
+
+
+def describe_evidence_identity_diff(before: Mapping[str, str], after: Mapping[str, str]) -> dict[str, Any]:
+    """Bounded, field-level description of what changed between two raw
+    canonical evidence-tree identity snapshots of the SAME root, for
+    diagnostic persistence only -- never authoritative for any preservation
+    decision (F-RUN005/Section 9). Reports the total changed-path count and
+    a bounded sample of changed paths; for each sampled path, whether it
+    appeared or disappeared, or else exactly which named fields differ
+    (`device`, `inode`, `mode`, `size`, `nlink`, `mtime_ns`, `ctime_ns`,
+    `content_sha256`, or `type`). Never an unbounded dump of a mismatched
+    evidence tree.
+    """
+
+    changed_paths = diff_workspace_hashes(before, after)
+    sample: list[dict[str, Any]] = []
+    for path in changed_paths[:_EVIDENCE_DIFF_BOUNDED_SAMPLE_SIZE]:
+        before_value = before.get(path)
+        after_value = after.get(path)
+        if before_value is None:
+            sample.append({"path": path, "appeared": True, "disappeared": False, "changed_fields": []})
+            continue
+        if after_value is None:
+            sample.append({"path": path, "appeared": False, "disappeared": True, "changed_fields": []})
+            continue
+        sample.append(
+            {
+                "path": path,
+                "appeared": False,
+                "disappeared": False,
+                "changed_fields": list(_describe_descriptor_field_diff(before_value, after_value)),
+                "before_descriptor": before_value,
+                "after_descriptor": after_value,
+            }
+        )
+    return {"changed_path_count": len(changed_paths), "changed_paths_sample": sample}
 
 
 def _stat_identity(metadata: os.stat_result) -> tuple[int, int, int, int, int, int, int]:

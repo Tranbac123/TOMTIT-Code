@@ -1277,6 +1277,216 @@ def test_protected_git_metadata_content_changing_race_during_retry_fails_closed(
 
 
 # ---------------------------------------------------------------------------
+# F-RUN005 (TARGET04_RUN005_PRIOR_EVIDENCE_STABLE_IDENTITY_FIX): prior
+# (Attempt1/Review1) evidence-tree cross-phase stable identity, reusing
+# `_stable_cross_phase_projection` (already exercised above for protected
+# Git metadata) for a SECOND cross-phase-comparison contract -- repair's own
+# "previous evidence must remain unchanged" check. Sections 11-13's exact
+# positive (timestamp-only) and negative (every other field) matrices.
+# ---------------------------------------------------------------------------
+
+
+def _dir_descriptor(*, dev=1, ino=2, mode="0755", size=64, nlink=1, mtime_ns=100, ctime_ns=200) -> str:
+    return f"dir:dev={dev}:ino={ino}:mode={mode}:size={size}:nlink={nlink}:mtime_ns={mtime_ns}:ctime_ns={ctime_ns}"
+
+
+def _file_descriptor(
+    *, dev=1, ino=2, mode="0644", size=64, nlink=1, mtime_ns=100, ctime_ns=200, sha256=None
+) -> str:
+    sha = sha256 or ("a" * 64)
+    return (
+        f"file:dev={dev}:ino={ino}:mode={mode}:size={size}:nlink={nlink}:"
+        f"mtime_ns={mtime_ns}:ctime_ns={ctime_ns}:sha256={sha}"
+    )
+
+
+def test_prior_evidence_stable_identity_tolerates_dir_mtime_only() -> None:
+    """(Section 13) Root/nested directory mtime_ns-only change -> preserved."""
+
+    before = {".": _dir_descriptor(mtime_ns=100, ctime_ns=200)}
+    after = {".": _dir_descriptor(mtime_ns=999, ctime_ns=200)}
+    assert run_review._stable_cross_phase_projection(before) == run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_tolerates_dir_ctime_only() -> None:
+    """(Section 13) Directory ctime_ns-only change -> preserved."""
+
+    before = {".": _dir_descriptor(mtime_ns=100, ctime_ns=200)}
+    after = {".": _dir_descriptor(mtime_ns=100, ctime_ns=999)}
+    assert run_review._stable_cross_phase_projection(before) == run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_tolerates_dir_mtime_and_ctime() -> None:
+    """(Section 13/11) Exact Run005 reproduction shape: BOTH mtime_ns and
+    ctime_ns change on the evidence root directory, every other field
+    identical -> preserved."""
+
+    before = {".": _dir_descriptor(mtime_ns=100, ctime_ns=200)}
+    after = {".": _dir_descriptor(mtime_ns=999, ctime_ns=888)}
+    assert run_review._stable_cross_phase_projection(before) == run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_tolerates_file_mtime_only() -> None:
+    """(Section 13) File mtime_ns-only change, identical content -> preserved."""
+
+    before = {"receipt.json": _file_descriptor(mtime_ns=100, ctime_ns=200)}
+    after = {"receipt.json": _file_descriptor(mtime_ns=999, ctime_ns=200)}
+    assert run_review._stable_cross_phase_projection(before) == run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_tolerates_file_ctime_only() -> None:
+    """(Section 13) File ctime_ns-only change, identical content -> preserved."""
+
+    before = {"receipt.json": _file_descriptor(mtime_ns=100, ctime_ns=200)}
+    after = {"receipt.json": _file_descriptor(mtime_ns=100, ctime_ns=999)}
+    assert run_review._stable_cross_phase_projection(before) == run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_content_sha_change() -> None:
+    """(Section 12.A) File content SHA-256 change -> rejected."""
+
+    before = {"receipt.json": _file_descriptor(sha256="a" * 64)}
+    after = {"receipt.json": _file_descriptor(sha256="b" * 64)}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_size_change() -> None:
+    """(Section 12.B) File size change -> rejected."""
+
+    before = {"receipt.json": _file_descriptor(size=64)}
+    after = {"receipt.json": _file_descriptor(size=65)}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_mode_change() -> None:
+    """(Section 12.C) File mode change -> rejected."""
+
+    before = {"receipt.json": _file_descriptor(mode="0644")}
+    after = {"receipt.json": _file_descriptor(mode="0600")}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_inode_and_device_change() -> None:
+    """(Section 12.D) inode/device change -> rejected (currently load-bearing)."""
+
+    before = {"receipt.json": _file_descriptor(dev=1, ino=100)}
+    after_ino = {"receipt.json": _file_descriptor(dev=1, ino=101)}
+    after_dev = {"receipt.json": _file_descriptor(dev=2, ino=100)}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after_ino)
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after_dev)
+
+
+def test_prior_evidence_stable_identity_rejects_nlink_change() -> None:
+    """(Section 12.E) nlink change -> rejected."""
+
+    before = {"receipt.json": _file_descriptor(nlink=1)}
+    after = {"receipt.json": _file_descriptor(nlink=2)}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_member_appears() -> None:
+    """(Section 12.F/5) A new member appearing -> rejected."""
+
+    before = {".": _dir_descriptor(), "receipt.json": _file_descriptor()}
+    after = {".": _dir_descriptor(), "receipt.json": _file_descriptor(), "new.json": _file_descriptor()}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_member_disappears() -> None:
+    """(Section 12.G/5) A member disappearing -> rejected."""
+
+    before = {".": _dir_descriptor(), "receipt.json": _file_descriptor(), "result.json": _file_descriptor()}
+    after = {".": _dir_descriptor(), "receipt.json": _file_descriptor()}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_nested_membership_change() -> None:
+    """(Section 12.H/5) A nested directory's own membership changing
+    (a file appearing one level down) -> rejected -- directory timestamp
+    tolerance never implies membership tolerance."""
+
+    before = {
+        ".": _dir_descriptor(),
+        "children": _dir_descriptor(ino=3),
+        "children/impl-1": _dir_descriptor(ino=4),
+        "children/impl-1/receipt.json": _file_descriptor(),
+    }
+    after = {
+        ".": _dir_descriptor(),
+        "children": _dir_descriptor(ino=3),
+        "children/impl-1": _dir_descriptor(ino=4),
+        "children/impl-1/receipt.json": _file_descriptor(),
+        "children/impl-1/extra.json": _file_descriptor(ino=5),
+    }
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_object_type_change() -> None:
+    """(Section 12.I) A path changing from a regular file to a directory
+    (or vice versa) -> rejected."""
+
+    before = {"receipt.json": _file_descriptor()}
+    after = {"receipt.json": _dir_descriptor()}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_prior_evidence_stable_identity_rejects_timestamp_change_plus_content_change() -> None:
+    """(Section 12.J) A timestamp-only-looking change that ALSO carries a
+    real content change -> rejected because content changed, not merely
+    tolerated because a timestamp also happened to change."""
+
+    before = {"receipt.json": _file_descriptor(mtime_ns=100, ctime_ns=200, sha256="a" * 64)}
+    after = {"receipt.json": _file_descriptor(mtime_ns=999, ctime_ns=888, sha256="b" * 64)}
+    assert run_review._stable_cross_phase_projection(before) != run_review._stable_cross_phase_projection(after)
+
+
+def test_describe_evidence_identity_diff_reports_bounded_changed_fields() -> None:
+    """(Section 9) Bounded field-level diagnostic: reports exactly which
+    named fields differ for a changed path, never an unbounded dump."""
+
+    before = {"receipt.json": _file_descriptor(size=64, sha256="a" * 64, mtime_ns=1, ctime_ns=2)}
+    after = {"receipt.json": _file_descriptor(size=65, sha256="b" * 64, mtime_ns=1, ctime_ns=2)}
+    diff = run_review.describe_evidence_identity_diff(before, after)
+    assert diff["changed_path_count"] == 1
+    sample = diff["changed_paths_sample"][0]
+    assert sample["path"] == "receipt.json"
+    assert sample["appeared"] is False
+    assert sample["disappeared"] is False
+    assert set(sample["changed_fields"]) == {"size", "content_sha256"}
+
+
+def test_describe_evidence_identity_diff_reports_timestamp_only_fields() -> None:
+    before = {".": _dir_descriptor(mtime_ns=1, ctime_ns=2)}
+    after = {".": _dir_descriptor(mtime_ns=999, ctime_ns=888)}
+    diff = run_review.describe_evidence_identity_diff(before, after)
+    assert diff["changed_path_count"] == 1
+    assert set(diff["changed_paths_sample"][0]["changed_fields"]) == {"mtime_ns", "ctime_ns"}
+
+
+def test_describe_evidence_identity_diff_reports_appeared_and_disappeared() -> None:
+    before = {"a.json": _file_descriptor(), "b.json": _file_descriptor(ino=3)}
+    after = {"a.json": _file_descriptor(), "c.json": _file_descriptor(ino=4)}
+    diff = run_review.describe_evidence_identity_diff(before, after)
+    assert diff["changed_path_count"] == 2
+    by_path = {entry["path"]: entry for entry in diff["changed_paths_sample"]}
+    assert by_path["b.json"]["disappeared"] is True
+    assert by_path["c.json"]["appeared"] is True
+
+
+def test_describe_evidence_identity_diff_reports_type_change() -> None:
+    before = {"x": _file_descriptor()}
+    after = {"x": _dir_descriptor()}
+    diff = run_review.describe_evidence_identity_diff(before, after)
+    assert diff["changed_paths_sample"][0]["changed_fields"] == ["type"]
+
+
+def test_describe_evidence_identity_diff_no_changes_empty_sample() -> None:
+    same = {".": _dir_descriptor(), "receipt.json": _file_descriptor()}
+    diff = run_review.describe_evidence_identity_diff(same, dict(same))
+    assert diff == {"changed_path_count": 0, "changed_paths_sample": []}
+
+
+# ---------------------------------------------------------------------------
 # Intra-measurement timestamp-only instability for a protected regular-file
 # *member* (HEAD, a ref, a loose object, ...), not just the root .git entry.
 # See TimestampOnlyRegularFileInstability. All of these perturb only the

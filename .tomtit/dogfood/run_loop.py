@@ -1098,6 +1098,18 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
         evidence_snapshots[child_id] = hash_directory(run_directory)
 
     def _verify_previous_evidence_unchanged() -> tuple[bool, list[str]]:
+        """Cross-phase STABLE comparison (aligned with run_repair.py's own
+        internal previous-evidence check -- see
+        TARGET04_RUN005_PRIOR_EVIDENCE_STABLE_IDENTITY_FIX_REPORT.md): a
+        benign mtime_ns/ctime_ns-only change to a recorded child evidence
+        directory must never by itself count as drift here. Every other
+        load-bearing field (path/membership, type, device, inode, mode,
+        size, nlink, content SHA-256) remains fully sensitive. `snapshot`
+        (recorded once via `_record_child_evidence`, at the time that child
+        completed) is the raw baseline and is never itself mutated by this
+        comparison.
+        """
+
         drifted: list[str] = []
         for child_id, snapshot in evidence_snapshots.items():
             try:
@@ -1105,7 +1117,9 @@ def main(argv: list[str] | None = None) -> int:  # noqa: C901
             except run_review.EvidenceIntegrityFailure:
                 drifted.append(child_id)
                 continue
-            if current != snapshot:
+            if run_review._stable_cross_phase_projection(current) != run_review._stable_cross_phase_projection(
+                snapshot
+            ):
                 drifted.append(child_id)
         return (not drifted, drifted)
 
