@@ -2,8 +2,8 @@
 
 None of these tests invoke a real Claude/Codex service and none modify any
 historical Target-04 run evidence (Run001-006). Disposable synthetic loop
-evidence trees are used for every write-path test; the one test that reads
-real Run006 evidence never calls the write path against it.
+evidence trees are used for every write-path test; the tests that read real
+Run006 evidence never call the write path against it.
 
 Run with:
 
@@ -16,6 +16,7 @@ import importlib.util
 import json
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -31,6 +32,10 @@ _spec.loader.exec_module(evaluate_dogfood_run)
 REAL_RUN006_EVIDENCE_ROOT = (
     Path.home() / "Documents" / "AI" / "ai-agent" / "TOMTIT-E2E-Evidence" / "real-e2e-target04a-006-sonnet-medium"
 )
+
+# Known real values used throughout for explicit-input tests (Section 10).
+KNOWN_TARGET04A_TASK_CONTRACT_SHA256 = "9948219bfdd1de053bcdc03239a97029d465a671f9270a58510896c0bbb29e13"
+KNOWN_TARGET04A_RUNTIME_COMMIT = "60a44355c77c4d651cc4a45f7a83c65122fea6d2"
 
 
 # ---------------------------------------------------------------------------
@@ -196,6 +201,31 @@ def make_owner(
     )
 
 
+def _minimal_summary_record(**overrides: Any) -> dict[str, Any]:
+    """A minimal, hand-built DOGFOOD_EVALUATION_V0-shaped record for
+    exercising `summarize_evaluations()` in isolation from evidence
+    extraction."""
+
+    base: dict[str, Any] = {
+        "accepted": False,
+        "accepted_without_manual_edit": False,
+        "repair_count": 0,
+        "evidence_complete": True,
+        "scope_violation": "UNKNOWN",
+        "escaped_defect_reported": "UNKNOWN",
+        "active_human_minutes_to_confident_accept": None,
+        "total_cost_usd": {"status": "UNAVAILABLE", "value": None},
+        "elapsed_seconds": None,
+        "implementation_attempt_count": 1,
+        "review_count": 1,
+        "owner_interruptions": 0,
+        "clarification_count": 0,
+        "manual_edit_lines": 0,
+    }
+    base.update(overrides)
+    return base
+
+
 # ---------------------------------------------------------------------------
 # Identity / schema.
 # ---------------------------------------------------------------------------
@@ -208,11 +238,12 @@ def test_schema_version_constant() -> None:
 def test_build_evaluation_record_identity_fields(tmp_path: Path) -> None:
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-identity")
     record = evaluate_dogfood_run.build_evaluation_record(
-        evidence_root=evidence_root, owner=make_owner(), runtime_commit="deadbeef"
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit="deadbeef"
     )
     assert record["schema_version"] == "DOGFOOD_EVALUATION_V0"
     assert record["run_id"] == "loop-identity"
-    assert record["task_contract_sha256"] == "ce6b4693d5a7634ba26974449ca3dca5f1a1e4d0cbdd4c012bbfb11a7f7cceae"
+    assert record["task_prompt_sha256"] == "ce6b4693d5a7634ba26974449ca3dca5f1a1e4d0cbdd4c012bbfb11a7f7cceae"
+    assert record["task_contract_sha256"] is None
     assert record["workspace_baseline"] == "6bb0d1b2f8ad69d6c6a91b1c5516b5da86211a4e"
     assert record["runtime_commit"] == "deadbeef"
     assert isinstance(record["evaluation_id"], str) and record["evaluation_id"]
@@ -221,9 +252,141 @@ def test_build_evaluation_record_identity_fields(tmp_path: Path) -> None:
 
 def test_evaluation_id_unique_per_call(tmp_path: Path) -> None:
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-uuid")
-    r1 = evaluate_dogfood_run.build_evaluation_record(evidence_root=evidence_root, owner=make_owner(), runtime_commit=None)
-    r2 = evaluate_dogfood_run.build_evaluation_record(evidence_root=evidence_root, owner=make_owner(), runtime_commit=None)
+    r1 = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    r2 = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
     assert r1["evaluation_id"] != r2["evaluation_id"]
+
+
+# ---------------------------------------------------------------------------
+# Task identity semantics (Blocker 1; tests 1-5).
+# ---------------------------------------------------------------------------
+
+
+def test_task_prompt_sha256_stored_under_correct_name(tmp_path: Path) -> None:
+    """(1) task_prompt_sha256, not task_contract_sha256, is the field
+    populated from the Runtime-derived prompt hash."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-identity-prompt-hash")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    assert record["task_prompt_sha256"] == "ce6b4693d5a7634ba26974449ca3dca5f1a1e4d0cbdd4c012bbfb11a7f7cceae"
+
+
+def test_task_contract_sha256_defaults_to_null(tmp_path: Path) -> None:
+    """(2) Without an explicit --task-contract-sha256 input, the field is
+    null -- never silently populated from task_prompt_sha256."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-identity-contract-null")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    assert record["task_contract_sha256"] is None
+    assert record["task_contract_sha256_provenance"] == "UNKNOWN"
+
+
+def test_explicit_valid_task_contract_sha256_accepted(tmp_path: Path) -> None:
+    """(3) A validated, explicitly-supplied TaskContract hash is stored
+    exactly and labeled EXPLICIT_INPUT."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-identity-contract-explicit")
+    validated = evaluate_dogfood_run.validate_task_contract_sha256(KNOWN_TARGET04A_TASK_CONTRACT_SHA256)
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=validated, runtime_commit=None
+    )
+    assert record["task_contract_sha256"] == KNOWN_TARGET04A_TASK_CONTRACT_SHA256
+    assert record["task_contract_sha256_provenance"] == "EXPLICIT_INPUT"
+
+
+@pytest.mark.parametrize(
+    "malformed",
+    ["too-short", "g" * 64, KNOWN_TARGET04A_TASK_CONTRACT_SHA256 + "zz", ""],
+    ids=["too_short", "non_hex", "too_long", "empty"],
+)
+def test_malformed_explicit_task_contract_sha256_rejected(malformed: str) -> None:
+    """(4) A malformed explicit hash is rejected -- never truncated,
+    padded, or silently accepted."""
+
+    with pytest.raises(evaluate_dogfood_run.EvaluationError) as excinfo:
+        evaluate_dogfood_run.validate_task_contract_sha256(malformed)
+    assert excinfo.value.category == "INVALID_TASK_CONTRACT_SHA256"
+
+
+def test_no_free_text_hash_inference(tmp_path: Path) -> None:
+    """(5) Even if some other field happens to contain a 64-hex-looking
+    substring, it must never be scraped into task_contract_sha256 -- only
+    an explicit input can populate it."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-identity-no-inference")
+    owner = make_owner(owner_note=f"see contract {KNOWN_TARGET04A_TASK_CONTRACT_SHA256}")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=owner, task_contract_sha256=None, runtime_commit=None
+    )
+    assert record["task_contract_sha256"] is None
+
+
+# ---------------------------------------------------------------------------
+# Runtime commit provenance (Blocker 2; tests 6-8).
+# ---------------------------------------------------------------------------
+
+
+def test_default_historical_runtime_commit_null(tmp_path: Path) -> None:
+    """(6) Without an explicit --runtime-commit input, the field is null."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-commit-default-null")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    assert record["runtime_commit"] is None
+    assert record["runtime_commit_provenance"] == "UNKNOWN"
+
+
+def test_explicit_runtime_commit_accepted(tmp_path: Path) -> None:
+    """(7) A validated, explicitly-supplied Runtime commit is stored
+    exactly and labeled EXPLICIT_INPUT."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-commit-explicit")
+    validated = evaluate_dogfood_run.validate_runtime_commit(KNOWN_TARGET04A_RUNTIME_COMMIT)
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=validated
+    )
+    assert record["runtime_commit"] == KNOWN_TARGET04A_RUNTIME_COMMIT
+    assert record["runtime_commit_provenance"] == "EXPLICIT_INPUT"
+
+
+def test_evaluator_checkout_head_does_not_silently_become_runtime_commit(tmp_path: Path) -> None:
+    """(8) main() without --runtime-commit must never fall back to the
+    evaluator's own `git rev-parse HEAD` -- no such helper exists in the
+    module at all anymore."""
+
+    assert not hasattr(evaluate_dogfood_run, "_detect_runtime_commit")
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-commit-no-auto")
+    exit_code = evaluate_dogfood_run.main(
+        [
+            "--evidence-root",
+            str(evidence_root),
+            "--owner-disposition",
+            "ACCEPTED",
+            "--active-human-seconds",
+            "10",
+            "--owner-interruptions",
+            "0",
+            "--clarification-count",
+            "0",
+            "--manual-edit-lines",
+            "0",
+        ]
+    )
+    assert exit_code == 0
+    record_path = evidence_root.parent / "evaluations" / "loop-commit-no-auto.evaluation.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["runtime_commit"] is None
+    assert record["runtime_commit_provenance"] == "UNKNOWN"
 
 
 # ---------------------------------------------------------------------------
@@ -248,6 +411,7 @@ def test_owner_disposition_derivation(
     record = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=evidence_root,
         owner=make_owner(owner_disposition=disposition, manual_edit_lines=manual_edit_lines),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
     assert record["accepted"] is expected_accepted
@@ -259,6 +423,7 @@ def test_active_human_minutes_derived_only_when_accepted(tmp_path: Path) -> None
     accepted_record = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=accepted_root,
         owner=make_owner(owner_disposition="ACCEPTED", active_human_seconds=180),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
     assert accepted_record["active_human_minutes_to_confident_accept"] == 3.0
@@ -267,14 +432,15 @@ def test_active_human_minutes_derived_only_when_accepted(tmp_path: Path) -> None
     not_usable_record = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=not_usable_root,
         owner=make_owner(owner_disposition="NOT_USABLE", active_human_seconds=999),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
-    # (Section 8) Do not reinterpret NOT_USABLE as infinite time -- null, not 0, not 999/60.
+    # Do not reinterpret NOT_USABLE as infinite time -- null, not 0, not 999/60.
     assert not_usable_record["active_human_minutes_to_confident_accept"] is None
 
 
 # ---------------------------------------------------------------------------
-# Runtime-derived outcome extraction (Section 5).
+# Runtime-derived outcome extraction.
 # ---------------------------------------------------------------------------
 
 
@@ -292,19 +458,22 @@ def test_runtime_derived_outcome_extraction_first_pass(tmp_path: Path) -> None:
 
 
 def test_runtime_accepted_never_confused_with_owner_accepted(tmp_path: Path) -> None:
-    """(Section 5) runtime_accepted (Runtime's own field) and accepted
-    (Owner-derived) are DISTINCT fields and must never be conflated."""
+    """runtime_accepted (Runtime's own field) and accepted (Owner-derived)
+    are DISTINCT fields and must never be conflated."""
 
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-runtime-accepted-distinct", accepted=True)
     record = evaluate_dogfood_run.build_evaluation_record(
-        evidence_root=evidence_root, owner=make_owner(owner_disposition="NOT_USABLE"), runtime_commit=None
+        evidence_root=evidence_root,
+        owner=make_owner(owner_disposition="NOT_USABLE"),
+        task_contract_sha256=None,
+        runtime_commit=None,
     )
     assert record["runtime_accepted"] is True
     assert record["accepted"] is False
 
 
 # ---------------------------------------------------------------------------
-# Tri-state semantics (Sections 6/7).
+# Tri-state cost/token/scope semantics (extraction-level).
 # ---------------------------------------------------------------------------
 
 
@@ -321,8 +490,8 @@ def test_cost_and_token_known_when_usage_present(tmp_path: Path) -> None:
 
 
 def test_cost_and_token_unavailable_when_usage_block_absent(tmp_path: Path) -> None:
-    """(Section 7/16.E) No `usage` key at all in this evidence shape ->
-    UNAVAILABLE, never zero, never inferred."""
+    """No `usage` key at all in this evidence shape -> UNAVAILABLE, never
+    zero, never inferred."""
 
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-usage-absent", usage=None)
     facts = evaluate_dogfood_run.extract_runtime_derived_facts(evidence_root)
@@ -331,9 +500,9 @@ def test_cost_and_token_unavailable_when_usage_block_absent(tmp_path: Path) -> N
 
 
 def test_cost_unknown_when_usage_present_but_field_malformed(tmp_path: Path) -> None:
-    """(Section 7) The concept is measurable (usage block exists) but this
-    specific field is not a trustworthy number -> UNKNOWN, not UNAVAILABLE,
-    not zero."""
+    """The concept is measurable (usage block exists) but this specific
+    field is not a trustworthy number -> UNKNOWN, not UNAVAILABLE, not
+    zero."""
 
     evidence_root = make_loop_evidence(
         tmp_path,
@@ -357,7 +526,7 @@ def test_scope_violation_false_when_no_unexpected_changed_paths(tmp_path: Path) 
 
 
 def test_scope_violation_unknown_when_field_absent(tmp_path: Path) -> None:
-    """(Section 6) Never manufacture certainty: if scope validity cannot be
+    """Never manufacture certainty: if scope validity cannot be
     deterministically established, scope_violation = UNKNOWN."""
 
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-scope-unknown", unexpected_changed_paths=None)
@@ -375,11 +544,13 @@ def test_scope_violation_unknown_when_evidence_incomplete(tmp_path: Path) -> Non
 
 
 def test_escaped_defect_reported_defaults_to_unknown_never_inferred_from_approve(tmp_path: Path) -> None:
-    """(Section 6/13) Even a clean Review2 APPROVE must never be used to
-    infer "no escaped defect" -- default is UNKNOWN unless Owner-supplied."""
+    """Even a clean Review2 APPROVE must never be used to infer "no
+    escaped defect" -- default is UNKNOWN unless Owner-supplied."""
 
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-escaped-default", trajectory="repair")
-    record = evaluate_dogfood_run.build_evaluation_record(evidence_root=evidence_root, owner=make_owner(), runtime_commit=None)
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
     assert record["escaped_defect_reported"] == "UNKNOWN"
 
 
@@ -387,13 +558,16 @@ def test_escaped_defect_reported_defaults_to_unknown_never_inferred_from_approve
 def test_escaped_defect_reported_owner_supplied(tmp_path: Path, value: str) -> None:
     evidence_root = make_loop_evidence(tmp_path, run_id=f"loop-escaped-{value}")
     record = evaluate_dogfood_run.build_evaluation_record(
-        evidence_root=evidence_root, owner=make_owner(escaped_defect_reported=value), runtime_commit=None
+        evidence_root=evidence_root,
+        owner=make_owner(escaped_defect_reported=value),
+        task_contract_sha256=None,
+        runtime_commit=None,
     )
     assert record["escaped_defect_reported"] == value
 
 
 # ---------------------------------------------------------------------------
-# Trajectory-aware evidence completeness (Section 12).
+# Trajectory-aware evidence completeness.
 # ---------------------------------------------------------------------------
 
 
@@ -450,8 +624,8 @@ def test_evidence_incomplete_when_repair_context_missing(tmp_path: Path) -> None
 
 
 def test_evidence_complete_preflight_blocked_requires_only_loop_level_files(tmp_path: Path) -> None:
-    """(Section 12) A failed-preflight trajectory records no
-    implementation/review run ids at all -- no child evidence is required."""
+    """A failed-preflight trajectory records no implementation/review run
+    ids at all -- no child evidence is required."""
 
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-preflight-blocked", trajectory="preflight_blocked")
     facts = evaluate_dogfood_run.extract_runtime_derived_facts(evidence_root)
@@ -460,7 +634,84 @@ def test_evidence_complete_preflight_blocked_requires_only_loop_level_files(tmp_
 
 
 # ---------------------------------------------------------------------------
-# Run006-shaped fixture (Section 15 compatibility target).
+# Bounded child evidence paths (Blocker 3; tests 9-14).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "child_id",
+    ["../../outside", "../outside", "/absolute/path", "a/b", "a\\b", ".", "..", ""],
+    ids=["dotdot_dotdot", "dotdot", "absolute", "slash", "backslash", "dot", "dotdot_literal", "empty"],
+)
+def test_child_path_escape_rejected(tmp_path: Path, child_id: str) -> None:
+    """(9)(10)(11)(12) Every escaping/malformed shape is rejected before
+    anything is inspected under the candidate path."""
+
+    children_root = tmp_path / "children"
+    children_root.mkdir()
+    with pytest.raises(evaluate_dogfood_run.EvaluationError) as excinfo:
+        evaluate_dogfood_run.resolve_child_evidence_directory(children_root, child_id)
+    assert excinfo.value.category in ("INVALID_CHILD_ID", "CHILD_PATH_ESCAPE")
+
+
+def test_child_path_valid_simple_id_still_works(tmp_path: Path) -> None:
+    """(13) A normal, valid child id still resolves correctly."""
+
+    children_root = tmp_path / "children"
+    (children_root / "impl-1").mkdir(parents=True)
+    resolved = evaluate_dogfood_run.resolve_child_evidence_directory(children_root, "impl-1")
+    assert resolved == children_root / "impl-1"
+
+
+def test_child_path_symlink_escape_rejected(tmp_path: Path) -> None:
+    """(14) A child id that is itself a valid basename, but resolves via a
+    symlink to somewhere outside children_root, is rejected."""
+
+    outside = tmp_path / "outside-secret"
+    outside.mkdir()
+    children_root = tmp_path / "children"
+    children_root.mkdir()
+    (children_root / "evil-link").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(evaluate_dogfood_run.EvaluationError) as excinfo:
+        evaluate_dogfood_run.resolve_child_evidence_directory(children_root, "evil-link")
+    assert excinfo.value.category == "CHILD_PATH_ESCAPE"
+
+
+def test_evidence_completeness_fails_clearly_on_malicious_child_id(tmp_path: Path) -> None:
+    """A malicious child id recorded in loop-result.json must raise --
+    never be silently folded into missing_evidence_paths, never
+    inspected."""
+
+    evidence_root = tmp_path / "loop-malicious-child"
+    evidence_root.mkdir()
+    (evidence_root / "children").mkdir()
+    run_id = "loop-malicious-child"
+    _write_json(
+        evidence_root / "loop-result.json",
+        {
+            "loop_run_id": run_id,
+            "run_state": "COMPLETED",
+            "terminal_outcome": "COMPLETED",
+            "stop_reason": "REVIEW_APPROVED",
+            "implementation_attempts": 1,
+            "repair_rounds": 0,
+            "review_attempts": 0,
+            "model_invocation_count": 1,
+            "implementation_run_ids": ["../../outside"],
+            "review_run_ids": [],
+            "unexpected_changed_paths": [],
+        },
+    )
+    _write_json(evidence_root / "loop-receipt.json", {"loop_run_id": run_id})
+    (evidence_root / "events.jsonl").write_text("{}\n", encoding="utf-8")
+
+    with pytest.raises(evaluate_dogfood_run.EvaluationError) as excinfo:
+        evaluate_dogfood_run.extract_runtime_derived_facts(evidence_root)
+    assert excinfo.value.category in ("INVALID_CHILD_ID", "CHILD_PATH_ESCAPE")
+
+
+# ---------------------------------------------------------------------------
+# Run006-shaped fixture (compatibility target).
 # ---------------------------------------------------------------------------
 
 
@@ -485,9 +736,9 @@ def test_run006_shaped_synthetic_fixture(tmp_path: Path) -> None:
 
 
 def test_real_run006_evidence_extraction_read_only() -> None:
-    """(Section 15) Use the REAL Run006 evidence directly, as a read-only
-    example -- never writing anywhere near it. Skips gracefully if that
-    machine-local evidence is not present (e.g. a different checkout)."""
+    """Use the REAL Run006 evidence directly, as a read-only example --
+    never writing anywhere near it. Skips gracefully if that machine-local
+    evidence is not present (e.g. a different checkout)."""
 
     if not REAL_RUN006_EVIDENCE_ROOT.is_dir():
         pytest.skip("real Run006 evidence not present on this machine")
@@ -507,50 +758,104 @@ def test_real_run006_evidence_extraction_read_only() -> None:
     assert after_listing == before_listing
 
 
+def test_real_run006_evaluation_record_identity_without_explicit_overrides() -> None:
+    """(Section 10) Without explicit --task-contract-sha256/--runtime-commit,
+    real historical Run006 evidence yields task_prompt_sha256 = the actual
+    Runtime prompt hash, task_contract_sha256 = null, runtime_commit =
+    null, runtime_commit_provenance = UNKNOWN. build_evaluation_record
+    never writes; write_evaluation_record is never called against real
+    Run006 evidence."""
+
+    if not REAL_RUN006_EVIDENCE_ROOT.is_dir():
+        pytest.skip("real Run006 evidence not present on this machine")
+
+    before_listing = sorted(p.name for p in REAL_RUN006_EVIDENCE_ROOT.parent.iterdir())
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=REAL_RUN006_EVIDENCE_ROOT,
+        owner=make_owner(),
+        task_contract_sha256=None,
+        runtime_commit=None,
+    )
+    after_listing = sorted(p.name for p in REAL_RUN006_EVIDENCE_ROOT.parent.iterdir())
+
+    assert record["task_prompt_sha256"] == "ce6b4693d5a7634ba26974449ca3dca5f1a1e4d0cbdd4c012bbfb11a7f7cceae"
+    assert record["task_contract_sha256"] is None
+    assert record["task_contract_sha256_provenance"] == "UNKNOWN"
+    assert record["runtime_commit"] is None
+    assert record["runtime_commit_provenance"] == "UNKNOWN"
+    assert record["implementation_attempt_count"] == 2
+    assert record["repair_count"] == 1
+    assert record["review_count"] == 2
+    assert record["model_invocation_count"] == 4
+    assert record["runtime_terminal_outcome"] == "COMPLETED"
+    assert record["runtime_stop_reason"] == "REVIEW_APPROVED"
+    assert record["evidence_complete"] is True
+    assert after_listing == before_listing
+
+
+def test_real_run006_evaluation_record_identity_with_explicit_overrides() -> None:
+    """(Section 10) With explicit, validated overrides, both fields are
+    stored exactly and labeled EXPLICIT_INPUT. Still read-only."""
+
+    if not REAL_RUN006_EVIDENCE_ROOT.is_dir():
+        pytest.skip("real Run006 evidence not present on this machine")
+
+    before_listing = sorted(p.name for p in REAL_RUN006_EVIDENCE_ROOT.parent.iterdir())
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=REAL_RUN006_EVIDENCE_ROOT,
+        owner=make_owner(),
+        task_contract_sha256=evaluate_dogfood_run.validate_task_contract_sha256(KNOWN_TARGET04A_TASK_CONTRACT_SHA256),
+        runtime_commit=evaluate_dogfood_run.validate_runtime_commit(KNOWN_TARGET04A_RUNTIME_COMMIT),
+    )
+    after_listing = sorted(p.name for p in REAL_RUN006_EVIDENCE_ROOT.parent.iterdir())
+
+    assert record["task_prompt_sha256"] == "ce6b4693d5a7634ba26974449ca3dca5f1a1e4d0cbdd4c012bbfb11a7f7cceae"
+    assert record["task_contract_sha256"] == KNOWN_TARGET04A_TASK_CONTRACT_SHA256
+    assert record["task_contract_sha256_provenance"] == "EXPLICIT_INPUT"
+    assert record["runtime_commit"] == KNOWN_TARGET04A_RUNTIME_COMMIT
+    assert record["runtime_commit_provenance"] == "EXPLICIT_INPUT"
+    assert after_listing == before_listing
+
+
 # ---------------------------------------------------------------------------
-# Output: immutable per-run record, append-only aggregation, no overwrite.
+# Write consistency (Blocker 4; tests 15-18).
 # ---------------------------------------------------------------------------
 
 
-def test_write_evaluation_record_creates_record_and_jsonl(tmp_path: Path) -> None:
-    evidence_root = make_loop_evidence(tmp_path, run_id="loop-write-1")
-    record = evaluate_dogfood_run.build_evaluation_record(evidence_root=evidence_root, owner=make_owner(), runtime_commit=None)
-    record_path, jsonl_path = evaluate_dogfood_run.write_evaluation_record(evidence_root, record)
+def test_successful_write_requires_no_second_authoritative_write(tmp_path: Path) -> None:
+    """(15) A successful per-run JSON write is the complete, sole
+    authoritative artifact -- no JSONL (or any other) second file is
+    produced."""
 
-    assert record_path == evidence_root.parent / "evaluations" / "loop-write-1.evaluation.json"
-    assert json.loads(record_path.read_text(encoding="utf-8"))["run_id"] == "loop-write-1"
-    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 1
-    assert json.loads(lines[0])["run_id"] == "loop-write-1"
-    # (Section 2) Never written inside the canonical evidence root itself.
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-write-sole-artifact")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    record_path = evaluate_dogfood_run.write_evaluation_record(evidence_root, record)
+    assert record_path == evidence_root.parent / "evaluations" / "loop-write-sole-artifact.evaluation.json"
+    assert json.loads(record_path.read_text(encoding="utf-8"))["run_id"] == "loop-write-sole-artifact"
+    siblings = sorted(p.name for p in record_path.parent.iterdir())
+    assert siblings == ["loop-write-sole-artifact.evaluation.json"]
+    # Never written inside the canonical evidence root itself.
     assert not (evidence_root / "evaluations").exists()
 
 
-def test_write_evaluation_record_appends_to_shared_jsonl(tmp_path: Path) -> None:
-    root1 = make_loop_evidence(tmp_path, run_id="loop-append-1")
-    root2 = make_loop_evidence(tmp_path, run_id="loop-append-2")
-    r1 = evaluate_dogfood_run.build_evaluation_record(evidence_root=root1, owner=make_owner(), runtime_commit=None)
-    r2 = evaluate_dogfood_run.build_evaluation_record(evidence_root=root2, owner=make_owner(), runtime_commit=None)
-    evaluate_dogfood_run.write_evaluation_record(root1, r1)
-    _, jsonl_path = evaluate_dogfood_run.write_evaluation_record(root2, r2)
+def test_existing_record_still_cannot_be_overwritten(tmp_path: Path) -> None:
+    """(16) A second evaluation of the same run must fail clearly, never
+    silently overwrite; original bytes are preserved exactly."""
 
-    lines = jsonl_path.read_text(encoding="utf-8").strip().splitlines()
-    assert len(lines) == 2
-    run_ids = {json.loads(line)["run_id"] for line in lines}
-    assert run_ids == {"loop-append-1", "loop-append-2"}
-
-
-def test_no_silent_overwrite_of_existing_evaluation(tmp_path: Path) -> None:
-    """(Section 11/16.H) A second evaluation of the same run must fail
-    clearly, never silently overwrite."""
-
-    evidence_root = make_loop_evidence(tmp_path, run_id="loop-no-overwrite")
-    record = evaluate_dogfood_run.build_evaluation_record(evidence_root=evidence_root, owner=make_owner(), runtime_commit=None)
-    record_path, _ = evaluate_dogfood_run.write_evaluation_record(evidence_root, record)
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-no-overwrite-2")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    record_path = evaluate_dogfood_run.write_evaluation_record(evidence_root, record)
     original_bytes = record_path.read_bytes()
 
     second_record = evaluate_dogfood_run.build_evaluation_record(
-        evidence_root=evidence_root, owner=make_owner(owner_disposition="NOT_USABLE"), runtime_commit=None
+        evidence_root=evidence_root,
+        owner=make_owner(owner_disposition="NOT_USABLE"),
+        task_contract_sha256=None,
+        runtime_commit=None,
     )
     with pytest.raises(evaluate_dogfood_run.EvaluationError) as excinfo:
         evaluate_dogfood_run.write_evaluation_record(evidence_root, second_record)
@@ -558,8 +863,46 @@ def test_no_silent_overwrite_of_existing_evaluation(tmp_path: Path) -> None:
     assert record_path.read_bytes() == original_bytes
 
 
+def test_summary_works_from_per_run_json_records_alone(tmp_path: Path) -> None:
+    """(17) --summarize needs nothing beyond the per-run *.evaluation.json
+    files -- no JSONL file is ever produced or required."""
+
+    root1 = make_loop_evidence(tmp_path, run_id="loop-summary-only-1")
+    root2 = make_loop_evidence(tmp_path, run_id="loop-summary-only-2")
+    r1 = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=root1, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    r2 = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=root2, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    evaluate_dogfood_run.write_evaluation_record(root1, r1)
+    evaluate_dogfood_run.write_evaluation_record(root2, r2)
+
+    evaluations_dir = root1.parent / "evaluations"
+    assert list(evaluations_dir.glob("*.jsonl")) == []
+    records = evaluate_dogfood_run._load_all_records(evaluations_dir)
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["total_evaluations"] == 2
+
+
+def test_no_jsonl_step_can_make_an_accepted_evaluation_unrecoverable(tmp_path: Path) -> None:
+    """(18) There is no second, separately-failable persistence step at
+    all -- a successful per-run JSON write is unconditionally the
+    complete, recoverable record."""
+
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-write-unrecoverable-check")
+    record = evaluate_dogfood_run.build_evaluation_record(
+        evidence_root=evidence_root, owner=make_owner(), task_contract_sha256=None, runtime_commit=None
+    )
+    record_path = evaluate_dogfood_run.write_evaluation_record(evidence_root, record)
+    assert record_path.is_file()
+    reloaded = json.loads(record_path.read_text(encoding="utf-8"))
+    summary = evaluate_dogfood_run.summarize_evaluations([reloaded])
+    assert summary["total_evaluations"] == 1
+
+
 # ---------------------------------------------------------------------------
-# Negative cases (Section 16).
+# Negative cases.
 # ---------------------------------------------------------------------------
 
 
@@ -590,15 +933,18 @@ def test_loop_result_missing_required_key_rejected(tmp_path: Path) -> None:
 def test_runtime_completed_owner_not_usable_accepted_is_false(tmp_path: Path) -> None:
     evidence_root = make_loop_evidence(tmp_path, run_id="loop-completed-not-usable", terminal_outcome="COMPLETED", accepted=True)
     record = evaluate_dogfood_run.build_evaluation_record(
-        evidence_root=evidence_root, owner=make_owner(owner_disposition="NOT_USABLE"), runtime_commit=None
+        evidence_root=evidence_root,
+        owner=make_owner(owner_disposition="NOT_USABLE"),
+        task_contract_sha256=None,
+        runtime_commit=None,
     )
     assert record["runtime_terminal_outcome"] == "COMPLETED"
     assert record["accepted"] is False
 
 
 def test_runtime_failed_owner_accepted_with_manual_edit_preserves_both_facts(tmp_path: Path) -> None:
-    """(Section 16.D) Do not silently force Runtime and Owner facts to
-    agree -- both are preserved independently."""
+    """Do not silently force Runtime and Owner facts to agree -- both are
+    preserved independently."""
 
     evidence_root = make_loop_evidence(
         tmp_path, run_id="loop-failed-owner-accepted", terminal_outcome="FAILED", stop_reason="REPAIR_ATTEMPT_2_FAILED", accepted=False
@@ -606,6 +952,7 @@ def test_runtime_failed_owner_accepted_with_manual_edit_preserves_both_facts(tmp
     record = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=evidence_root,
         owner=make_owner(owner_disposition="ACCEPTED_WITH_MANUAL_EDIT", manual_edit_lines=12),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
     assert record["runtime_terminal_outcome"] == "FAILED"
@@ -614,14 +961,9 @@ def test_runtime_failed_owner_accepted_with_manual_edit_preserves_both_facts(tmp
     assert record["manual_edit_lines"] == 12
 
 
-# (E) token/cost unavailable already covered above
-# (F) first-pass evidence completeness already covered above
-# (G) repair-path evidence completeness already covered above
-# (H) no silent overwrite already covered above
-
-
 # ---------------------------------------------------------------------------
-# Summary helper (Section 14) -- trivial arithmetic only.
+# Summary helper -- known-value denominators, null semantics, elapsed time
+# (Blockers 5/6; tests 19-24).
 # ---------------------------------------------------------------------------
 
 
@@ -635,11 +977,13 @@ def test_summarize_evaluations_basic_arithmetic(tmp_path: Path) -> None:
     r1 = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=accepted_root,
         owner=make_owner(owner_disposition="ACCEPTED", active_human_seconds=60, owner_interruptions=1),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
     r2 = evaluate_dogfood_run.build_evaluation_record(
         evidence_root=repaired_root,
         owner=make_owner(owner_disposition="NOT_USABLE", owner_interruptions=2),
+        task_contract_sha256=None,
         runtime_commit=None,
     )
     summary = evaluate_dogfood_run.summarize_evaluations([r1, r2])
@@ -649,6 +993,140 @@ def test_summarize_evaluations_basic_arithmetic(tmp_path: Path) -> None:
     assert summary["repair_rate"] == 0.5
     assert summary["total_owner_interruptions"] == 3
     assert summary["median_active_human_minutes_to_confident_accept"] == 1.0
+
+
+def test_summary_scope_violation_rate_excludes_unknown_from_denominator() -> None:
+    """(19) UNKNOWN scope entries are excluded from the denominator
+    entirely -- never counted as "not a violation"."""
+
+    records = [
+        _minimal_summary_record(scope_violation="TRUE"),
+        _minimal_summary_record(scope_violation="FALSE"),
+        _minimal_summary_record(scope_violation="UNKNOWN"),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["scope_violation_known_count"] == 2
+    assert summary["scope_violation_rate"] == 0.5
+
+
+def test_summary_scope_violation_rate_null_when_all_unknown() -> None:
+    """(20) All-UNKNOWN scope observations -> null rate, not 0."""
+
+    records = [_minimal_summary_record(scope_violation="UNKNOWN"), _minimal_summary_record(scope_violation="UNKNOWN")]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["scope_violation_known_count"] == 0
+    assert summary["scope_violation_rate"] is None
+
+
+def test_summary_escaped_defect_unknown_not_counted_as_false() -> None:
+    """(21) escaped_defect_true_count / escaped_defect_known_count never
+    treat UNKNOWN as FALSE."""
+
+    records = [
+        _minimal_summary_record(escaped_defect_reported="TRUE"),
+        _minimal_summary_record(escaped_defect_reported="UNKNOWN"),
+        _minimal_summary_record(escaped_defect_reported="UNKNOWN"),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["escaped_defect_true_count"] == 1
+    assert summary["escaped_defect_known_count"] == 1
+
+
+def test_summary_cost_metric_excludes_unknown_and_unavailable() -> None:
+    """(22) Only accepted records with a KNOWN cost contribute."""
+
+    records = [
+        _minimal_summary_record(accepted=True, total_cost_usd={"status": "KNOWN", "value": 2.0}),
+        _minimal_summary_record(accepted=True, total_cost_usd={"status": "UNKNOWN", "value": None}),
+        _minimal_summary_record(accepted=True, total_cost_usd={"status": "UNAVAILABLE", "value": None}),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["cost_known_accepted_task_count"] == 1
+    assert summary["average_cost_usd_per_accepted_task_when_known"] == 2.0
+
+
+def test_summary_cost_metric_null_when_no_known_costs() -> None:
+    """(23) No known accepted costs -> null, never $0."""
+
+    records = [_minimal_summary_record(accepted=True, total_cost_usd={"status": "UNAVAILABLE", "value": None})]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["cost_known_accepted_task_count"] == 0
+    assert summary["average_cost_usd_per_accepted_task_when_known"] is None
+
+
+def test_summary_elapsed_time_aggregation() -> None:
+    """(24) mean/total elapsed seconds, filtering to valid numeric values
+    only."""
+
+    records = [
+        _minimal_summary_record(elapsed_seconds=100.0),
+        _minimal_summary_record(elapsed_seconds=200.0),
+        _minimal_summary_record(elapsed_seconds=None),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["mean_elapsed_seconds"] == 150.0
+    assert summary["total_elapsed_seconds"] == 300.0
+
+
+# ---------------------------------------------------------------------------
+# Token / cost KNOWN-value validation (Blocker 6; tests 25-33).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [float("nan"), float("inf"), float("-inf"), -1, -1.0, True, "1.25"],
+    ids=["nan", "pos_inf", "neg_inf", "neg_int", "neg_float", "bool_true", "string"],
+)
+def test_cost_invalid_values_rejected_as_unknown(value: Any) -> None:
+    """(25)(26)(27)(28)(30) NaN/+inf/-inf/negative/bool/string all reject
+    to UNKNOWN, never coerced, never KNOWN."""
+
+    status, stored = evaluate_dogfood_run._tri_state_field(
+        {"total_model_cost_usd": value}, "total_model_cost_usd", is_valid=evaluate_dogfood_run._valid_known_cost
+    )
+    assert status == "UNKNOWN"
+    assert stored is None
+
+
+@pytest.mark.parametrize(
+    "value",
+    [-1, float("nan"), float("inf"), 1.5, True, "10"],
+    ids=["negative", "nan", "inf", "float", "bool_true", "string"],
+)
+def test_token_invalid_values_rejected_as_unknown(value: Any) -> None:
+    """(29)(31) Negative/non-finite/float/bool/string token counts all
+    reject to UNKNOWN -- floats rejected even when integral-valued would
+    make sense, because token counts are discrete."""
+
+    status, stored = evaluate_dogfood_run._tri_state_field(
+        {"total_input_tokens": value}, "total_input_tokens", is_valid=evaluate_dogfood_run._valid_known_token_count
+    )
+    assert status == "UNKNOWN"
+    assert stored is None
+
+
+@pytest.mark.parametrize("value", [0, 1.25])
+def test_cost_valid_values_accepted_as_known(value: Any) -> None:
+    """(32)(33) Zero and positive finite costs are accepted as KNOWN."""
+
+    status, stored = evaluate_dogfood_run._tri_state_field(
+        {"total_model_cost_usd": value}, "total_model_cost_usd", is_valid=evaluate_dogfood_run._valid_known_cost
+    )
+    assert status == "KNOWN"
+    assert stored == value
+
+
+@pytest.mark.parametrize("value", [0, 123])
+def test_token_valid_values_accepted_as_known(value: Any) -> None:
+    """(32)(33) Zero and positive integer token counts are accepted as
+    KNOWN."""
+
+    status, stored = evaluate_dogfood_run._tri_state_field(
+        {"total_input_tokens": value}, "total_input_tokens", is_valid=evaluate_dogfood_run._valid_known_token_count
+    )
+    assert status == "KNOWN"
+    assert stored == value
 
 
 # ---------------------------------------------------------------------------
@@ -729,9 +1207,63 @@ def test_cli_summarize_mode(tmp_path: Path) -> None:
     assert exit_code == 0
 
 
+def test_cli_explicit_identity_flags_reach_record(tmp_path: Path) -> None:
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-cli-explicit-identity")
+    exit_code = evaluate_dogfood_run.main(
+        [
+            "--evidence-root",
+            str(evidence_root),
+            "--owner-disposition",
+            "ACCEPTED",
+            "--active-human-seconds",
+            "10",
+            "--owner-interruptions",
+            "0",
+            "--clarification-count",
+            "0",
+            "--manual-edit-lines",
+            "0",
+            "--task-contract-sha256",
+            KNOWN_TARGET04A_TASK_CONTRACT_SHA256,
+            "--runtime-commit",
+            KNOWN_TARGET04A_RUNTIME_COMMIT,
+        ]
+    )
+    assert exit_code == 0
+    record_path = evidence_root.parent / "evaluations" / "loop-cli-explicit-identity.evaluation.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    assert record["task_contract_sha256"] == KNOWN_TARGET04A_TASK_CONTRACT_SHA256
+    assert record["task_contract_sha256_provenance"] == "EXPLICIT_INPUT"
+    assert record["runtime_commit"] == KNOWN_TARGET04A_RUNTIME_COMMIT
+    assert record["runtime_commit_provenance"] == "EXPLICIT_INPUT"
+
+
+def test_cli_malformed_task_contract_sha256_rejected(tmp_path: Path) -> None:
+    evidence_root = make_loop_evidence(tmp_path, run_id="loop-cli-malformed-contract")
+    exit_code = evaluate_dogfood_run.main(
+        [
+            "--evidence-root",
+            str(evidence_root),
+            "--owner-disposition",
+            "ACCEPTED",
+            "--active-human-seconds",
+            "10",
+            "--owner-interruptions",
+            "0",
+            "--clarification-count",
+            "0",
+            "--manual-edit-lines",
+            "0",
+            "--task-contract-sha256",
+            "not-a-valid-hash",
+        ]
+    )
+    assert exit_code == 2
+
+
 # ---------------------------------------------------------------------------
-# Authority coupling (Section 17): no canonical Runtime transition code may
-# import or call this module.
+# Authority coupling: no canonical Runtime transition code may import or
+# call this module.
 # ---------------------------------------------------------------------------
 
 

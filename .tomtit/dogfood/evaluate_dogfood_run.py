@@ -25,7 +25,9 @@ Run with:
       --active-human-seconds 120 \\
       --owner-interruptions 1 \\
       --clarification-count 0 \\
-      --manual-edit-lines 0
+      --manual-edit-lines 0 \\
+      [--task-contract-sha256 <64-hex>] \\
+      [--runtime-commit <git-sha>]
 
     python3 .tomtit/dogfood/evaluate_dogfood_run.py \\
       --summarize /path/to/evaluations
@@ -36,9 +38,13 @@ from __future__ import annotations
 import argparse
 import dataclasses
 import json
-import subprocess
+import math
+import os
+import re
 import sys
+import tempfile
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
@@ -55,6 +61,14 @@ REQUIRED_LOOP_FILES = ("loop-result.json", "loop-receipt.json", "events.jsonl")
 IMPLEMENTATION_REQUIRED_FILES = ("receipt.json", "result.json", "diff.patch")
 REPAIR_ADDITIONAL_REQUIRED_FILES = ("repair-context.json", "checks.json")
 REVIEW_REQUIRED_FILES = ("review-receipt.json", "review-result.json", "checks.json")
+
+_TASK_CONTRACT_SHA256_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+# Git object ids are hex; a full SHA-1 is 40 characters and a full SHA-256
+# repository uses 64 -- an abbreviated form is commonly shorter. 4 is git's
+# own historical minimum abbreviation length.
+_RUNTIME_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{4,64}$")
+
+_CHILD_ID_FORBIDDEN_LITERALS = frozenset({"", ".", ".."})
 
 
 class OwnerDisposition(str, Enum):
@@ -84,6 +98,15 @@ class ObservabilityState(str, Enum):
     UNAVAILABLE = "UNAVAILABLE"
 
 
+class ExplicitInputProvenance(str, Enum):
+    """For fields that are EITHER an explicitly-supplied, trustworthy input
+    OR absent -- never auto-populated from ambient/incidental state (see
+    `runtime_commit`)."""
+
+    EXPLICIT_INPUT = "EXPLICIT_INPUT"
+    UNKNOWN = "UNKNOWN"
+
+
 class EvaluationError(Exception):
     """A clearly-categorized failure to build or write an evaluation record.
     Never raised by, or caught inside, canonical Runtime code -- this
@@ -93,6 +116,83 @@ class EvaluationError(Exception):
         super().__init__(message)
         self.category = category
         self.message = message
+
+
+# ---------------------------------------------------------------------------
+# Explicit-input validation (Sections 1/2). Both of these are used ONLY at
+# the boundary where a value is first supplied (CLI, or a direct caller) --
+# never derived, never guessed, never scraped from free text.
+# ---------------------------------------------------------------------------
+
+
+def validate_task_contract_sha256(value: str | None) -> str | None:
+    """Strict validation for an explicitly-supplied TaskContract identity
+    hash (Section 1). `None` in, `None` out -- never guessed. Raises on a
+    non-null value that is not exactly 64 hex characters; normalizes a
+    valid value to lowercase."""
+
+    if value is None:
+        return None
+    if not _TASK_CONTRACT_SHA256_RE.fullmatch(value):
+        raise EvaluationError(
+            "INVALID_TASK_CONTRACT_SHA256",
+            f"--task-contract-sha256 must be exactly 64 hexadecimal characters, got: {value!r}",
+        )
+    return value.lower()
+
+
+def validate_runtime_commit(value: str | None) -> str | None:
+    """Strict-enough validation for an explicitly-supplied Runtime revision
+    (Section 2). `None` in, `None` out -- never auto-populated from the
+    evaluator's own current checkout."""
+
+    if value is None:
+        return None
+    if not _RUNTIME_COMMIT_RE.fullmatch(value):
+        raise EvaluationError(
+            "INVALID_RUNTIME_COMMIT",
+            f"--runtime-commit must be 4-64 hexadecimal characters, got: {value!r}",
+        )
+    return value.lower()
+
+
+# ---------------------------------------------------------------------------
+# Bounded child-evidence path resolution (Section 3). implementation_run_ids
+# / review_run_ids are OPAQUE identifiers recorded by Runtime evidence --
+# never trusted as filesystem path fragments.
+# ---------------------------------------------------------------------------
+
+
+def resolve_child_evidence_directory(children_root: Path, child_id: str) -> Path:
+    """Resolve one child id to a directory strictly beneath `children_root`,
+    or raise `EvaluationError` -- never returns (and never lets a caller
+    inspect) a path that could point outside it. `child_id` must be a
+    simple basename: non-empty, not "."/"..", and containing no path
+    separator of either kind. The joined path is additionally required to
+    resolve (following any real symlink) to something still strictly under
+    the resolved `children_root` -- catching a symlinked child directory
+    that targets outside it.
+    """
+
+    if not isinstance(child_id, str) or child_id in _CHILD_ID_FORBIDDEN_LITERALS:
+        raise EvaluationError("INVALID_CHILD_ID", f"child id is not a valid simple identifier: {child_id!r}")
+    if "/" in child_id or "\\" in child_id:
+        raise EvaluationError(
+            "INVALID_CHILD_ID", f"child id must not contain a path separator: {child_id!r}"
+        )
+    if os.path.isabs(child_id):
+        raise EvaluationError("INVALID_CHILD_ID", f"child id must not be an absolute path: {child_id!r}")
+
+    candidate = children_root / child_id
+    resolved_children_root = children_root.resolve(strict=False)
+    resolved_candidate = candidate.resolve(strict=False)
+    try:
+        resolved_candidate.relative_to(resolved_children_root)
+    except ValueError:
+        raise EvaluationError(
+            "CHILD_PATH_ESCAPE", f"child id resolves outside the children root: {child_id!r}"
+        ) from None
+    return candidate
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +227,11 @@ def check_evidence_completeness(evidence_root: Path, loop_result: dict[str, Any]
     repair/Review2 artifacts; a run that never left preflight
     (`implementation_run_ids`/`review_run_ids` both empty) requires only
     the three loop-level files.
+
+    Every recorded child id is resolved through
+    `resolve_child_evidence_directory` before anything is inspected under
+    it -- an invalid or escaping child id raises immediately (Section 3):
+    "Do NOT inspect an escaped path."
     """
 
     missing: list[str] = []
@@ -134,12 +239,11 @@ def check_evidence_completeness(evidence_root: Path, loop_result: dict[str, Any]
         if not (evidence_root / name).is_file():
             missing.append(name)
 
+    children_root = evidence_root / "children"
+
     implementation_run_ids = loop_result.get("implementation_run_ids") or []
     for index, run_id in enumerate(implementation_run_ids):
-        if not isinstance(run_id, str) or not run_id:
-            missing.append(f"children/<invalid-implementation-run-id-at-index-{index}>")
-            continue
-        child_dir = evidence_root / "children" / run_id
+        child_dir = resolve_child_evidence_directory(children_root, run_id)
         required = IMPLEMENTATION_REQUIRED_FILES
         if index > 0:
             # Every implementation run after the first is a bounded repair
@@ -152,10 +256,7 @@ def check_evidence_completeness(evidence_root: Path, loop_result: dict[str, Any]
 
     review_run_ids = loop_result.get("review_run_ids") or []
     for run_id in review_run_ids:
-        if not isinstance(run_id, str) or not run_id:
-            missing.append("children/<invalid-review-run-id>")
-            continue
-        child_dir = evidence_root / "children" / run_id
+        child_dir = resolve_child_evidence_directory(children_root, run_id)
         for name in REVIEW_REQUIRED_FILES:
             if not (child_dir / name).is_file():
                 missing.append(f"children/{run_id}/{name}")
@@ -163,15 +264,36 @@ def check_evidence_completeness(evidence_root: Path, loop_result: dict[str, Any]
     return EvidenceCompletenessResult(complete=not missing, missing_paths=tuple(missing))
 
 
-def _tri_state_numeric(usage: Any, key: str) -> tuple[str, float | None]:
+def _valid_known_cost(value: Any) -> bool:
+    """KNOWN cost requires a real, non-boolean, finite, non-negative number
+    (Section 7 negative matrix: NaN/+inf/-inf/negative/bool all rejected)."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= 0
+
+
+def _valid_known_token_count(value: Any) -> bool:
+    """KNOWN token count requires a real, non-boolean INTEGER >= 0 -- a
+    float (even 1.0) is rejected because token counts are discrete."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return value >= 0
+
+
+def _tri_state_field(usage: Any, key: str, *, is_valid: Callable[[Any], bool]) -> tuple[str, Any]:
     """UNAVAILABLE if the `usage` block itself (or this specific field) is
-    absent from this evidence shape; UNKNOWN if present but not a
-    trustworthy number; KNOWN with the real value otherwise. Never zero."""
+    absent from this evidence shape; UNKNOWN if present but `is_valid`
+    rejects it (never coerced, e.g. a string is never parsed as a number);
+    KNOWN with the real value otherwise."""
 
     if not isinstance(usage, dict) or key not in usage:
         return (ObservabilityState.UNAVAILABLE.value, None)
     value = usage[key]
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
+    if is_valid(value):
         return (ObservabilityState.KNOWN.value, value)
     return (ObservabilityState.UNKNOWN.value, None)
 
@@ -183,7 +305,7 @@ class RuntimeDerivedFacts:
     DOGFOOD_EVALUATION_TELEMETRY_V0.md#provenance)."""
 
     run_id: str | None
-    task_contract_sha256: str | None
+    task_prompt_sha256: str | None
     workspace_baseline: str | None
     runtime_terminal_outcome: str | None
     runtime_stop_reason: str | None
@@ -196,9 +318,9 @@ class RuntimeDerivedFacts:
     total_cost_usd_status: str
     total_cost_usd_value: float | None
     total_input_tokens_status: str
-    total_input_tokens_value: float | None
+    total_input_tokens_value: int | None
     total_output_tokens_status: str
-    total_output_tokens_value: float | None
+    total_output_tokens_value: int | None
     scope_violation: str
     evidence_complete: bool
     missing_evidence_paths: tuple[str, ...]
@@ -226,7 +348,10 @@ def extract_runtime_derived_facts(evidence_root: Path) -> RuntimeDerivedFacts:
 
     completeness = check_evidence_completeness(evidence_root, loop_result)
 
-    task_contract_sha256: str | None = None
+    # (Section 1) task_prompt_sha256 is the exact canonical Runtime field --
+    # never relabeled as, copied into, or confused with task_contract_sha256
+    # (which is an explicit CLI input only; see build_evaluation_record).
+    task_prompt_sha256: str | None = None
     workspace_baseline: str | None = None
     contract_path = evidence_root / "task-contract.json"
     if contract_path.is_file():
@@ -234,23 +359,26 @@ def extract_runtime_derived_facts(evidence_root: Path) -> RuntimeDerivedFacts:
             contract = _read_json_object(contract_path)
         except EvaluationError:
             contract = {}
-        # run_loop.py's own task-contract.json has no field named literally
-        # "task_contract_sha256" -- the closest canonical, deterministic
-        # identity hash it records is `task_prompt_sha256` (the sha256 of
-        # the exact task prompt text this run was bound to). Documented
-        # explicitly in DOGFOOD_EVALUATION_TELEMETRY_V0.md.
         value = contract.get("task_prompt_sha256")
-        task_contract_sha256 = value if isinstance(value, str) else None
+        task_prompt_sha256 = value if isinstance(value, str) else None
         baseline = contract.get("baseline_commit")
         workspace_baseline = baseline if isinstance(baseline, str) else None
 
     duration_ms = loop_result.get("duration_ms")
-    elapsed_seconds = duration_ms / 1000.0 if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool) else None
+    elapsed_seconds = (
+        duration_ms / 1000.0
+        if isinstance(duration_ms, (int, float)) and not isinstance(duration_ms, bool)
+        else None
+    )
 
     usage = loop_result.get("usage")
-    cost_status, cost_value = _tri_state_numeric(usage, "total_model_cost_usd")
-    input_tokens_status, input_tokens_value = _tri_state_numeric(usage, "total_input_tokens")
-    output_tokens_status, output_tokens_value = _tri_state_numeric(usage, "total_output_tokens")
+    cost_status, cost_value = _tri_state_field(usage, "total_model_cost_usd", is_valid=_valid_known_cost)
+    input_tokens_status, input_tokens_value = _tri_state_field(
+        usage, "total_input_tokens", is_valid=_valid_known_token_count
+    )
+    output_tokens_status, output_tokens_value = _tri_state_field(
+        usage, "total_output_tokens", is_valid=_valid_known_token_count
+    )
 
     unexpected_changed_paths = loop_result.get("unexpected_changed_paths")
     if not completeness.complete or unexpected_changed_paths is None:
@@ -269,7 +397,7 @@ def extract_runtime_derived_facts(evidence_root: Path) -> RuntimeDerivedFacts:
 
     return RuntimeDerivedFacts(
         run_id=loop_result.get("loop_run_id") if isinstance(loop_result.get("loop_run_id"), str) else None,
-        task_contract_sha256=task_contract_sha256,
+        task_prompt_sha256=task_prompt_sha256,
         workspace_baseline=workspace_baseline,
         runtime_terminal_outcome=loop_result.get("terminal_outcome"),
         runtime_stop_reason=loop_result.get("stop_reason"),
@@ -311,14 +439,22 @@ def build_evaluation_record(
     *,
     evidence_root: Path,
     owner: OwnerSuppliedFacts,
+    task_contract_sha256: str | None,
     runtime_commit: str | None,
     now: datetime | None = None,
 ) -> dict[str, Any]:
     """The single non-authoritative merge point: Runtime-derived facts
-    (read-only) + Owner-supplied facts -> one DOGFOOD_EVALUATION_V0 record.
-    Never validates the two sources against each other -- a Runtime FAILED
-    run and an Owner ACCEPTED_WITH_MANUAL_EDIT disposition are both
-    recorded exactly as given (Section 16.D)."""
+    (read-only) + Owner-supplied facts + explicit trustworthy identity
+    inputs -> one DOGFOOD_EVALUATION_V0 record. Never validates the Runtime
+    and Owner facts against each other -- a Runtime FAILED run and an Owner
+    ACCEPTED_WITH_MANUAL_EDIT disposition are both recorded exactly as
+    given (Section 16.D).
+
+    `task_contract_sha256` and `runtime_commit` must already be validated
+    (see `validate_task_contract_sha256`/`validate_runtime_commit`) --
+    this function does not re-validate them, and never derives either one
+    from anything else.
+    """
 
     facts = extract_runtime_derived_facts(evidence_root)
 
@@ -335,15 +471,28 @@ def build_evaluation_record(
 
     evaluated_at = (now or datetime.now(timezone.utc)).isoformat()
 
+    runtime_commit_provenance = (
+        ExplicitInputProvenance.EXPLICIT_INPUT.value if runtime_commit is not None else ExplicitInputProvenance.UNKNOWN.value
+    )
+    task_contract_sha256_provenance = (
+        ExplicitInputProvenance.EXPLICIT_INPUT.value
+        if task_contract_sha256 is not None
+        else ExplicitInputProvenance.UNKNOWN.value
+    )
+
     return {
         # Identity (tool-generated: schema_version/evaluation_id/evaluated_at;
-        # RUNTIME_DERIVED: run_id/task_contract_sha256/workspace_baseline;
-        # mixed tool-detected/owner-overridable: runtime_commit).
+        # RUNTIME_DERIVED: run_id/task_prompt_sha256/workspace_baseline;
+        # EXPLICIT_INPUT only, never auto-populated: task_contract_sha256,
+        # runtime_commit -- see their _provenance siblings).
         "schema_version": SCHEMA_VERSION,
         "evaluation_id": str(uuid.uuid4()),
         "run_id": facts.run_id,
-        "task_contract_sha256": facts.task_contract_sha256,
+        "task_prompt_sha256": facts.task_prompt_sha256,
+        "task_contract_sha256": task_contract_sha256,
+        "task_contract_sha256_provenance": task_contract_sha256_provenance,
         "runtime_commit": runtime_commit,
+        "runtime_commit_provenance": runtime_commit_provenance,
         "workspace_baseline": facts.workspace_baseline,
         "evaluated_at": evaluated_at,
         # OWNER_SUPPLIED.
@@ -378,41 +527,60 @@ def build_evaluation_record(
 
 
 # ---------------------------------------------------------------------------
-# Output: one immutable per-run record, plus append-only aggregation.
+# Output: one immutable per-run record. This IS the complete, sole source
+# of truth for a run's evaluation -- there is no second required
+# persistence action, so no partial-write state can exist (Section 4).
 # ---------------------------------------------------------------------------
 
 
-def evaluation_output_paths(evidence_root: Path, run_id: str) -> tuple[Path, Path]:
-    evaluations_dir = evidence_root.parent / "evaluations"
-    record_path = evaluations_dir / f"{run_id}.evaluation.json"
-    jsonl_path = evaluations_dir / "dogfood-evaluations-v0.jsonl"
-    return record_path, jsonl_path
+def evaluation_record_path(evidence_root: Path, run_id: str) -> Path:
+    return evidence_root.parent / "evaluations" / f"{run_id}.evaluation.json"
 
 
-def write_evaluation_record(evidence_root: Path, record: dict[str, Any]) -> tuple[Path, Path]:
-    """Write the one immutable per-run JSON artifact and append it to the
-    aggregation JSONL. Never overwrites an existing per-run record
-    (Section 11/16.H) -- for Batch 1, evaluation records are immutable."""
+def write_evaluation_record(evidence_root: Path, record: dict[str, Any]) -> Path:
+    """Atomically create the one immutable per-run JSON artifact. Never
+    overwrites an existing per-run record (Section 4/16.H): uses a
+    temp-file-then-hardlink sequence (never `os.rename`, which silently
+    overwrites on POSIX) so the existence check and the actual creation
+    cannot race, and so the file is either fully written or not created at
+    all -- never partially written.
+    """
 
     run_id = record.get("run_id")
     if not run_id:
         raise EvaluationError("MISSING_RUN_ID", "loop-result.json did not provide a usable loop_run_id")
-    record_path, jsonl_path = evaluation_output_paths(evidence_root, run_id)
+    record_path = evaluation_record_path(evidence_root, run_id)
     record_path.parent.mkdir(parents=True, exist_ok=True)
     if record_path.exists():
         raise EvaluationError(
             "EVALUATION_ALREADY_EXISTS",
             f"an evaluation record already exists for run {run_id!r}: {record_path}",
         )
-    record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    with jsonl_path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, sort_keys=True) + "\n")
-    return record_path, jsonl_path
+
+    payload = json.dumps(record, indent=2, sort_keys=True) + "\n"
+    fd, tmp_name = tempfile.mkstemp(dir=str(record_path.parent), prefix=f".{run_id}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        try:
+            os.link(tmp_name, record_path)
+        except FileExistsError:
+            raise EvaluationError(
+                "EVALUATION_ALREADY_EXISTS",
+                f"an evaluation record already exists for run {run_id!r}: {record_path}",
+            ) from None
+    finally:
+        Path(tmp_name).unlink(missing_ok=True)
+    return record_path
 
 
 # ---------------------------------------------------------------------------
 # Tiny deterministic Batch-1 summary helper (Section 14). Arithmetic only --
-# no dashboard, no visualization, no statistical framework.
+# no dashboard, no visualization, no statistical framework. Reads per-run
+# `*.evaluation.json` files directly; no separate aggregate file is
+# required or produced.
 # ---------------------------------------------------------------------------
 
 
@@ -437,8 +605,21 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
     first_pass = [r for r in records if r.get("repair_count") == 0]
     repaired = [r for r in records if (r.get("repair_count") or 0) > 0]
     evidence_complete = [r for r in records if r.get("evidence_complete")]
-    scope_violations = [r for r in records if r.get("scope_violation") == BoolTriState.TRUE.value]
-    escaped_defects = [r for r in records if r.get("escaped_defect_reported") == BoolTriState.TRUE.value]
+
+    # (Section 5) UNKNOWN is excluded from the denominator entirely -- never
+    # treated as FALSE/0.
+    known_scope_records = [
+        r for r in records if r.get("scope_violation") in (BoolTriState.TRUE.value, BoolTriState.FALSE.value)
+    ]
+    scope_violations_true = [r for r in known_scope_records if r.get("scope_violation") == BoolTriState.TRUE.value]
+
+    escaped_defect_known = [
+        r
+        for r in records
+        if r.get("escaped_defect_reported") in (BoolTriState.TRUE.value, BoolTriState.FALSE.value)
+    ]
+    escaped_defect_true = [r for r in records if r.get("escaped_defect_reported") == BoolTriState.TRUE.value]
+
     human_minutes = [
         r["active_human_minutes_to_confident_accept"]
         for r in accepted
@@ -447,8 +628,10 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
     known_costs = [
         r["total_cost_usd"]["value"]
         for r in accepted
-        if isinstance(r.get("total_cost_usd"), dict) and r["total_cost_usd"].get("status") == ObservabilityState.KNOWN.value
+        if isinstance(r.get("total_cost_usd"), dict)
+        and r["total_cost_usd"].get("status") == ObservabilityState.KNOWN.value
     ]
+    elapsed_values = [r["elapsed_seconds"] for r in records if isinstance(r.get("elapsed_seconds"), (int, float))]
 
     return {
         "total_evaluations": total,
@@ -462,11 +645,17 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
         "total_owner_interruptions": sum(r.get("owner_interruptions") or 0 for r in records),
         "total_clarification_count": sum(r.get("clarification_count") or 0 for r in records),
         "total_manual_edit_lines": sum(r.get("manual_edit_lines") or 0 for r in records),
-        "scope_violation_rate": len(scope_violations) / total,
+        "scope_violation_known_count": len(known_scope_records),
+        "scope_violation_rate": (
+            (len(scope_violations_true) / len(known_scope_records)) if known_scope_records else None
+        ),
         "evidence_completeness_rate": len(evidence_complete) / total,
         "cost_known_accepted_task_count": len(known_costs),
         "average_cost_usd_per_accepted_task_when_known": (sum(known_costs) / len(known_costs)) if known_costs else None,
-        "escaped_defect_reported_count": len(escaped_defects),
+        "escaped_defect_known_count": len(escaped_defect_known),
+        "escaped_defect_true_count": len(escaped_defect_true),
+        "mean_elapsed_seconds": (sum(elapsed_values) / len(elapsed_values)) if elapsed_values else None,
+        "total_elapsed_seconds": sum(elapsed_values) if elapsed_values else None,
     }
 
 
@@ -480,30 +669,6 @@ def _load_all_records(evaluations_dir: Path) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 # CLI.
 # ---------------------------------------------------------------------------
-
-
-def _detect_runtime_commit() -> str | None:
-    """Best-effort: the Coordinator repository commit this evaluator tool
-    itself is running from. This is metadata about the TOOL, not something
-    read from the run's own Runtime evidence (which does not record it) --
-    documented explicitly in DOGFOOD_EVALUATION_TELEMETRY_V0.md. Overridable
-    via --runtime-commit; never guessed if git is unavailable."""
-
-    try:
-        completed = subprocess.run(
-            ["git", "rev-parse", "HEAD"],
-            cwd=str(REPO_ROOT),
-            capture_output=True,
-            text=True,
-            timeout=10,
-            check=False,
-        )
-    except OSError:
-        return None
-    if completed.returncode != 0:
-        return None
-    value = completed.stdout.strip()
-    return value or None
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -522,7 +687,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=BoolTriState.UNKNOWN.value,
     )
     parser.add_argument("--owner-note", default=None)
-    parser.add_argument("--runtime-commit", default=None)
+    parser.add_argument("--task-contract-sha256", default=None, metavar="HEX64")
+    parser.add_argument("--runtime-commit", default=None, metavar="GIT_SHA")
     parser.add_argument("--summarize", metavar="EVALUATIONS_DIR", default=None)
     return parser.parse_args(argv)
 
@@ -565,6 +731,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"MESSAGE={name} must be >= 0, got {value}")
             return 2
 
+    try:
+        task_contract_sha256 = validate_task_contract_sha256(args.task_contract_sha256)
+        runtime_commit = validate_runtime_commit(args.runtime_commit)
+    except EvaluationError as exc:
+        print(f"STATUS=CONFIG_FAILURE:{exc.category}")
+        print(f"MESSAGE={exc.message}")
+        return 2
+
     evidence_root = Path(args.evidence_root).expanduser()
     if not evidence_root.is_absolute():
         evidence_root = (Path.cwd() / evidence_root).resolve(strict=False)
@@ -580,11 +754,15 @@ def main(argv: list[str] | None = None) -> int:
         owner_note=args.owner_note,
         escaped_defect_reported=args.escaped_defect_reported,
     )
-    runtime_commit = args.runtime_commit or _detect_runtime_commit()
 
     try:
-        record = build_evaluation_record(evidence_root=evidence_root, owner=owner, runtime_commit=runtime_commit)
-        record_path, jsonl_path = write_evaluation_record(evidence_root, record)
+        record = build_evaluation_record(
+            evidence_root=evidence_root,
+            owner=owner,
+            task_contract_sha256=task_contract_sha256,
+            runtime_commit=runtime_commit,
+        )
+        record_path = write_evaluation_record(evidence_root, record)
     except EvaluationError as exc:
         print(f"STATUS=EVALUATION_FAILURE:{exc.category}")
         print(f"MESSAGE={exc.message}")
@@ -596,7 +774,6 @@ def main(argv: list[str] | None = None) -> int:
     print(f"ACCEPTED={str(record['accepted']).lower()}")
     print(f"EVIDENCE_COMPLETE={str(record['evidence_complete']).lower()}")
     print(f"RECORD_PATH={record_path}")
-    print(f"JSONL_PATH={jsonl_path}")
     return 0
 
 
