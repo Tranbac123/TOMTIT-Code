@@ -595,6 +595,31 @@ def _median(values: list[float]) -> float | None:
     return (ordered[mid - 1] + ordered[mid]) / 2.0
 
 
+def _valid_known_count(value: Any) -> bool:
+    """A valid known count-like Runtime observation for summary
+    aggregation (`implementation_attempt_count`/`repair_count`/
+    `review_count`): an `int`, not a `bool`, and `>= 0`. Never coerced
+    (a string is never parsed), never inferred. Kept independent of the
+    per-field token-count validator used at extraction time -- this is a
+    summary-level concern with its own name."""
+
+    if isinstance(value, bool) or not isinstance(value, int):
+        return False
+    return value >= 0
+
+
+def _valid_known_elapsed_seconds(value: Any) -> bool:
+    """A valid known `elapsed_seconds` observation for summary
+    aggregation: `int` or `float`, not `bool`, finite, `>= 0`. Kept
+    independent of the per-field cost validator used at extraction time."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return False
+    if not math.isfinite(value):
+        return False
+    return value >= 0
+
+
 def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
     total = len(records)
     if total == 0:
@@ -602,9 +627,19 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
 
     accepted = [r for r in records if r.get("accepted")]
     accepted_no_edit = [r for r in records if r.get("accepted_without_manual_edit")]
-    first_pass = [r for r in records if r.get("repair_count") == 0]
-    repaired = [r for r in records if (r.get("repair_count") or 0) > 0]
     evidence_complete = [r for r in records if r.get("evidence_complete")]
+
+    # An unknown repair_count is neither "first pass" nor "repaired" -- it
+    # is excluded from both numerators AND the denominator, never silently
+    # folded into "not repaired" via `or 0`.
+    known_repair_records = [r for r in records if _valid_known_count(r.get("repair_count"))]
+    first_pass_records = [r for r in known_repair_records if r.get("repair_count") == 0]
+    repaired_records = [r for r in known_repair_records if r.get("repair_count") > 0]
+
+    known_attempt_counts = [
+        r["implementation_attempt_count"] for r in records if _valid_known_count(r.get("implementation_attempt_count"))
+    ]
+    known_review_counts = [r["review_count"] for r in records if _valid_known_count(r.get("review_count"))]
 
     # (Section 5) UNKNOWN is excluded from the denominator entirely -- never
     # treated as FALSE/0.
@@ -631,16 +666,27 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
         if isinstance(r.get("total_cost_usd"), dict)
         and r["total_cost_usd"].get("status") == ObservabilityState.KNOWN.value
     ]
-    elapsed_values = [r["elapsed_seconds"] for r in records if isinstance(r.get("elapsed_seconds"), (int, float))]
+    known_elapsed_seconds = [
+        r["elapsed_seconds"] for r in records if _valid_known_elapsed_seconds(r.get("elapsed_seconds"))
+    ]
 
     return {
         "total_evaluations": total,
         "owner_acceptance_rate": len(accepted) / total,
         "accepted_without_manual_edit_rate": len(accepted_no_edit) / total,
-        "first_pass_success_rate": len(first_pass) / total,
-        "repair_rate": len(repaired) / total,
-        "average_implementation_attempts": sum(r.get("implementation_attempt_count") or 0 for r in records) / total,
-        "average_review_count": sum(r.get("review_count") or 0 for r in records) / total,
+        "repair_count_known_count": len(known_repair_records),
+        "first_pass_success_rate": (
+            (len(first_pass_records) / len(known_repair_records)) if known_repair_records else None
+        ),
+        "repair_rate": (len(repaired_records) / len(known_repair_records)) if known_repair_records else None,
+        "implementation_attempt_count_known_count": len(known_attempt_counts),
+        "average_implementation_attempts": (
+            (sum(known_attempt_counts) / len(known_attempt_counts)) if known_attempt_counts else None
+        ),
+        "review_count_known_count": len(known_review_counts),
+        "average_review_count": (
+            (sum(known_review_counts) / len(known_review_counts)) if known_review_counts else None
+        ),
         "median_active_human_minutes_to_confident_accept": _median(human_minutes),
         "total_owner_interruptions": sum(r.get("owner_interruptions") or 0 for r in records),
         "total_clarification_count": sum(r.get("clarification_count") or 0 for r in records),
@@ -654,8 +700,11 @@ def summarize_evaluations(records: list[dict[str, Any]]) -> dict[str, Any]:
         "average_cost_usd_per_accepted_task_when_known": (sum(known_costs) / len(known_costs)) if known_costs else None,
         "escaped_defect_known_count": len(escaped_defect_known),
         "escaped_defect_true_count": len(escaped_defect_true),
-        "mean_elapsed_seconds": (sum(elapsed_values) / len(elapsed_values)) if elapsed_values else None,
-        "total_elapsed_seconds": sum(elapsed_values) if elapsed_values else None,
+        "elapsed_seconds_known_count": len(known_elapsed_seconds),
+        "mean_elapsed_seconds": (
+            (sum(known_elapsed_seconds) / len(known_elapsed_seconds)) if known_elapsed_seconds else None
+        ),
+        "total_elapsed_seconds": sum(known_elapsed_seconds) if known_elapsed_seconds else None,
     }
 
 

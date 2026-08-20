@@ -1069,6 +1069,159 @@ def test_summary_elapsed_time_aggregation() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Unknown-count regressions (summary-semantics fix; Section 10, cases A-H).
+# implementation_attempt_count/repair_count/review_count must never be
+# zero-filled or counted against an all-records denominator.
+# ---------------------------------------------------------------------------
+
+
+def test_summary_average_attempts_null_when_all_unknown() -> None:
+    """(A) A single unknown attempt observation -> average is null, not 0."""
+
+    records = [_minimal_summary_record(implementation_attempt_count=None)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["implementation_attempt_count_known_count"] == 0
+    assert summary["average_implementation_attempts"] is None
+
+
+def test_summary_average_attempts_excludes_unknown_from_denominator() -> None:
+    """(B) [2, None, 4] -> average 3.0 (over the 2 known values), not 2.0
+    (over all 3 records)."""
+
+    records = [
+        _minimal_summary_record(implementation_attempt_count=2),
+        _minimal_summary_record(implementation_attempt_count=None),
+        _minimal_summary_record(implementation_attempt_count=4),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["implementation_attempt_count_known_count"] == 2
+    assert summary["average_implementation_attempts"] == 3.0
+
+
+def test_summary_average_reviews_null_when_all_unknown() -> None:
+    """(C) A single unknown review observation -> average is null."""
+
+    records = [_minimal_summary_record(review_count=None)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["review_count_known_count"] == 0
+    assert summary["average_review_count"] is None
+
+
+def test_summary_average_reviews_excludes_unknown_from_denominator() -> None:
+    """(D) [1, None, 3] -> average 2.0."""
+
+    records = [
+        _minimal_summary_record(review_count=1),
+        _minimal_summary_record(review_count=None),
+        _minimal_summary_record(review_count=3),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["review_count_known_count"] == 2
+    assert summary["average_review_count"] == 2.0
+
+
+def test_summary_repair_rates_null_when_all_unknown() -> None:
+    """(E) Unknown repair_count only -> both rates null, never 0/1."""
+
+    records = [_minimal_summary_record(repair_count=None)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["repair_count_known_count"] == 0
+    assert summary["first_pass_success_rate"] is None
+    assert summary["repair_rate"] is None
+
+
+def test_summary_repair_rates_exclude_unknown_from_denominator() -> None:
+    """(F) repair_count values [0, 1, None] -> known denominator 2, both
+    rates 0.5 (not divided by 3)."""
+
+    records = [
+        _minimal_summary_record(repair_count=0),
+        _minimal_summary_record(repair_count=1),
+        _minimal_summary_record(repair_count=None),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["repair_count_known_count"] == 2
+    assert summary["first_pass_success_rate"] == 0.5
+    assert summary["repair_rate"] == 0.5
+
+
+def test_summary_negative_repair_count_treated_as_unknown() -> None:
+    """(G) repair_count=-1 is invalid -> unknown, not first-pass, not
+    repaired."""
+
+    records = [_minimal_summary_record(repair_count=-1)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["repair_count_known_count"] == 0
+    assert summary["first_pass_success_rate"] is None
+    assert summary["repair_rate"] is None
+
+
+def test_summary_bool_repair_count_treated_as_unknown() -> None:
+    """(H) repair_count=True is invalid -> unknown."""
+
+    records = [_minimal_summary_record(repair_count=True)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["repair_count_known_count"] == 0
+    assert summary["first_pass_success_rate"] is None
+    assert summary["repair_rate"] is None
+
+
+# ---------------------------------------------------------------------------
+# Elapsed-value validity regressions (summary-semantics fix; Section 11).
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "value",
+    [True, False, float("nan"), float("inf"), float("-inf"), -1, -0.5, "5"],
+    ids=["bool_true", "bool_false", "nan", "pos_inf", "neg_inf", "neg_int", "neg_float", "string"],
+)
+def test_summary_elapsed_invalid_values_excluded(value: Any) -> None:
+    records = [_minimal_summary_record(elapsed_seconds=value)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["elapsed_seconds_known_count"] == 0
+    assert summary["mean_elapsed_seconds"] is None
+    assert summary["total_elapsed_seconds"] is None
+
+
+def test_summary_elapsed_all_invalid_yields_null() -> None:
+    records = [
+        _minimal_summary_record(elapsed_seconds=True),
+        _minimal_summary_record(elapsed_seconds=float("nan")),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["elapsed_seconds_known_count"] == 0
+    assert summary["mean_elapsed_seconds"] is None
+    assert summary["total_elapsed_seconds"] is None
+
+
+def test_summary_elapsed_mixed_valid_and_invalid() -> None:
+    """10, None, NaN, 20 -> mean 15, total 30 (over the 2 valid values)."""
+
+    records = [
+        _minimal_summary_record(elapsed_seconds=10),
+        _minimal_summary_record(elapsed_seconds=None),
+        _minimal_summary_record(elapsed_seconds=float("nan")),
+        _minimal_summary_record(elapsed_seconds=20),
+    ]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["elapsed_seconds_known_count"] == 2
+    assert summary["mean_elapsed_seconds"] == 15
+    assert summary["total_elapsed_seconds"] == 30
+
+
+def test_summary_elapsed_zero_is_a_known_observation() -> None:
+    """A valid elapsed_seconds=0 must remain a real known observation, not
+    missing/excluded."""
+
+    records = [_minimal_summary_record(elapsed_seconds=0)]
+    summary = evaluate_dogfood_run.summarize_evaluations(records)
+    assert summary["elapsed_seconds_known_count"] == 1
+    assert summary["mean_elapsed_seconds"] == 0
+    assert summary["total_elapsed_seconds"] == 0
+
+
+# ---------------------------------------------------------------------------
 # Token / cost KNOWN-value validation (Blocker 6; tests 25-33).
 # ---------------------------------------------------------------------------
 

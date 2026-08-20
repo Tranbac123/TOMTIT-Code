@@ -290,10 +290,10 @@ implementation attempts, average review count, scope violation rate,
 evidence completeness rate, mean/total elapsed time, cost per accepted
 task when `KNOWN`, and escaped defect counts when reported.
 
-**Known-value denominators, never zero-filled (tri-state metrics):**
-`UNKNOWN`/`UNAVAILABLE`/`null` observations are never treated as numeric
-zero, and never silently included in a denominator as if they were the
-negative case.
+**Known-value denominators, never zero-filled (tri-state metrics and
+count-like Runtime observations):** `UNKNOWN`/`UNAVAILABLE`/`null`/invalid
+observations are never treated as numeric zero, and never silently
+included in a denominator as if they were the negative case.
 
 - `scope_violation_known_count` = number of records with
   `scope_violation` in `{TRUE, FALSE}`. `scope_violation_rate` =
@@ -307,12 +307,30 @@ negative case.
   `average_cost_usd_per_accepted_task_when_known` = only accepted records
   whose `total_cost_usd.status == "KNOWN"` contribute; `null` when that
   count is `0` -- `UNKNOWN`/`UNAVAILABLE` costs are never treated as `$0`.
+- **Count-like aggregates** (`implementation_attempt_count`,
+  `repair_count`, `review_count`): a valid known observation is an `int`,
+  not `bool`, `>= 0` -- never coerced from a string, never inferred.
+  `repair_count_known_count` / `implementation_attempt_count_known_count` /
+  `review_count_known_count` expose each denominator explicitly.
+  `first_pass_success_rate` = (records with known `repair_count == 0`) /
+  `repair_count_known_count`; `repair_rate` = (records with known
+  `repair_count > 0`) / `repair_count_known_count`; both `null` when that
+  denominator is `0`. `average_implementation_attempts` /
+  `average_review_count` divide the sum of only the known observations by
+  their own known count, not by `total_evaluations`; both `null` when no
+  known observation exists. An unknown/invalid `repair_count` (e.g.
+  `null`, negative, or a `bool`) is excluded from the denominator
+  entirely -- it is neither "first pass" nor "repaired."
 
-**Elapsed time aggregation:** `mean_elapsed_seconds` and
-`total_elapsed_seconds` are computed over records with a valid numeric
-`elapsed_seconds` only (`None` filtered out); both are `null` when no
-record has a numeric value. `median_active_human_minutes_to_confident_accept`
-is unchanged.
+**Elapsed time aggregation:** a valid known `elapsed_seconds` observation
+is an `int` or `float`, not `bool`, finite (`math.isfinite`), and `>= 0` --
+`NaN`, `+inf`/`-inf`, negative values, and booleans are all excluded, never
+coerced from a string. `elapsed_seconds_known_count` exposes that
+denominator. `mean_elapsed_seconds` and `total_elapsed_seconds` are
+computed over only the known values; both are `null` when
+`elapsed_seconds_known_count` is `0`. A valid `elapsed_seconds == 0` is a
+real known observation, not excluded.
+`median_active_human_minutes_to_confident_accept` is unchanged.
 
 `summarize_evaluations()` computes exactly this list as plain arithmetic
 over an in-memory list of records (no dashboard, no visualization, no
