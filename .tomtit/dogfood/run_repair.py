@@ -1220,7 +1220,9 @@ def run_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
     for command in args.check_command:
         try:
-            run_review.validate_check_command_text(command)
+            # Same effective-PATH/workspace-cwd contract as run_loop.py's
+            # preflight and run_review.run_check_command()'s execution.
+            run_review.validate_check_command_text(command, workspace=workspace)
         except run_review.PreflightFailure as exc:
             raise PreflightFailure(exc.category, exc.message) from None
 

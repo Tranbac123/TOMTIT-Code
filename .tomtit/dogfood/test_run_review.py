@@ -11,10 +11,12 @@ Run with:
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -5156,6 +5158,697 @@ def test_canonical_index_identity_real_split_index_and_sparse_checkout(tmp_path:
     assert any(
         key.startswith("entry:") and "skip_worktree=1" in value for key, value in projection.items()
     )
+
+
+# ---------------------------------------------------------------------------
+# B1-01 corrective fix -- deterministic check-command execution context.
+#
+# Root cause (proven from source, not hypothesized): check commands are
+# executed via direct argv (subprocess.Popen, never shell=True). A leading
+# POSIX-style environment assignment such as
+# `TMPDIR=x PYTHONPYCACHEPREFIX=y ./venv/bin/python3 ...` was naively
+# shlex.split() into a flat argv and handed straight to Popen(); the first
+# assignment token ("TMPDIR=x") was then used as argv[0] -- Popen has no
+# shell to interpret it as an environment assignment, so it just tried (and
+# failed) to execute a program literally named "TMPDIR=x", raising
+# FileNotFoundError (errno=2) in a few milliseconds, before any real process
+# existed. This exactly reproduces the B1-01 R3 signature: exit_code=null,
+# stderr="FileNotFoundError errno=2", ~5-18ms duration, while the two
+# `git diff` checks in the same batch (no leading assignment) executed
+# normally. The check-runner's `cwd` was already the correct candidate
+# workspace the whole time (see run_deterministic_checks() passing
+# `workspace` straight through) -- the forensic report's cwd hypothesis is
+# not what actually reproduces here.
+# ---------------------------------------------------------------------------
+
+
+def write_local_checker(
+    ws: Path,
+    *,
+    relative_path: str = "local-bin/checker",
+    exit_code: int = 0,
+    env_vars_to_report: tuple[str, ...] = (),
+) -> Path:
+    """A tiny workspace-local executable (no shell dependency) that reports
+    the requested environment variables and exits with a fixed code -- used
+    to prove workspace-relative resolution, env-assignment visibility, and
+    exit-code/executable-not-found classification for deterministic checks.
+    """
+
+    path = ws / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    body = ["#!/usr/bin/env python3", "import os"]
+    for name in env_vars_to_report:
+        body.append(f"print({name!r} + '=' + os.environ.get({name!r}, '<unset>'))")
+    body.append(f"raise SystemExit({exit_code!r})")
+    path.write_text("\n".join(body) + "\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+def test_case_a_workspace_local_executable_resolves(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code == 0
+    assert result.error_category is None
+    assert result.timed_out is False
+
+
+def test_case_b_leading_environment_assignment_is_applied(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, env_vars_to_report=("TMPDIR", "SOME_FLAG"))
+    result = run_review.run_check_command(
+        "TMPDIR=.tmp SOME_FLAG=value ./local-bin/checker", ws, 5
+    )
+    assert result.exit_code == 0
+    assert result.error_category is None
+    assert "TMPDIR=.tmp" in result.stdout_excerpt
+    assert "SOME_FLAG=value" in result.stdout_excerpt
+
+
+def test_case_c_multiple_leading_environment_assignments(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, env_vars_to_report=("TMPDIR", "PYTHONPYCACHEPREFIX", "SOME_FLAG"))
+    result = run_review.run_check_command(
+        "TMPDIR=.tmp PYTHONPYCACHEPREFIX=.pycache SOME_FLAG=value ./local-bin/checker", ws, 5
+    )
+    assert result.exit_code == 0
+    assert result.error_category is None
+    assert "TMPDIR=.tmp" in result.stdout_excerpt
+    assert "PYTHONPYCACHEPREFIX=.pycache" in result.stdout_excerpt
+    assert "SOME_FLAG=value" in result.stdout_excerpt
+
+
+def test_case_d_missing_executable_is_classified(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    result = run_review.run_check_command("./local-bin/does-not-exist", ws, 5)
+    assert result.exit_code is None
+    assert result.timed_out is False
+    assert result.error_category == "EXECUTABLE_NOT_FOUND"
+
+
+def test_case_d_missing_executable_with_env_prefix_is_still_classified_correctly(tmp_path: Path) -> None:
+    """The exact B1-01 shape but pointed at a genuinely-missing interpreter:
+    must classify as EXECUTABLE_NOT_FOUND, never silently misparse the env
+    assignment itself as the missing program."""
+
+    ws = make_workspace(tmp_path)
+    result = run_review.run_check_command(
+        "TMPDIR=.tmp PYTHONPYCACHEPREFIX=.pycache ./.no-such-env/bin/python3.11 -c \"1\"", ws, 5
+    )
+    assert result.exit_code is None
+    assert result.error_category == "EXECUTABLE_NOT_FOUND"
+
+
+def test_case_e_nonzero_exit_is_preserved_and_not_confused_with_missing_executable(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, exit_code=7)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code == 7
+    assert result.error_category is None
+
+
+def test_case_f_git_diff_check_style_command_still_works(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    result = run_review.run_check_command("git diff --check", ws, 5)
+    assert result.exit_code == 0
+    assert result.error_category is None
+
+
+def test_case_g_quoted_argument_is_preserved_as_one_token(tmp_path: Path) -> None:
+    """Existing shlex-based grammar already supports quoted arguments; this
+    is not broadened here, only proven for the workspace-relative-executable
+    shape this fix concerns."""
+
+    ws = make_workspace(tmp_path)
+    checker = ws / "local-bin" / "checker"
+    checker.parent.mkdir(parents=True, exist_ok=True)
+    checker.write_text(
+        "#!/usr/bin/env python3\nimport sys\nprint(f'ARGC={len(sys.argv) - 1}')\nprint(f'ARG1={sys.argv[1]!r}')\n",
+        encoding="utf-8",
+    )
+    checker.chmod(0o755)
+    result = run_review.run_check_command('./local-bin/checker "hello world"', ws, 5)
+    assert result.exit_code == 0
+    assert "ARGC=1" in result.stdout_excerpt
+    assert "ARG1='hello world'" in result.stdout_excerpt
+
+
+def test_case_h_check_runner_does_not_mutate_protected_git_state(tmp_path: Path) -> None:
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, env_vars_to_report=("TMPDIR",))
+    before_head = run_review.git_rev_parse(ws, "HEAD")
+    before_status = run_review.git_status_porcelain(ws)
+
+    result = run_review.run_check_command("TMPDIR=.tmp ./local-bin/checker", ws, 5)
+
+    assert result.exit_code == 0
+    after_head = run_review.git_rev_parse(ws, "HEAD")
+    after_status = run_review.git_status_porcelain(ws)
+    assert after_head == before_head
+    # The checker script itself is a new untracked file created by the test
+    # fixture before the call (an authorized local-bin addition, not a side
+    # effect of run_check_command); status must otherwise be unchanged by
+    # actually running it.
+    assert after_status == before_status
+
+
+def test_env_assignment_only_command_rejected_at_preflight(tmp_path: Path) -> None:
+    """AC-P0-03(B)-equivalent fail-closed edge: a command that is only
+    environment assignments with no executable is rejected before any
+    process is ever spawned, not silently treated as a no-op or misparsed."""
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text("TMPDIR=.tmp PYTHONPYCACHEPREFIX=.pycache")
+    assert excinfo.value.category == "INVALID_CHECK_COMMAND"
+
+
+def test_bare_missing_executable_rejected_at_preflight_before_model_invocation(tmp_path: Path) -> None:
+    """A bare, PATH-searched command name that cannot resolve is proven
+    invalid without executing the product test, and is rejected before an
+    implementation attempt would be spent (preflight executability)."""
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text("this-command-almost-certainly-does-not-exist-12345")
+    assert excinfo.value.category == "CHECK_COMMAND_EXECUTABLE_NOT_FOUND"
+
+
+def test_workspace_relative_executable_not_checked_at_preflight_before_side_effect_created(
+    tmp_path: Path,
+) -> None:
+    """A workspace-relative interpreter path (e.g. a venv Attempt 1 has not
+    created yet) must NOT be rejected at preflight parse time merely because
+    it does not exist yet -- only a bare PATH-searched name is statically
+    resolvable independent of workspace/attempt state."""
+
+    argv = run_review.validate_check_command_text(
+        "TMPDIR=.tomtit-b1-01-tmp PYTHONPYCACHEPREFIX=.tomtit-b1-01-pycache "
+        "./.tomtit-b1-01-env/bin/python3.11 -m pytest -q"
+    )
+    assert argv[-1] == "-q"
+
+
+def test_split_check_command_env_prefix_splits_leading_assignments() -> None:
+    env, exec_argv = run_review.split_check_command_env_prefix(
+        ["TMPDIR=.tmp", "PYTHONPYCACHEPREFIX=.pycache", "./venv/bin/python3", "-m", "pytest"]
+    )
+    assert env == {"TMPDIR": ".tmp", "PYTHONPYCACHEPREFIX": ".pycache"}
+    assert exec_argv == ["./venv/bin/python3", "-m", "pytest"]
+
+
+def test_split_check_command_env_prefix_no_assignments_is_a_no_op() -> None:
+    env, exec_argv = run_review.split_check_command_env_prefix(["git", "diff", "--check"])
+    assert env == {}
+    assert exec_argv == ["git", "diff", "--check"]
+
+
+def test_b1_01_shape_regression_env_prefixed_workspace_local_interpreter(tmp_path: Path) -> None:
+    """Disposable fixture mimicking the exact R3 command shape (task-
+    contract.json `check_commands[0..2]`):
+
+        TMPDIR=.tomtit-b1-01-tmp PYTHONPYCACHEPREFIX=.tomtit-b1-01-pycache \\
+        ./.tomtit-b1-01-env/bin/python3.11 -c "<small deterministic statement>"
+
+    Does not require TOMTIT-Memory's real venv or its 151-test suite --
+    proves exactly what the defect broke: workspace-local executable
+    resolution, leading-env-assignment handling, and real exit-code
+    reporting for this exact shape.
+    """
+
+    ws = make_workspace(tmp_path)
+    interpreter_rel = ".tomtit-b1-01-env/bin/python3.11"
+    interpreter = ws / interpreter_rel
+    interpreter.parent.mkdir(parents=True, exist_ok=True)
+    # Mimics `python3.11 -c "<statement>"`: writes proof that TMPDIR/
+    # PYTHONPYCACHEPREFIX reached the process and that a writable relative
+    # scratch path under TMPDIR is reachable, then exits 0 -- standing in for
+    # a real interpreter without needing one.
+    interpreter.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, pathlib, sys\n"
+        "assert sys.argv[1] == '-c'\n"
+        "tmpdir = os.environ.get('TMPDIR')\n"
+        "pycache = os.environ.get('PYTHONPYCACHEPREFIX')\n"
+        "assert tmpdir == '.tomtit-b1-01-tmp'\n"
+        "assert pycache == '.tomtit-b1-01-pycache'\n"
+        "scratch = pathlib.Path(tmpdir) / 'reached.txt'\n"
+        "scratch.parent.mkdir(parents=True, exist_ok=True)\n"
+        "scratch.write_text('ok')\n"
+        "print('B1_01_SHAPE_OK')\n",
+        encoding="utf-8",
+    )
+    interpreter.chmod(0o755)
+
+    command = (
+        "TMPDIR=.tomtit-b1-01-tmp PYTHONPYCACHEPREFIX=.tomtit-b1-01-pycache "
+        f"./{interpreter_rel} -c \"1\""
+    )
+
+    # The OLD behavior: naive tokenization treats the first assignment as
+    # argv[0]. This is the literal mechanism that produced the B1-01 R3
+    # evidence (exit_code=null, "FileNotFoundError errno=2", ~5-18ms) --
+    # asserted directly here without needing to check out the pre-fix
+    # source, since it is a pure fact about the raw tokenization this fix
+    # changes how the runner *uses*.
+    import shlex as _shlex
+
+    naive_argv = _shlex.split(command)
+    assert naive_argv[0] == "TMPDIR=.tomtit-b1-01-tmp"
+    assert not naive_argv[0].startswith(".") and "/" not in naive_argv[0].split("=")[0]
+
+    # The NEW (fixed) behavior: the same command string now resolves,
+    # applies both leading assignments to the child environment, reaches a
+    # writable relative scratch path under TMPDIR, and reports the real
+    # exit code.
+    result = run_review.run_check_command(command, ws, 10)
+    assert result.error_category is None
+    assert result.exit_code == 0
+    assert "B1_01_SHAPE_OK" in result.stdout_excerpt
+    assert (ws / ".tomtit-b1-01-tmp" / "reached.txt").read_text(encoding="utf-8") == "ok"
+
+
+# ---------------------------------------------------------------------------
+# Codex re-review corrections (F-01 / F-02 / F-03).
+#
+# F-01: bare-executable preflight resolved against the *parent* Runtime PATH
+#       via shutil.which(), while execution used the effective child PATH
+#       (base env + leading NAME=value assignments). That both false-rejected
+#       `PATH=/usr/bin env` and false-accepted `PATH=/definitely/not-real git`.
+#       Preflight now builds the identical child environment execution will
+#       use and resolves against effective_env["PATH"], anchoring relative
+#       PATH entries at the candidate workspace (the child's real cwd).
+# F-02: any OSError escaping execute_bounded() was classified as a spawn
+#       failure, but execute_bounded() can also raise OSError *after* Popen()
+#       succeeded (communicate()/I/O/cleanup). The process-start phase is now
+#       taken from execute_bounded()'s own observer, and a post-start failure
+#       gets the distinct fail-closed PROCESS_IO_ERROR category.
+# F-03: the environment-assignment grammar and error-category matrix are now
+#       covered end to end.
+# ---------------------------------------------------------------------------
+
+
+def write_shell_checker(ws: Path, relative_path: str, marker: str) -> Path:
+    """A PATH-independent workspace-local executable.
+
+    Uses an absolute `/bin/sh` shebang and only the `echo` builtin, so it
+    still runs when the check command replaces PATH entirely (a
+    `#!/usr/bin/env python3` shebang would itself need PATH to find python3).
+    """
+
+    path = ws / relative_path
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\necho {marker}\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+    return path
+
+
+# --- F-01: effective-PATH preflight ----------------------------------------
+
+
+def test_path_1_assigned_path_enables_executable_unavailable_on_parent_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """PATH-1. The parent Runtime PATH cannot resolve `env`; the command's own
+    `PATH=/usr/bin` assignment can. Preflight must accept it (the old
+    shutil.which() against the parent PATH false-rejected it), and execution
+    must then actually succeed with the same effective PATH."""
+
+    ws = make_workspace(tmp_path)
+    monkeypatch.setenv("PATH", "/definitely/not-real")
+
+    # Preflight: accepted, and resolved to the assigned-PATH location.
+    argv = run_review.validate_check_command_text("PATH=/usr/bin env", workspace=ws)
+    assert argv == ["PATH=/usr/bin", "env"]
+    env_assignments, exec_argv = run_review.split_check_command_env_prefix(argv)
+    child_env = run_review.build_check_command_child_env(env_assignments)
+    assert child_env["PATH"] == "/usr/bin"
+    assert run_review.resolve_bare_check_executable(
+        exec_argv[0], child_env=child_env, workspace=ws
+    ) == "/usr/bin/env"
+
+    # Execution agrees with preflight.
+    result = run_review.run_check_command("PATH=/usr/bin env", ws, 10)
+    assert result.exit_code == 0
+    assert result.error_category is None
+
+
+def test_path_2_assigned_path_disables_parent_resolvable_executable(tmp_path: Path) -> None:
+    """PATH-2. The parent Runtime PATH resolves `git`, but the command's own
+    `PATH=/definitely/not-real` cannot. Preflight must fail closed rather than
+    spend a model invocation on a command that will ENOENT at execution."""
+
+    ws = make_workspace(tmp_path)
+    # Control: the parent PATH really can resolve `git` right now.
+    assert shutil.which("git") is not None
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text(
+            "PATH=/definitely/not-real git --version", workspace=ws
+        )
+    assert excinfo.value.category == "CHECK_COMMAND_EXECUTABLE_NOT_FOUND"
+
+
+def test_path_3_relative_path_component_resolves_against_candidate_workspace(
+    tmp_path: Path,
+) -> None:
+    """PATH-3. `PATH=tools checker` must search `<workspace>/tools/checker`,
+    because the child process's cwd is the candidate workspace -- never
+    `<coordinator-repo>/tools/checker`. Preflight resolution and actual
+    execution must agree."""
+
+    ws = make_workspace(tmp_path)
+    write_shell_checker(ws, "tools/checker", "PATH3_OK")
+
+    argv = run_review.validate_check_command_text("PATH=tools checker", workspace=ws)
+    env_assignments, exec_argv = run_review.split_check_command_env_prefix(argv)
+    child_env = run_review.build_check_command_child_env(env_assignments)
+    resolved = run_review.resolve_bare_check_executable(
+        exec_argv[0], child_env=child_env, workspace=ws
+    )
+    assert resolved == str(ws / "tools" / "checker")
+
+    result = run_review.run_check_command("PATH=tools checker", ws, 10)
+    assert result.exit_code == 0
+    assert result.error_category is None
+    assert "PATH3_OK" in result.stdout_excerpt
+
+
+def test_path_3b_relative_path_component_is_not_resolved_without_a_workspace(
+    tmp_path: Path,
+) -> None:
+    """PATH-3 negative control. Without a candidate workspace there is no
+    correct directory to anchor a relative PATH entry to, so it is skipped
+    (fail-closed) instead of being resolved against the Coordinator's own
+    current working directory."""
+
+    ws = make_workspace(tmp_path)
+    write_shell_checker(ws, "tools/checker", "PATH3_OK")
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text("PATH=tools checker", workspace=None)
+    assert excinfo.value.category == "CHECK_COMMAND_EXECUTABLE_NOT_FOUND"
+
+
+def test_path_4_last_path_assignment_wins(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """PATH-4. PATH obeys the same last-assignment-wins rule as any other
+    environment variable, in preflight and at execution alike."""
+
+    ws = make_workspace(tmp_path)
+    monkeypatch.setenv("PATH", "/definitely/not-real")
+
+    argv = run_review.validate_check_command_text("PATH=/bad PATH=/usr/bin env", workspace=ws)
+    env_assignments, exec_argv = run_review.split_check_command_env_prefix(argv)
+    assert env_assignments == {"PATH": "/usr/bin"}
+    child_env = run_review.build_check_command_child_env(env_assignments)
+    assert run_review.resolve_bare_check_executable(
+        exec_argv[0], child_env=child_env, workspace=ws
+    ) == "/usr/bin/env"
+
+    result = run_review.run_check_command("PATH=/bad PATH=/usr/bin env", ws, 10)
+    assert result.exit_code == 0
+    assert result.error_category is None
+
+    # And the reverse order really does fail closed, proving the ordering is
+    # load-bearing rather than incidentally satisfied by the parent PATH.
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text("PATH=/usr/bin PATH=/bad env", workspace=ws)
+    assert excinfo.value.category == "CHECK_COMMAND_EXECUTABLE_NOT_FOUND"
+
+
+def test_path_5_ordinary_command_without_path_assignment_is_unchanged(tmp_path: Path) -> None:
+    """PATH-5. A command with no PATH assignment keeps resolving against the
+    inherited Runtime PATH exactly as before."""
+
+    ws = make_workspace(tmp_path)
+    argv = run_review.validate_check_command_text("git diff --check", workspace=ws)
+    assert argv == ["git", "diff", "--check"]
+    result = run_review.run_check_command("git diff --check", ws, 10)
+    assert result.exit_code == 0
+    assert result.error_category is None
+
+
+def test_empty_path_assignment_means_the_candidate_workspace(tmp_path: Path) -> None:
+    """POSIX: an empty PATH entry designates the current directory, which for
+    a check command is the candidate workspace."""
+
+    ws = make_workspace(tmp_path)
+    write_shell_checker(ws, "checker", "EMPTY_PATH_OK")
+    result = run_review.run_check_command("PATH= checker", ws, 10)
+    assert result.exit_code == 0
+    assert result.error_category is None
+    assert "EMPTY_PATH_OK" in result.stdout_excerpt
+
+
+def test_bare_executable_preflight_does_not_execute_the_candidate(tmp_path: Path) -> None:
+    """Preflight is resolution/existence/executable-bit inspection only -- it
+    must never run the product's own check command."""
+
+    ws = make_workspace(tmp_path)
+    marker = ws / "tools" / "executed.txt"
+    path = ws / "tools" / "checker"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(f"#!/bin/sh\n: > {marker}\nexit 0\n", encoding="utf-8")
+    path.chmod(0o755)
+
+    run_review.validate_check_command_text("PATH=tools checker", workspace=ws)
+    assert not marker.exists()
+
+
+# --- F-02: process-start phase accuracy ------------------------------------
+
+
+def test_err_1_missing_executable_is_a_pre_start_category(tmp_path: Path) -> None:
+    """ERR-1."""
+
+    ws = make_workspace(tmp_path)
+    result = run_review.run_check_command("./local-bin/missing-checker", ws, 5)
+    assert result.exit_code is None
+    assert result.timed_out is False
+    assert result.error_category == "EXECUTABLE_NOT_FOUND"
+
+
+def test_err_2_non_executable_file_is_classified(tmp_path: Path) -> None:
+    """ERR-2. The file exists but carries no execute bit: EACCES at spawn."""
+
+    ws = make_workspace(tmp_path)
+    target = ws / "local-bin" / "checker"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    target.chmod(0o644)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code is None
+    assert result.error_category == "EXECUTABLE_NOT_EXECUTABLE"
+
+
+def test_err_3_enotdir_executable_path_is_classified(tmp_path: Path) -> None:
+    """ERR-3. A path component that is a regular file, not a directory."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, relative_path="local-bin/checker")
+    result = run_review.run_check_command("./local-bin/checker/nested", ws, 5)
+    assert result.exit_code is None
+    assert result.error_category == "EXECUTABLE_PATH_NOT_A_DIRECTORY"
+
+
+def test_err_4_generic_pre_start_oserror_is_process_spawn_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ERR-4. A synthetic Popen() failure with an unmapped errno. The real
+    execute_bounded() spawn path runs (its observer fires False), so this
+    proves the pre-start branch, not just the classifier in isolation."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws)
+
+    def _raise(*args: Any, **kwargs: Any) -> Any:
+        raise OSError(errno.EIO, "synthetic spawn failure")
+
+    monkeypatch.setattr(run_review.subprocess, "Popen", _raise)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code is None
+    assert result.timed_out is False
+    assert result.error_category == "PROCESS_SPAWN_ERROR"
+
+
+def test_err_5_nonzero_exit_keeps_real_code_and_no_error_category(tmp_path: Path) -> None:
+    """ERR-5."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws, exit_code=7)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code == 7
+    assert result.timed_out is False
+    assert result.error_category is None
+
+
+def test_err_6_timeout_is_not_a_spawn_category(tmp_path: Path) -> None:
+    """ERR-6. The process started, so no spawn category may be assigned."""
+
+    ws = make_workspace(tmp_path)
+    sleeper = ws / "local-bin" / "sleeper"
+    sleeper.parent.mkdir(parents=True, exist_ok=True)
+    sleeper.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    sleeper.chmod(0o755)
+
+    result = run_review.run_check_command("./local-bin/sleeper", ws, 1)
+    assert result.timed_out is True
+    assert result.exit_code is None
+    assert result.error_category is None
+
+
+def test_err_7_post_start_oserror_is_not_a_spawn_category(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """ERR-7. Popen() succeeded -- the process demonstrably started -- and the
+    OSError came from communicate(). It must fail closed, must retain the
+    evidence that the process started, and must NOT claim any pre-start
+    category (this is exactly the F-02 defect: it previously reported
+    PROCESS_SPAWN_ERROR)."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws)
+    observations: list[bool | None] = []
+
+    class StartedProcess:
+        pid = 4242424
+        returncode = None
+
+        def communicate(self, *, timeout: float) -> tuple[bytes, bytes]:
+            raise OSError(errno.ENOENT, "synthetic post-start communicate failure")
+
+        def wait(self, *, timeout: float) -> int:
+            return 0
+
+    real_popen = run_review.subprocess.Popen
+
+    def _fake_popen(*args: Any, **kwargs: Any) -> Any:
+        observations.append(True)
+        return StartedProcess()
+
+    monkeypatch.setattr(run_review.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(run_review, "_signal_group", lambda pgid, sig: True)
+    monkeypatch.setattr(run_review, "_ensure_group_quiescent", lambda pgid: None)
+
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+
+    assert real_popen is not run_review.subprocess.Popen
+    assert observations == [True], "the fixture must model a *successful* Popen"
+    # Fails closed.
+    assert result.exit_code is None
+    assert result.timed_out is False
+    # Distinct post-start category -- never a pre-start one, even though the
+    # synthetic errno is ENOENT (the classifier must not be consulted at all).
+    assert result.error_category == "PROCESS_IO_ERROR"
+    assert result.error_category != "PROCESS_SPAWN_ERROR"
+    assert result.error_category != "EXECUTABLE_NOT_FOUND"
+    # Evidence retains that the process had started.
+    assert "after process start" in result.stderr_excerpt
+
+
+def test_err_8_success_has_no_error_category(tmp_path: Path) -> None:
+    """ERR-8 (control)."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(ws)
+    result = run_review.run_check_command("./local-bin/checker", ws, 5)
+    assert result.exit_code == 0
+    assert result.timed_out is False
+    assert result.error_category is None
+
+
+def test_post_start_and_pre_start_categories_are_disjoint() -> None:
+    """The two phase classes must never share a category name, or serialized
+    evidence cannot distinguish 'never started' from 'started then failed'."""
+
+    pre_start = {
+        "EXECUTABLE_NOT_FOUND",
+        "EXECUTABLE_NOT_EXECUTABLE",
+        "EXECUTABLE_PATH_NOT_A_DIRECTORY",
+        "PROCESS_SPAWN_ERROR",
+    }
+    assert "PROCESS_IO_ERROR" not in pre_start
+    for exc in (
+        FileNotFoundError(errno.ENOENT, "x"),
+        PermissionError(errno.EACCES, "x"),
+        OSError(errno.ENOTDIR, "x"),
+        OSError(errno.EIO, "x"),
+    ):
+        assert run_review._classify_spawn_error(exc) in pre_start
+
+
+# --- F-03: environment-assignment grammar matrix ---------------------------
+
+
+@pytest.mark.parametrize(
+    ("command", "expected_env", "expected_exec_argv"),
+    [
+        ("FOO=bar ./local-bin/checker", {"FOO": "bar"}, ["./local-bin/checker"]),
+        (
+            "FOO=bar BAZ=qux ./local-bin/checker",
+            {"FOO": "bar", "BAZ": "qux"},
+            ["./local-bin/checker"],
+        ),
+        ("FOO=first FOO=second ./local-bin/checker", {"FOO": "second"}, ["./local-bin/checker"]),
+        ("FOO= ./local-bin/checker", {"FOO": ""}, ["./local-bin/checker"]),
+        ("FOO=a=b=c ./local-bin/checker", {"FOO": "a=b=c"}, ["./local-bin/checker"]),
+        ('FOO="hello world" ./local-bin/checker', {"FOO": "hello world"}, ["./local-bin/checker"]),
+        ("_FOO=value ./local-bin/checker", {"_FOO": "value"}, ["./local-bin/checker"]),
+    ],
+)
+def test_environment_assignment_grammar_matrix(
+    command: str, expected_env: dict[str, str], expected_exec_argv: list[str]
+) -> None:
+    """F-03. The supported leading-assignment grammar, token level."""
+
+    import shlex as _shlex
+
+    env, exec_argv = run_review.split_check_command_env_prefix(_shlex.split(command))
+    assert env == expected_env
+    assert exec_argv == expected_exec_argv
+
+
+@pytest.mark.parametrize("token", ["1FOO=value", "FOO-BAR=value"])
+def test_tokens_outside_the_assignment_grammar_are_not_assignments(token: str) -> None:
+    """F-03. `1FOO=value` and `FOO-BAR=value` are outside the POSIX env-var
+    name grammar. They are therefore NOT assignments: they stay the would-be
+    executable token, and (being bare names) fail closed at preflight. The
+    grammar is not broadened here."""
+
+    env, exec_argv = run_review.split_check_command_env_prefix([token, "arg"])
+    assert env == {}
+    assert exec_argv == [token, "arg"]
+
+    with pytest.raises(run_review.PreflightFailure) as excinfo:
+        run_review.validate_check_command_text(f"{token} arg")
+    assert excinfo.value.category == "CHECK_COMMAND_EXECUTABLE_NOT_FOUND"
+
+
+def test_environment_assignment_matrix_reaches_the_real_child_environment(tmp_path: Path) -> None:
+    """F-03. The same matrix proven end to end through the public runner:
+    every supported form must actually arrive in the child's environment with
+    its exact value."""
+
+    ws = make_workspace(tmp_path)
+    write_local_checker(
+        ws, env_vars_to_report=("FOO", "BAZ", "DUP", "EMPTY", "EQUALS", "SPACED", "_UNDER")
+    )
+    result = run_review.run_check_command(
+        "FOO=bar BAZ=qux DUP=first DUP=second EMPTY= EQUALS=a=b=c "
+        'SPACED="hello world" _UNDER=value ./local-bin/checker',
+        ws,
+        10,
+    )
+    assert result.exit_code == 0
+    assert result.error_category is None
+    lines = result.stdout_excerpt.splitlines()
+    assert "FOO=bar" in lines
+    assert "BAZ=qux" in lines
+    assert "DUP=second" in lines
+    assert "EMPTY=" in lines
+    assert "EQUALS=a=b=c" in lines
+    assert "SPACED=hello world" in lines
+    assert "_UNDER=value" in lines
 
 
 if __name__ == "__main__":

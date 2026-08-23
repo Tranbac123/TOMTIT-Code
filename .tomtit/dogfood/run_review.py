@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
+import errno
 import hashlib
 import json
 import os
@@ -276,6 +277,16 @@ _REQUIRED_FINDING_KEYS = {"id", "severity", "title", "evidence", "required_chang
 # shell=False means it is never given operator meaning either way.
 _RAW_FORBIDDEN_CHECK_COMMAND_SUBSTRINGS = ("$(", "`", "\n")
 _FORBIDDEN_STANDALONE_CHECK_COMMAND_TOKENS = {";", "&&", "||", "|", ">", "<", ">>", "<<", "&"}
+
+# POSIX-style leading environment assignment: `NAME=value` where NAME follows
+# the standard shell env-var-name grammar. Check commands run via direct argv
+# execution (never shell=True), so a leading assignment like
+# `TMPDIR=x PYTHONPYCACHEPREFIX=y ./venv/bin/python3 ...` is never implicitly
+# applied to the child environment by subprocess.Popen the way a real shell
+# would -- it must be recognized and split out explicitly, or the first
+# assignment token is mistaken for argv[0] and the process fails to spawn at
+# all (see split_check_command_env_prefix()).
+_ENV_ASSIGNMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 
 _GIT_SPECIAL_STATE_MARKERS = ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply")
 
@@ -2760,12 +2771,42 @@ class CheckResult:
     stderr_excerpt: str
     stdout_sha256: str
     stderr_sha256: str
+    # None whenever the process started *and* reached a normal terminal
+    # outcome (exit 0, nonzero exit, or timeout -- all process-start
+    # outcomes). Otherwise exactly one of two disjoint phase classes:
+    #
+    #   PRE-START  (subprocess.Popen() itself raised; no process ever
+    #              existed): EXECUTABLE_NOT_FOUND /
+    #              EXECUTABLE_NOT_EXECUTABLE /
+    #              EXECUTABLE_PATH_NOT_A_DIRECTORY / PROCESS_SPAWN_ERROR.
+    #   POST-START (Popen() succeeded, then an OSError escaped during
+    #              communicate()/I/O/cleanup): PROCESS_IO_ERROR.
+    #
+    # The split is taken from execute_bounded()'s own process-start observer
+    # (which fires False on a Popen failure and True the instant Popen
+    # returns), never inferred from the exception class or errno -- a
+    # post-start ENOENT must never be reported as EXECUTABLE_NOT_FOUND. This
+    # keeps "the process ran and failed" strictly distinct from "the process
+    # never started" -- the exact ambiguity that let the B1-01 ENOENT spawn
+    # failure masquerade as an unexplained instant test failure.
+    error_category: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return dataclasses.asdict(self)
 
 
-def validate_check_command_text(text: str) -> list[str]:
+def validate_check_command_text(text: str, *, workspace: Path | None = None) -> list[str]:
+    """Validate one check command's grammar and preflight executability.
+
+    `workspace` is the candidate repository root the check will actually run
+    in (the child process `cwd`). It is required for bare-executable
+    preflight to be faithful whenever the effective PATH contains a relative
+    entry, because such an entry resolves against the child's cwd, not the
+    Coordinator's. Callers that pass no workspace get a strictly
+    fail-closed subset: relative PATH entries are skipped rather than
+    resolved against an unrelated directory.
+    """
+
     if not text or not text.strip():
         raise PreflightFailure("INVALID_CHECK_COMMAND", "check command must not be empty")
     for substring in _RAW_FORBIDDEN_CHECK_COMMAND_SUBSTRINGS:
@@ -2784,18 +2825,162 @@ def validate_check_command_text(text: str) -> list[str]:
             raise PreflightFailure(
                 "SHELL_OPERATOR_REJECTED", f"check command contains a rejected shell operator token: {token!r}"
             )
+    # Leading POSIX environment assignments (e.g. `TMPDIR=x PYTHONPYCACHEPREFIX=y
+    # ./venv/bin/python3 ...`) are a supported, pre-model-validated syntax --
+    # rejected here, before any implementation attempt is spent, only when
+    # they leave no actual executable token (AC-P0-03/preflight executability).
+    # The split itself (and applying the assignments to the child env) happens
+    # at execution time in run_check_command(); this function keeps returning
+    # the full raw token list, unchanged, for existing callers that only need
+    # parse/shape validation.
+    env_assignments, exec_argv = split_check_command_env_prefix(argv)
+    if not exec_argv:
+        raise PreflightFailure(
+            "INVALID_CHECK_COMMAND",
+            "check command consists only of environment assignments with no executable",
+        )
+    # Statically-resolvable executable check (AC "preflight executability"):
+    # only for a bare PATH-searched command name (no "/" at all, e.g. "git",
+    # "pytest") -- never for a workspace-relative or absolute path (e.g.
+    # "./.tomtit-b1-01-env/bin/python3.11"). A relative/absolute path may
+    # legitimately not exist yet at TaskContract preflight time (it can be an
+    # Owner-authorized side-effect path, such as a venv, that Attempt 1 has
+    # not created yet); failing closed on its absence here would incorrectly
+    # reject a valid contract. A bare PATH name has no such dependency and can
+    # be proven resolvable (or not) without executing the product test.
+    #
+    # Resolution MUST use the *effective child* environment -- the same
+    # read-only base environment plus this command's own leading assignments,
+    # last-assignment-wins -- not the Coordinator's own PATH. Using the parent
+    # PATH both false-rejects `PATH=/usr/bin env` (parent cannot resolve it,
+    # child can) and false-accepts `PATH=/definitely/not-real git --version`
+    # (parent can, child cannot). Nothing is executed here: resolution is
+    # existence/executable-bit inspection only.
+    executable = exec_argv[0]
+    if "/" not in executable:
+        child_env = build_check_command_child_env(env_assignments)
+        if resolve_bare_check_executable(executable, child_env=child_env, workspace=workspace) is None:
+            raise PreflightFailure(
+                "CHECK_COMMAND_EXECUTABLE_NOT_FOUND",
+                f"check command executable not found on the effective PATH: {executable!r}",
+            )
     return argv
 
 
+def split_check_command_env_prefix(argv: list[str]) -> tuple[dict[str, str], list[str]]:
+    """Split leading `NAME=value` tokens from the executable argv.
+
+    Mirrors POSIX shell semantics for `VAR=val VAR2=val2 cmd arg...`. Check
+    commands are executed via direct argv (never `shell=True`), so
+    `subprocess.Popen` never applies a leading assignment token to the child
+    environment on its own -- it just tries (and fails) to exec it as a
+    program name. Every token from the start matching the env-assignment
+    grammar is consumed as an assignment; the first non-matching token
+    becomes argv[0] and everything from there on is passed through
+    unchanged.
+    """
+
+    env: dict[str, str] = {}
+    index = 0
+    for token in argv:
+        if not _ENV_ASSIGNMENT_RE.match(token):
+            break
+        name, _, value = token.partition("=")
+        env[name] = value
+        index += 1
+    return env, argv[index:]
+
+
+def build_check_command_child_env(env_assignments: Mapping[str, str]) -> dict[str, str]:
+    """Build the exact child environment a check command will execute with.
+
+    One definition, used by *both* preflight executable resolution and actual
+    execution, so the two can never disagree about the effective PATH (or any
+    other variable). Assignments are overlaid on the read-only base
+    environment; `split_check_command_env_prefix()` has already applied
+    last-assignment-wins within the command itself.
+    """
+
+    child_env = _read_only_subprocess_env()
+    child_env.update(env_assignments)
+    return child_env
+
+
+def _is_executable_file(path: Path) -> bool:
+    """True only for an existing regular file carrying the execute bit.
+
+    Inspection only -- the candidate is never executed at preflight time.
+    """
+
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def resolve_bare_check_executable(
+    executable: str,
+    *,
+    child_env: Mapping[str, str],
+    workspace: Path | None,
+) -> str | None:
+    """Resolve a bare (no "/") executable name against the effective child PATH.
+
+    Deliberately not `shutil.which()`: `which()` resolves relative PATH
+    entries against the *Coordinator's* current working directory, whereas
+    the child process runs with `cwd` set to the candidate workspace. A
+    command such as `PATH=tools:/usr/bin mytool` must therefore search
+    `<workspace>/tools/mytool` and then `/usr/bin/mytool`, never
+    `<coordinator-repo>/tools/mytool`.
+
+    POSIX PATH semantics preserved: entries are `os.pathsep`-separated, an
+    empty entry means the current directory (i.e. the workspace), and the
+    first executable match wins. When no workspace is supplied, relative
+    entries are skipped rather than resolved against an unrelated directory
+    -- strictly fail-closed. Returns the resolved path, or None.
+    """
+
+    path_value = child_env.get("PATH")
+    if path_value is None:
+        path_value = os.defpath
+    for entry in path_value.split(os.pathsep):
+        directory = Path(entry or os.curdir)
+        if not directory.is_absolute():
+            if workspace is None:
+                continue
+            directory = Path(workspace) / directory
+        candidate = directory / executable
+        if _is_executable_file(candidate):
+            return str(candidate)
+    return None
+
+
 def run_check_command(text: str, cwd: Path, timeout_seconds: int) -> CheckResult:
-    argv = validate_check_command_text(text)
+    # `cwd` is the candidate workspace and is exactly the child process cwd,
+    # so preflight resolves relative PATH entries the same way execution will.
+    argv = validate_check_command_text(text, workspace=cwd)
+    env_assignments, exec_argv = split_check_command_env_prefix(argv)
+    child_env = build_check_command_child_env(env_assignments)
+    # Process-start phase, taken from execute_bounded()'s own observer rather
+    # than inferred from whichever OSError happens to escape: the observer is
+    # called with False when Popen() raises and True the instant Popen()
+    # returns, so an OSError raised later (communicate()/I/O/cleanup) can
+    # never be misreported as a spawn failure.
+    process_started = False
+
+    def _observe_process_start(started: bool | None) -> None:
+        nonlocal process_started
+        if started:
+            process_started = True
+
     start = time.monotonic()
     try:
         completed = execute_bounded(
-            argv,
+            exec_argv,
             cwd=str(cwd),
             timeout_seconds=float(timeout_seconds),
-            env=_read_only_subprocess_env(),
+            provider_observer=_observe_process_start,
+            env=child_env,
         )
         duration_ms = int((time.monotonic() - start) * 1000)
         return CheckResult(
@@ -2807,6 +2992,7 @@ def run_check_command(text: str, cwd: Path, timeout_seconds: int) -> CheckResult
             stderr_excerpt=_excerpt(completed.stderr),
             stdout_sha256=_sha256(completed.stdout),
             stderr_sha256=_sha256(completed.stderr),
+            error_category=None,
         )
     except ProcessQuiescenceFailure as exc:
         raise PreflightFailure(
@@ -2815,7 +3001,16 @@ def run_check_command(text: str, cwd: Path, timeout_seconds: int) -> CheckResult
         ) from None
     except OSError as exc:
         duration_ms = int((time.monotonic() - start) * 1000)
-        message = f"{exc.__class__.__name__} errno={getattr(exc, 'errno', None)}"
+        detail = f"{exc.__class__.__name__} errno={getattr(exc, 'errno', None)}"
+        if process_started:
+            # The process demonstrably started; only I/O or cleanup failed.
+            # Fails closed (exit_code stays None, the check cannot be counted
+            # as passing) but must NOT claim a spawn category.
+            category = "PROCESS_IO_ERROR"
+            message = f"PROCESS_IO_ERROR after process start: {detail}"
+        else:
+            category = _classify_spawn_error(exc)
+            message = detail
         return CheckResult(
             command=text,
             exit_code=None,
@@ -2825,7 +3020,27 @@ def run_check_command(text: str, cwd: Path, timeout_seconds: int) -> CheckResult
             stderr_excerpt=message,
             stdout_sha256=_EMPTY_SHA256,
             stderr_sha256=_sha256(message.encode("utf-8")),
+            error_category=category,
         )
+
+
+def _classify_spawn_error(exc: OSError) -> str:
+    """Distinguish *why* a check command's process never started.
+
+    Only ever called on the proven pre-start path: `run_check_command()`
+    consults `execute_bounded()`'s process-start observer first and routes
+    any post-start OSError to PROCESS_IO_ERROR instead. Never conflated with
+    a nonzero exit code or a timeout either -- both of those mean the process
+    did start.
+    """
+
+    if isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT:
+        return "EXECUTABLE_NOT_FOUND"
+    if isinstance(exc, PermissionError) or exc.errno in (errno.EACCES, errno.EPERM):
+        return "EXECUTABLE_NOT_EXECUTABLE"
+    if exc.errno == errno.ENOTDIR:
+        return "EXECUTABLE_PATH_NOT_A_DIRECTORY"
+    return "PROCESS_SPAWN_ERROR"
 
 
 # ---------------------------------------------------------------------------

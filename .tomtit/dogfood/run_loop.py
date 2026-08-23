@@ -872,7 +872,12 @@ def _config_preflight(args: argparse.Namespace) -> dict[str, Any]:
 
     for command in args.check_command:
         try:
-            run_review.validate_check_command_text(command)
+            # `workspace` is the candidate repository root the check will run
+            # in; preflight must resolve a bare executable against the same
+            # effective PATH -- including workspace-relative PATH entries --
+            # that execution will use, or it can reject a valid command (or
+            # spend a model invocation on an unresolvable one).
+            run_review.validate_check_command_text(command, workspace=workspace)
         except run_review.PreflightFailure as exc:
             raise ConfigFailure(exc.category, exc.message) from None
 
