@@ -395,8 +395,10 @@ class OwnerWaitMetric(EvaluationModel):
 
     EVAL-01 has no authoritative owner-wait or ``WAITING_OWNER`` window facts,
     so this is always unavailable today. Producing real values requires Runtime
-    owner-wait instrumentation, which is a future source/bridge dependency and
-    is not implemented here.
+    owner-wait instrumentation, which is a separate open dependency: note that
+    ``EVAL-RUNTIME-BRIDGE-01`` ships and does *not* supply it, because it
+    carries terminal-report publication facts and nothing about how long an
+    Owner was waited on.
     """
 
     elapsed_seconds: float | None = None
@@ -424,7 +426,8 @@ def owner_wait_metric(
             "owner wall-clock wait requires authoritative Runtime "
             "WAITING_OWNER window facts, which Evaluation does not have; "
             "intervention request/response spans are not a substitute "
-            "(Contract V1 §16). Future dependency: EVAL-RUNTIME-BRIDGE."
+            "(Contract V1 §16). Open dependency: Runtime owner-wait "
+            "instrumentation, which EVAL-RUNTIME-BRIDGE-01 does not provide."
         )
     )
 

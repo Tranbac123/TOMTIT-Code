@@ -22,14 +22,41 @@ Shape
 Trust boundary
 --------------
 Contract V1 §4.1 makes ``report_id`` and ``source_revision`` Runtime-assigned
-and immutable, so Evaluation can neither originate nor verify them. A binding
-value a *caller* supplies is therefore the caller attesting to itself, whatever
-its shape — a dedicated class, a duck-typed protocol or a chosen ``issued_by``
-string are all the same thing. V0A does not pretend otherwise: canonical
-publication of the two report-bound events fails closed for every operational
-source (:class:`ReportBoundAppendUnavailableError`), and this package exposes
-no public way to open it. Producing genuine authority is
-``EVAL-RUNTIME-BRIDGE``, which is not implemented.
+and immutable, so Evaluation can neither originate nor verify them on its own.
+A binding value a *caller* supplies is the caller attesting to itself, whatever
+its shape — a dedicated class, a duck-typed protocol, a copied report file or a
+chosen ``issued_by`` string are all the same thing, and none of them is
+authority.
+
+``EVAL-RUNTIME-BRIDGE-01`` supplies the missing half, and it is implemented:
+see :mod:`tomtit.evaluation.bridge`. Runtime keeps a **process-local
+publication ledger** (:mod:`tomtit.reporting`) recording the terminal reports
+this process actually published — allocated report identity, the exact path,
+the exact published bytes and their SHA-256, and the run identity — and returns
+an opaque publication receipt. A report-bound append therefore takes a receipt
+id, and :func:`verify_published_report` rebinds it to the ledger's own facts:
+the ledger re-reads the path *it* recorded and re-hashes those bytes. The
+caller selects which publication to assess and establishes nothing about it.
+
+Two limits on that guarantee, stated rather than glossed:
+
+**Process-local, not cryptographic.** The ledger lives in memory. It
+establishes "this process published this artifact" — not that another process
+or host did, and not that a hostile process could not reach its internals.
+There is no signing, no attestation and no cross-process or malicious-host
+resistance. Those remain open work, not properties of V0A.
+
+**Source revision authority does not exist yet.**
+``PRODUCT_RUNTIME_SOURCE_REVISION_AUTHORITY`` is unimplemented: nothing in this
+repository establishes the source revision a run executed against, and Runtime
+must not manufacture one. Runtime therefore publishes ``source_revision =
+null``, and §4.2 makes such a report admit no Review or Owner assessment. So
+canonical report-bound publication of a *current* real Product Runtime run
+still fails closed — now because the artifact lacks provenance, not because the
+bridge is missing. Once a separately authorized source-provenance component
+establishes the executed revision, a publication carrying both that revision
+and a ledger receipt becomes assessable; until then it does not, and
+:class:`UnassessableTerminalReportError` says exactly that.
 
 Public surface and authority
 ----------------------------
@@ -74,6 +101,15 @@ from tomtit.evaluation.assessments import (
     SourceAwareAssessment,
     report_target_key,
 )
+from tomtit.evaluation.bridge import (
+    TERMINAL_REPORT_NAME,
+    TERMINAL_REPORT_SCHEMA_VERSION,
+    PublishedReportVerificationError,
+    TerminalReportUnavailableError,
+    UnassessableTerminalReportError,
+    VerifiedTerminalReport,
+    verify_published_report,
+)
 from tomtit.evaluation.derive import (
     ESCAPED_DEFECT_WINDOW_DAYS,
     CrossSourceSelectionError,
@@ -115,6 +151,7 @@ from tomtit.evaluation.store import (
     DuplicateAssessmentIdentityError,
     EvaluationAssessmentStore,
     ForeignSequenceError,
+    PublicationTargetMismatchError,
     ReportBoundAppendUnavailableError,
     UnsupportedAssessmentError,
 )
@@ -127,6 +164,8 @@ __all__ = [
     "REVIEWER_PROXY_APPROVAL_OUTCOMES",
     "RUNTIME_EXECUTION_STREAM",
     "CrossSourceSelectionError",
+    "TERMINAL_REPORT_NAME",
+    "TERMINAL_REPORT_SCHEMA_VERSION",
     "DecisionAssessmentAdaptation",
     "DecisionAssessmentEvent",
     "DecisionAssessmentEventDraft",
@@ -156,6 +195,8 @@ __all__ = [
     "OwnerOutcome",
     "OwnerReviewStatus",
     "OwnerWaitMetric",
+    "PublicationTargetMismatchError",
+    "PublishedReportVerificationError",
     "ReportBoundAppendUnavailableError",
     "ReviewAssessmentEvent",
     "ReviewAssessmentEventDraft",
@@ -165,8 +206,11 @@ __all__ = [
     "SourceAwareAssessment",
     "SourceRevision",
     "StatusOriginVocabulary",
+    "TerminalReportUnavailableError",
     "TranslatedCriterionStatus",
+    "UnassessableTerminalReportError",
     "UnsupportedAssessmentError",
+    "VerifiedTerminalReport",
     "adapt_decision_evaluation_result",
     "effective_assessment",
     "escaped_defect_status",
@@ -174,6 +218,7 @@ __all__ = [
     "map_human_intervention_source",
     "owner_review_status",
     "owner_wait_metric",
+    "verify_published_report",
     "report_target_key",
     "require_active_source_revision",
     "revision_type_status",

@@ -34,7 +34,9 @@ from tomtit.domain.evaluation import (
 from tomtit.fakes import FakeCheckRunner, FakeWorker
 from tomtit.reporting import (
     STAGED_REPORT_NAME,
+    PublicationReceipt,
     _build_terminal_report_from_validated_record,
+    publication_authority,
     publish_staged_report,
     render_terminal_report,
     stage_terminal_report,
@@ -77,6 +79,9 @@ class _PreparedCompletion:
     staged_report: Path
     final_report: Path
     events: tuple[PreparedEvent, ...]
+    #: The ledger allocation stamped into the staged bytes, so a commit that
+    #: rolls back can hand it back instead of stranding it as publishable.
+    report_id: str
 
 
 def _remove_quietly(path: Path) -> None:
@@ -181,6 +186,14 @@ class Runtime:
         self._event_log = event_log
         self._report_directory = report_directory
         self._clock = clock
+        # Contract V1 §4.1: report identity comes from the process publication
+        # ledger, not from this constructor. There is deliberately no seam for
+        # supplying it — an injectable id factory would let a caller choose the
+        # identity a published report is later assessed under, which is exactly
+        # the authority §4.1 reserves to Runtime.
+        self._publication_authority = publication_authority()
+        # Set once, past the commit point, by the run that actually published.
+        self._publication_receipt: PublicationReceipt | None = None
         # The canonical contract binding for this run's lifetime. It is captured
         # from the original TaskContract before any record can be copied, and is
         # never recomputed from self._record, whose task_contract a caller could
@@ -196,6 +209,17 @@ class Runtime:
     @property
     def record(self) -> RunRecord:
         return self._record
+
+    @property
+    def publication_receipt(self) -> PublicationReceipt | None:
+        """Evidence that this run published its terminal report, once it has.
+
+        ``None`` until completion commits. It is the only thing an assessment
+        caller can present to Evaluation, and it asserts nothing by itself:
+        Evaluation resolves it against the publication ledger.
+        """
+
+        return self._publication_receipt
 
     @property
     def canonical_task_contract_hash(self) -> str:
@@ -719,6 +743,9 @@ class Runtime:
         # Known up front so a staging call that fails part-way through still has
         # its partial file removed by the handler below.
         staged_report = self._report_directory / STAGED_REPORT_NAME
+        # Allocated before the try so a failure anywhere below can hand it back
+        # unused; an allocation that never publishes must not stay publishable.
+        report_id = self._publication_authority._allocate_report_id()
         try:
             completed_at = self._clock()
             generated_at = self._clock()
@@ -757,6 +784,11 @@ class Runtime:
             report = _build_terminal_report_from_validated_record(
                 candidate,
                 generated_at=generated_at,
+                # Allocated by the publication ledger, inside the single
+                # Runtime-controlled preparation, so the id reaches the exact
+                # published bytes and nothing outside Runtime can choose it
+                # (§4.1). Only this id will be recordable as published.
+                report_id=report_id,
             )
             rendered = render_terminal_report(report)
             stage_terminal_report(self._report_directory, rendered)
@@ -767,6 +799,7 @@ class Runtime:
                 expected_task_contract_hash=self._canonical_task_contract_hash,
             )
         except BaseException:
+            self._publication_authority._release_report_id(report_id)
             _remove_quietly(staged_report)
             raise
 
@@ -775,6 +808,7 @@ class Runtime:
             staged_report=staged_report,
             final_report=final_report,
             events=(run_completed, report_generated),
+            report_id=report_id,
         )
 
     def _commit_completion(self, prepared: _PreparedCompletion) -> RunRecord:
@@ -801,12 +835,19 @@ class Runtime:
             # it raises the final report was not created by this operation.
             publish_staged_report(prepared.staged_report, prepared.final_report)
         except BaseException:
+            self._publication_authority._release_report_id(prepared.report_id)
             self._record = previous_record
             self._event_log._restore_to_checkpoint(checkpoint)
             _remove_quietly(prepared.staged_report)
             raise
 
         # Past the commit point: best effort only, never a rollback trigger.
+        # Recording reads the published artifact back and never raises, so a
+        # ledger failure leaves the committed report standing — unassessable
+        # rather than uncommitted.
+        self._publication_receipt = self._publication_authority.record_publication(
+            prepared.final_report
+        )
         _remove_quietly(prepared.staged_report)
         return self._record
 

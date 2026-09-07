@@ -47,18 +47,47 @@ def _defect(**overrides) -> EscapedDefectEventDraft:
 # -- Evaluation never becomes an operational authority ----------------------
 
 
+#: The read-only publication surface the bridge is allowed to consult.
+#: EVAL-RUNTIME-BRIDGE-01: establishing that Runtime published an artifact means
+#: asking Runtime's publication ledger, so exactly one module may reach it, and
+#: only for verification. Everything that writes a report stays unreachable.
+_BRIDGE_MODULE = "bridge.py"
+_ALLOWED_REPORTING_IMPORTS = frozenset(
+    {
+        "PublishedReportChangedError",
+        "UnknownPublicationReceiptError",
+        "publication_authority",
+    }
+)
+
+
 def test_evaluation_package_never_imports_runtime_writers() -> None:
-    forbidden = (
-        "from tomtit.runtime.runtime import",
-        "from tomtit.runtime.state import",
-        "from tomtit.reporting import",
-        "import tomtit.runtime.runtime",
-        "import tomtit.reporting",
-    )
+    """Evaluation may verify a publication; it may never perform one."""
+
+    import ast
+
     for path in sorted(EVAL_PACKAGE.glob("*.py")):
-        source = path.read_text(encoding="utf-8")
-        for token in forbidden:
-            assert token not in source, f"{path.name} imports {token}"
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            modules: list[str] = []
+            imported: list[str] = []
+            if isinstance(node, ast.ImportFrom) and node.module:
+                modules.append(node.module)
+                imported.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.Import):
+                modules.extend(alias.name for alias in node.names)
+
+            for module in modules:
+                assert not module.startswith("tomtit.runtime"), (
+                    f"{path.name} imports {module}"
+                )
+                if not module.startswith("tomtit.reporting"):
+                    continue
+                assert path.name == _BRIDGE_MODULE, (
+                    f"{path.name} imports {module}; only {_BRIDGE_MODULE} is the seam"
+                )
+                unexpected = set(imported) - _ALLOWED_REPORTING_IMPORTS
+                assert unexpected == set(), (path.name, unexpected)
 
 
 def test_evaluation_does_not_construct_runtime_decision_events() -> None:

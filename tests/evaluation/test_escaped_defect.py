@@ -91,8 +91,8 @@ def test_defect_event_must_cite_evidence() -> None:
         _defect(evidence_refs=())
 
 
-def test_appended_defect_event_is_immutable(store) -> None:
-    envelope = store.append(_defect(), operational_source=RUNTIME)
+def test_appended_defect_event_is_immutable(history) -> None:
+    envelope = history.append(_defect(), operational_source=RUNTIME)
     with pytest.raises(ValidationError):
         envelope.assessment.severity = EscapedDefectSeverity.MINOR
 
@@ -100,68 +100,68 @@ def test_appended_defect_event_is_immutable(store) -> None:
 # -- window derivation from authoritative assessments -----------------------
 
 
-def test_window_starts_at_owner_acceptance(store, seed_owner) -> None:
+def test_window_starts_at_owner_acceptance(history, seed_owner) -> None:
     envelope = seed_owner(outcome=OwnerOutcome.OWNER_ACCEPTED, offset_seconds=60)
     target = report_target_key(RUNTIME, envelope.assessment)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW * 2)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW * 2)
     assert result.available
     assert result.window_started_at == envelope.assessment.timestamp
     assert result.window_ends_at == envelope.assessment.timestamp + WINDOW
 
 
-def test_window_starts_at_reviewer_proxy_approval(store, seed_review) -> None:
+def test_window_starts_at_reviewer_proxy_approval(history, seed_review) -> None:
     envelope = seed_review(outcome=ReviewOutcome.REVIEWER_APPROVED)
     target = report_target_key(RUNTIME, envelope.assessment)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.available
     assert result.window_started_at == envelope.assessment.timestamp
 
 
-def test_non_blocking_findings_approval_also_opens_window(store, seed_review) -> None:
+def test_non_blocking_findings_approval_also_opens_window(history, seed_review) -> None:
     envelope = seed_review(
         outcome=ReviewOutcome.REVIEWER_APPROVED_WITH_NON_BLOCKING_FINDINGS
     )
     target = report_target_key(RUNTIME, envelope.assessment)
-    assert escaped_defect_status(store, target, evaluated_at=NOW + WINDOW).available
+    assert escaped_defect_status(history, target, evaluated_at=NOW + WINDOW).available
 
 
 @pytest.mark.parametrize(
     "outcome",
     [ReviewOutcome.REVIEWER_REQUESTED_CHANGES, ReviewOutcome.REVIEWER_BLOCKED],
 )
-def test_non_approval_review_does_not_open_window(store, seed_review, outcome) -> None:
+def test_non_approval_review_does_not_open_window(history, seed_review, outcome) -> None:
     envelope = seed_review(outcome=outcome)
     target = report_target_key(RUNTIME, envelope.assessment)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert not result.available
     assert result.window_started_at is None
 
 
-def test_owner_rejection_does_not_open_window(store, seed_owner) -> None:
+def test_owner_rejection_does_not_open_window(history, seed_owner) -> None:
     envelope = seed_owner(outcome=OwnerOutcome.OWNER_REJECTED)
     target = report_target_key(RUNTIME, envelope.assessment)
-    assert not escaped_defect_status(store, target, evaluated_at=NOW + WINDOW).available
+    assert not escaped_defect_status(history, target, evaluated_at=NOW + WINDOW).available
 
 
 def test_owner_rejection_after_approval_closes_the_window(
-    store, seed_review, seed_owner
+    history, seed_review, seed_owner
 ) -> None:
     """§11 precedence: the Owner outranks the proxy, so no window remains."""
 
     seed_review(outcome=ReviewOutcome.REVIEWER_APPROVED)
     envelope = seed_owner(outcome=OwnerOutcome.OWNER_REJECTED)
     target = report_target_key(RUNTIME, envelope.assessment)
-    store.append(_defect(detected_at=NOW + timedelta(days=1)), operational_source=RUNTIME)
-    assert not escaped_defect_status(store, target, evaluated_at=NOW + WINDOW).available
+    history.append(_defect(detected_at=NOW + timedelta(days=1)), operational_source=RUNTIME)
+    assert not escaped_defect_status(history, target, evaluated_at=NOW + WINDOW).available
 
 
-def test_missing_acceptance_facts_yield_unavailable(store, seed_review) -> None:
+def test_missing_acceptance_facts_yield_unavailable(history, seed_review) -> None:
     """No acceptance means no window start — not an assumed status."""
 
     envelope = seed_review(outcome=ReviewOutcome.REVIEWER_BLOCKED)
-    store.append(_defect(), operational_source=RUNTIME)
+    history.append(_defect(), operational_source=RUNTIME)
     result = escaped_defect_status(
-        store,
+        history,
         report_target_key(RUNTIME, envelope.assessment),
         evaluated_at=NOW + WINDOW,
     )
@@ -170,7 +170,7 @@ def test_missing_acceptance_facts_yield_unavailable(store, seed_review) -> None:
     assert "no start" in result.unavailable_reason
 
 
-def test_unknown_target_is_unavailable_not_none_observed(store) -> None:
+def test_unknown_target_is_unavailable_not_none_observed(history) -> None:
     unknown = (
         "PRODUCT_RUNTIME",
         "run-x",
@@ -179,7 +179,7 @@ def test_unknown_target_is_unavailable_not_none_observed(store) -> None:
         "GIT_COMMIT",
         "f" * 40,
     )
-    result = escaped_defect_status(store, unknown, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, unknown, evaluated_at=NOW + WINDOW)
     assert not result.available
     assert result.status is not EscapedDefectStatusV1.NONE_OBSERVED
 
@@ -187,72 +187,72 @@ def test_unknown_target_is_unavailable_not_none_observed(store) -> None:
 # -- temporal boundaries ----------------------------------------------------
 
 
-def test_defect_just_before_acceptance_is_outside_window(store, seed_owner) -> None:
+def test_defect_just_before_acceptance_is_outside_window(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    store.append(
+    history.append(
         _defect(detected_at=NOW - timedelta(seconds=1)), operational_source=RUNTIME
     )
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
 
 
-def test_defect_exactly_at_acceptance_is_inside_window(store, seed_owner) -> None:
+def test_defect_exactly_at_acceptance_is_inside_window(history, seed_owner) -> None:
     """Start is inclusive."""
 
     target = _accepted_target(seed_owner)
-    store.append(_defect(detected_at=NOW), operational_source=RUNTIME)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    history.append(_defect(detected_at=NOW), operational_source=RUNTIME)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.FOUND
 
 
-def test_day_six_defect_is_found(store, seed_owner) -> None:
+def test_day_six_defect_is_found(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    store.append(
+    history.append(
         _defect(detected_at=NOW + timedelta(days=6)), operational_source=RUNTIME
     )
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.FOUND
 
 
-def test_defect_exactly_at_seven_day_boundary_is_outside(store, seed_owner) -> None:
+def test_defect_exactly_at_seven_day_boundary_is_outside(history, seed_owner) -> None:
     """End is exclusive: [start, start + 7d)."""
 
     target = _accepted_target(seed_owner)
-    store.append(_defect(detected_at=NOW + WINDOW), operational_source=RUNTIME)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    history.append(_defect(detected_at=NOW + WINDOW), operational_source=RUNTIME)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
 
 
-def test_defect_just_inside_boundary_is_found(store, seed_owner) -> None:
+def test_defect_just_inside_boundary_is_found(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    store.append(
+    history.append(
         _defect(detected_at=NOW + WINDOW - timedelta(seconds=1)),
         operational_source=RUNTIME,
     )
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.FOUND
 
 
-def test_day_ten_defect_is_not_found(store, seed_owner) -> None:
+def test_day_ten_defect_is_not_found(history, seed_owner) -> None:
     """The F07 probe: a late defect must never be pulled into the window."""
 
     target = _accepted_target(seed_owner)
     detected_at = NOW + timedelta(days=10)
-    store.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
+    history.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
     result = escaped_defect_status(
-        store, target, evaluated_at=detected_at + timedelta(days=1)
+        history, target, evaluated_at=detected_at + timedelta(days=1)
     )
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
     assert result.window_ends_at == NOW + WINDOW
 
 
 def test_defect_at_day_seven_and_a_half_is_outside_the_canonical_window(
-    store, seed_owner
+    history, seed_owner
 ) -> None:
     target = _accepted_target(seed_owner)
-    store.append(_defect(detected_at=NOW + DAY_7_5), operational_source=RUNTIME)
+    history.append(_defect(detected_at=NOW + DAY_7_5), operational_source=RUNTIME)
     result = escaped_defect_status(
-        store, target, evaluated_at=NOW + DAY_7_5 + timedelta(days=1)
+        history, target, evaluated_at=NOW + DAY_7_5 + timedelta(days=1)
     )
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
 
@@ -260,27 +260,27 @@ def test_defect_at_day_seven_and_a_half_is_outside_the_canonical_window(
 # -- window completion ------------------------------------------------------
 
 
-def test_window_not_complete_before_seven_days(store, seed_owner) -> None:
+def test_window_not_complete_before_seven_days(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + timedelta(days=3))
+    result = escaped_defect_status(history, target, evaluated_at=NOW + timedelta(days=3))
     assert result.status is EscapedDefectStatusV1.WINDOW_NOT_COMPLETE
-    assert len(store.records_of_type(EscapedDefectEventDraft)) == 0
+    assert len(history.records_of_type(EscapedDefectEventDraft)) == 0
 
 
-def test_window_complete_exactly_at_seven_days(store, seed_owner) -> None:
+def test_window_complete_exactly_at_seven_days(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
 
 
-def test_found_takes_precedence_over_incomplete_window(store, seed_owner) -> None:
+def test_found_takes_precedence_over_incomplete_window(history, seed_owner) -> None:
     """An observed in-window defect is an append-only fact."""
 
     target = _accepted_target(seed_owner)
-    store.append(
+    history.append(
         _defect(detected_at=NOW + timedelta(days=1)), operational_source=RUNTIME
     )
-    result = escaped_defect_status(store, target, evaluated_at=NOW + timedelta(days=2))
+    result = escaped_defect_status(history, target, evaluated_at=NOW + timedelta(days=2))
     assert result.status is EscapedDefectStatusV1.FOUND
 
 
@@ -292,16 +292,16 @@ def test_derived_status_vocabulary_has_no_cleared_state() -> None:
     }
 
 
-def test_later_activity_cannot_erase_an_earlier_defect_fact(store, seed_owner) -> None:
+def test_later_activity_cannot_erase_an_earlier_defect_fact(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    store.append(_defect(event_id="d1"), operational_source=RUNTIME)
-    store.append(
+    history.append(_defect(event_id="d1"), operational_source=RUNTIME)
+    history.append(
         _defect(event_id="d2", severity=EscapedDefectSeverity.MINOR),
         operational_source=RUNTIME,
     )
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.FOUND
-    assert len(store.records_of_type(EscapedDefectEventDraft)) == 2
+    assert len(history.records_of_type(EscapedDefectEventDraft)) == 2
 
 
 def test_legacy_status_enum_is_untouched() -> None:
@@ -319,7 +319,7 @@ def test_legacy_status_enum_is_untouched() -> None:
 
 
 def test_same_run_id_different_source_does_not_produce_found(
-    store, seed_owner
+    history, seed_owner
 ) -> None:
     """A dogfood defect must not mark the Product Runtime run as FOUND."""
 
@@ -327,58 +327,58 @@ def test_same_run_id_different_source_does_not_produce_found(
     dogfood_target = _accepted_target(seed_owner, source=DOGFOOD, run_id="run-1")
     assert runtime_target != dogfood_target
 
-    store.append(_defect(run_id="run-1"), operational_source=DOGFOOD)
+    history.append(_defect(run_id="run-1"), operational_source=DOGFOOD)
 
     runtime_result = escaped_defect_status(
-        store, runtime_target, evaluated_at=NOW + WINDOW
+        history, runtime_target, evaluated_at=NOW + WINDOW
     )
     assert runtime_result.status is EscapedDefectStatusV1.NONE_OBSERVED
     assert runtime_result.operational_source is RUNTIME
 
     dogfood_result = escaped_defect_status(
-        store, dogfood_target, evaluated_at=NOW + WINDOW
+        history, dogfood_target, evaluated_at=NOW + WINDOW
     )
     assert dogfood_result.status is EscapedDefectStatusV1.FOUND
     assert dogfood_result.operational_source is DOGFOOD
 
 
-def test_defect_from_another_run_does_not_leak(store, seed_owner) -> None:
+def test_defect_from_another_run_does_not_leak(history, seed_owner) -> None:
     target = _accepted_target(seed_owner, run_id="run-1")
-    store.append(_defect(run_id="run-2"), operational_source=RUNTIME)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    history.append(_defect(run_id="run-2"), operational_source=RUNTIME)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
     assert result.run_id == "run-1"
 
 
-def test_result_carries_its_operational_source(store, seed_owner) -> None:
+def test_result_carries_its_operational_source(history, seed_owner) -> None:
     target = _accepted_target(seed_owner, source=DOGFOOD)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.operational_source is DOGFOOD
 
 
 # -- F07: the seven-day duration is fixed and never caller-supplied ---------
 
 
-def test_canonical_window_duration_is_exactly_seven_days(store, seed_owner) -> None:
+def test_canonical_window_duration_is_exactly_seven_days(history, seed_owner) -> None:
     """The duration is a property of the canonical derivation, not an input."""
 
     assert ESCAPED_DEFECT_WINDOW_DAYS == 7
     target = _accepted_target(seed_owner)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     assert result.window_days == 7
     assert result.window_ends_at - result.window_started_at == timedelta(days=7)
 
 
 @pytest.mark.parametrize("days", [8, 14, 0, -1])
 def test_canonical_api_rejects_a_caller_supplied_duration(
-    store, seed_owner, days
+    history, seed_owner, days
 ) -> None:
     """F07: ``window_days`` is not a parameter of the canonical API at all."""
 
     target = _accepted_target(seed_owner)
     with pytest.raises(TypeError):
         escaped_defect_status(
-            store,
+            history,
             target,
             evaluated_at=NOW + WINDOW,
             window_days=days,  # type: ignore[call-arg]
@@ -407,7 +407,7 @@ def test_window_type_is_not_public() -> None:
 
 
 def test_caller_manufactured_window_cannot_control_derivation(
-    store, seed_owner
+    history, seed_owner
 ) -> None:
     """Even holding the private type, a fabricated window reaches no public API.
 
@@ -420,7 +420,7 @@ def test_caller_manufactured_window_cannot_control_derivation(
 
     target = _accepted_target(seed_owner)
     detected_at = NOW + timedelta(days=10)
-    store.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
+    history.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
 
     forged = _EvaluationWindow(
         operational_source=RUNTIME,
@@ -442,22 +442,22 @@ def test_caller_manufactured_window_cannot_control_derivation(
 
     # And it cannot be supplied to the canonical derivation.
     with pytest.raises(TypeError):
-        escaped_defect_status(store, forged)  # type: ignore[arg-type]
+        escaped_defect_status(history, forged)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         escaped_defect_status(
-            store, target, evaluated_at=NOW, window=forged  # type: ignore[call-arg]
+            history, target, evaluated_at=NOW, window=forged  # type: ignore[call-arg]
         )
 
     result = escaped_defect_status(
-        store, target, evaluated_at=detected_at + timedelta(days=1)
+        history, target, evaluated_at=detected_at + timedelta(days=1)
     )
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
     assert result.window_started_at == NOW
 
 
-def test_result_window_facts_are_immutable(store, seed_owner) -> None:
+def test_result_window_facts_are_immutable(history, seed_owner) -> None:
     target = _accepted_target(seed_owner)
-    result = escaped_defect_status(store, target, evaluated_at=NOW + WINDOW)
+    result = escaped_defect_status(history, target, evaluated_at=NOW + WINDOW)
     with pytest.raises(ValidationError):
         result.window_days = 14  # type: ignore[misc]
     with pytest.raises(ValidationError):
@@ -469,7 +469,7 @@ def test_result_window_facts_are_immutable(store, seed_owner) -> None:
 
 
 def test_window_subclass_cannot_widen_the_canonical_interval(
-    store, seed_owner
+    history, seed_owner
 ) -> None:
     """F07: overriding ``ends_at`` on a subclass reaches no public status path.
 
@@ -494,7 +494,7 @@ def test_window_subclass_cannot_widen_the_canonical_interval(
     target = _accepted_target(seed_owner)
     detected_at = NOW + DAY_7_5
     evaluated_at = detected_at + timedelta(days=1)
-    store.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
+    history.append(_defect(detected_at=detected_at), operational_source=RUNTIME)
 
     widened = WidenedWindow(
         operational_source=RUNTIME,
@@ -509,21 +509,21 @@ def test_window_subclass_cannot_widen_the_canonical_interval(
 
     # No public canonical entry point accepts it, positionally or by keyword.
     with pytest.raises(TypeError):
-        escaped_defect_status(store, widened)  # type: ignore[arg-type]
+        escaped_defect_status(history, widened)  # type: ignore[arg-type]
     with pytest.raises(TypeError):
         escaped_defect_status(
-            store, target, evaluated_at=evaluated_at, window=widened  # type: ignore[call-arg]
+            history, target, evaluated_at=evaluated_at, window=widened  # type: ignore[call-arg]
         )
     # Passing it where the source-qualified target belongs matches no appended
     # assessment, so the result is unavailable — never ``FOUND``.
     substituted = escaped_defect_status(
-        store, widened, evaluated_at=evaluated_at  # type: ignore[arg-type]
+        history, widened, evaluated_at=evaluated_at  # type: ignore[arg-type]
     )
     assert not substituted.available
     assert substituted.status is None
 
     # The canonical derivation keeps the seven-day interval and the real facts.
-    result = escaped_defect_status(store, target, evaluated_at=evaluated_at)
+    result = escaped_defect_status(history, target, evaluated_at=evaluated_at)
     assert result.status is EscapedDefectStatusV1.NONE_OBSERVED
     assert result.window_days == 7
     assert result.window_ends_at == NOW + WINDOW

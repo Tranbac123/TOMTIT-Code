@@ -112,17 +112,17 @@ def test_owner_unreviewed_cannot_be_constructed(owner_draft) -> None:
         owner_draft(outcome="OWNER_UNREVIEWED")
 
 
-def test_absence_of_owner_assessment_derives_unreviewed(store, seed_review) -> None:
+def test_absence_of_owner_assessment_derives_unreviewed(history, seed_review) -> None:
     envelope = seed_review()
     target = report_target_key(RUNTIME, envelope.assessment)
-    assert owner_review_status(store, target) is OwnerReviewStatus.UNREVIEWED
-    assert len(store) == 1
+    assert owner_review_status(history, target) is OwnerReviewStatus.UNREVIEWED
+    assert len(history) == 1
 
 
-def test_owner_accept_and_reject_derive_correctly(store, seed_owner) -> None:
+def test_owner_accept_and_reject_derive_correctly(history, seed_owner) -> None:
     accepted = seed_owner(outcome=OwnerOutcome.OWNER_ACCEPTED)
     assert (
-        owner_review_status(store, report_target_key(RUNTIME, accepted.assessment))
+        owner_review_status(history, report_target_key(RUNTIME, accepted.assessment))
         is OwnerReviewStatus.OWNER_ACCEPTED
     )
 
@@ -133,7 +133,7 @@ def test_owner_accept_and_reject_derive_correctly(store, seed_owner) -> None:
         outcome=OwnerOutcome.OWNER_REJECTED,
     )
     assert (
-        owner_review_status(store, report_target_key(RUNTIME, rejected.assessment))
+        owner_review_status(history, report_target_key(RUNTIME, rejected.assessment))
         is OwnerReviewStatus.OWNER_REJECTED
     )
 
@@ -142,13 +142,13 @@ def test_owner_accept_and_reject_derive_correctly(store, seed_owner) -> None:
 
 
 def test_owner_assessment_overrides_reviewer_proxy(
-    store, seed_review, seed_owner
+    history, seed_review, seed_owner
 ) -> None:
     envelope = seed_review()
     seed_owner(outcome=OwnerOutcome.OWNER_REJECTED)
 
     effective = effective_assessment(
-        store, report_target_key(RUNTIME, envelope.assessment)
+        history, report_target_key(RUNTIME, envelope.assessment)
     )
     assert effective is not None
     assert effective.authority == "OWNER"
@@ -156,18 +156,18 @@ def test_owner_assessment_overrides_reviewer_proxy(
 
 
 def test_reviewer_proxy_used_only_without_owner_assessment(
-    store, seed_review
+    history, seed_review
 ) -> None:
     envelope = seed_review()
     effective = effective_assessment(
-        store, report_target_key(RUNTIME, envelope.assessment)
+        history, report_target_key(RUNTIME, envelope.assessment)
     )
     assert effective is not None
     assert effective.authority == "REVIEWER_PROXY"
 
 
 def test_greatest_append_sequence_wins_not_latest_timestamp(
-    store, seed_review
+    history, seed_review
 ) -> None:
     """§8: timestamp is display/audit only; sequence is ordering authority."""
 
@@ -177,35 +177,35 @@ def test_greatest_append_sequence_wins_not_latest_timestamp(
     )
 
     effective = effective_assessment(
-        store, report_target_key(RUNTIME, last.assessment)
+        history, report_target_key(RUNTIME, last.assessment)
     )
     assert effective is not None
     assert effective.append_sequence == 2
     assert effective.outcome == "REVIEWER_BLOCKED"
-    assert len(store) == 2
+    assert len(history) == 2
 
 
 def test_assessment_of_different_artifact_does_not_apply(
-    store, seed_review, review_draft
+    history, seed_review, review_draft
 ) -> None:
     seed_review(assessment_id="a-old")
     other = review_draft(assessment_id="a-new", report_hash=OTHER_REPORT_HASH)
     other_target = report_target_key(RUNTIME, other)
 
-    assert effective_assessment(store, other_target) is None
-    assert owner_review_status(store, other_target) is OwnerReviewStatus.UNREVIEWED
+    assert effective_assessment(history, other_target) is None
+    assert owner_review_status(history, other_target) is OwnerReviewStatus.UNREVIEWED
 
 
-def test_no_assessment_for_unknown_target(store) -> None:
+def test_no_assessment_for_unknown_target(history) -> None:
     unknown = ("PRODUCT_RUNTIME", "run-x", "report-x", REPORT_HASH, "GIT_COMMIT", "f" * 40)
-    assert effective_assessment(store, unknown) is None
+    assert effective_assessment(history, unknown) is None
 
 
 # -- F10: source collision isolation ----------------------------------------
 
 
 def test_identical_report_identity_across_sources_stays_distinct(
-    store, seed_review
+    history, seed_review
 ) -> None:
     """Same run_id and report identity, two sources: never merged."""
 
@@ -220,8 +220,8 @@ def test_identical_report_identity_across_sources_stays_distinct(
     dogfood_target = report_target_key(DOGFOOD, dogfood_env.assessment)
     assert runtime_target != dogfood_target
 
-    runtime_effective = effective_assessment(store, runtime_target)
-    dogfood_effective = effective_assessment(store, dogfood_target)
+    runtime_effective = effective_assessment(history, runtime_target)
+    dogfood_effective = effective_assessment(history, dogfood_target)
     assert runtime_effective is not None and dogfood_effective is not None
     assert runtime_effective.outcome == "REVIEWER_APPROVED"
     assert dogfood_effective.outcome == "REVIEWER_BLOCKED"
@@ -230,7 +230,7 @@ def test_identical_report_identity_across_sources_stays_distinct(
 
 
 def test_owner_status_does_not_leak_across_sources(
-    store, seed_owner, seed_review
+    history, seed_owner, seed_review
 ) -> None:
     """A dogfood Owner acceptance must not mark the Runtime target reviewed."""
 
@@ -238,7 +238,7 @@ def test_owner_status_does_not_leak_across_sources(
     runtime_env = seed_review(source=RUNTIME)
 
     runtime_target = report_target_key(RUNTIME, runtime_env.assessment)
-    assert owner_review_status(store, runtime_target) is OwnerReviewStatus.UNREVIEWED
+    assert owner_review_status(history, runtime_target) is OwnerReviewStatus.UNREVIEWED
 
 
 # -- F01/F10: no public cross-source "latest" -------------------------------
@@ -256,7 +256,7 @@ def test_no_public_latest_by_sequence_reduction() -> None:
 
 
 def test_identical_local_ids_across_sources_never_produce_a_shared_latest(
-    store, seed_review
+    history, seed_review
 ) -> None:
     """Same run_id, same report identity, different Evaluation append order.
 
@@ -281,8 +281,8 @@ def test_identical_local_ids_across_sources_never_produce_a_shared_latest(
     runtime_target = report_target_key(RUNTIME, runtime_env.assessment)
     dogfood_target = report_target_key(DOGFOOD, dogfood_env.assessment)
 
-    runtime_effective = effective_assessment(store, runtime_target)
-    dogfood_effective = effective_assessment(store, dogfood_target)
+    runtime_effective = effective_assessment(history, runtime_target)
+    dogfood_effective = effective_assessment(history, dogfood_target)
     assert runtime_effective is not None and dogfood_effective is not None
 
     # The later dogfood sequence does not win the Runtime target.
@@ -296,7 +296,7 @@ def test_identical_local_ids_across_sources_never_produce_a_shared_latest(
 
 
 def test_dogfood_owner_acceptance_does_not_govern_the_runtime_target(
-    store, seed_review, seed_owner
+    history, seed_review, seed_owner
 ) -> None:
     """Owner precedence is also source-local, whatever the append order."""
 
@@ -313,15 +313,15 @@ def test_dogfood_owner_acceptance_does_not_govern_the_runtime_target(
     runtime_target = ("PRODUCT_RUNTIME",) + report_target_key(
         DOGFOOD, dogfood_owner.assessment
     )[1:]
-    effective = effective_assessment(store, runtime_target)
+    effective = effective_assessment(history, runtime_target)
     assert effective is not None
     assert effective.authority == "REVIEWER_PROXY"
     assert effective.operational_source is RUNTIME
-    assert owner_review_status(store, runtime_target) is OwnerReviewStatus.UNREVIEWED
+    assert owner_review_status(history, runtime_target) is OwnerReviewStatus.UNREVIEWED
 
 
 def test_mixed_source_records_are_rejected_by_latest_selection(
-    store, seed_review
+    history, seed_review
 ) -> None:
     """The internal reduction refuses anything outside the requested target."""
 
@@ -339,7 +339,7 @@ def test_mixed_source_records_are_rejected_by_latest_selection(
     assert _latest_by_sequence((runtime_env,), runtime_target) is runtime_env
 
 
-def test_unfiltered_store_read_is_not_a_latest_domain(store, seed_review) -> None:
+def test_unfiltered_store_read_is_not_a_latest_domain(history, seed_review) -> None:
     """``records_of_type`` without a source is inspection, not selection."""
 
     seed_review(assessment_id="a-runtime", source=RUNTIME)
@@ -347,7 +347,7 @@ def test_unfiltered_store_read_is_not_a_latest_domain(store, seed_review) -> Non
 
     from tomtit.evaluation.derive import _latest_by_sequence
 
-    both = store.records_of_type(ReviewAssessmentEventDraft)
+    both = history.records_of_type(ReviewAssessmentEventDraft)
     assert len(both) == 2
     with pytest.raises(CrossSourceSelectionError):
         _latest_by_sequence(both, report_target_key(RUNTIME, both[0].assessment))

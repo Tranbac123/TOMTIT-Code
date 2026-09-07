@@ -16,7 +16,7 @@ from tomtit.evaluation import (
     RevisionType,
     SourceRevision,
 )
-from ._seed import seed_report_bound_assessment
+from ._history import TrustedHistoryStore
 
 ACTIVE_COMMIT = "cdb6d360d1d340a1f7720707d3a8594937c0a6ad"
 REPORT_HASH = "a" * 64
@@ -38,7 +38,21 @@ def active_revision() -> SourceRevision:
 
 @pytest.fixture
 def store() -> EvaluationAssessmentStore:
+    """The real production store. Report-bound appends fail closed here."""
+
     return EvaluationAssessmentStore()
+
+
+@pytest.fixture
+def history() -> TrustedHistoryStore:
+    """A store-shaped test double for derivations that need trusted history.
+
+    Distinct from ``store`` on purpose: anything asserted through this fixture
+    is a statement about derivation behavior over history, never a statement
+    about what the shipped store lets a caller publish.
+    """
+
+    return TrustedHistoryStore()
 
 
 @pytest.fixture
@@ -94,15 +108,15 @@ def owner_draft(active_revision):
 
 
 @pytest.fixture
-def seed_review(store, review_draft):
-    """Seed a review assessment through the test-tree helper.
+def seed_review(history, review_draft):
+    """Place a review assessment into the test-only trusted history.
 
     The canonical public ``store.append`` refuses report-bound assessments
     (F04) and stays refused; derivation tests still need such history, so it is
-    placed directly by :mod:`tests.evaluation._seed`, which is not part of the
-    shipped package. This fixture is the *only* way these tests obtain
-    report-bound records, which keeps "can a caller publish one?" and "does the
-    derivation behave?" as separate questions.
+    represented in :mod:`tests.evaluation._history`, which is not part of the
+    shipped package and depends on no production write helper. This fixture is
+    the *only* way these tests obtain report-bound records, which keeps "can a
+    caller publish one?" and "does the derivation behave?" separate questions.
     """
 
     def _seed(
@@ -110,24 +124,24 @@ def seed_review(store, review_draft):
         source: OperationalSource = OperationalSource.PRODUCT_RUNTIME,
         **kwargs,
     ):
-        return seed_report_bound_assessment(
-            store, review_draft(**kwargs), operational_source=source
+        return history.seed_trusted_report_bound(
+            review_draft(**kwargs), operational_source=source
         )
 
     return _seed
 
 
 @pytest.fixture
-def seed_owner(store, owner_draft):
-    """Seed an Owner assessment through the same test-tree helper."""
+def seed_owner(history, owner_draft):
+    """Place an Owner assessment into the same test-only trusted history."""
 
     def _seed(
         *,
         source: OperationalSource = OperationalSource.PRODUCT_RUNTIME,
         **kwargs,
     ):
-        return seed_report_bound_assessment(
-            store, owner_draft(**kwargs), operational_source=source
+        return history.seed_trusted_report_bound(
+            owner_draft(**kwargs), operational_source=source
         )
 
     return _seed

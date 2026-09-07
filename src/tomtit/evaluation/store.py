@@ -15,25 +15,64 @@ Runtime stream, §2.3 forbids Evaluation from creating or modifying a Runtime
 ``DecisionEvent``, and sharing a counter would make the two streams' positions
 comparable.
 
-Report-bound trust boundary (F04)
----------------------------------
+Report-bound trust boundary
+---------------------------
 Contract V1 §4.1 makes ``report_id`` and ``source_revision`` Runtime-assigned
-and immutable, so Evaluation cannot originate them and cannot verify them
-either: any "binding" Evaluation accepts from a caller is a value the caller
+and immutable, so Evaluation cannot originate them and cannot verify them on
+its own: any "binding" Evaluation accepts *from a caller* is a value the caller
 chose. A structural check over caller-chosen values is not a trust boundary —
 neither a dedicated class, nor a duck-typed protocol, nor a reserved
-``issued_by`` string turns a caller's assertion into Runtime authority.
+``issued_by`` string turns a caller's assertion into Runtime authority. Nor
+does an object that carries its own ``verify()``: running a method the caller
+supplied to decide whether that caller is authorized is the same defect wearing
+a type annotation.
 
-Until an authorized ``EVAL-RUNTIME-BRIDGE`` supplies genuinely Runtime-owned
-binding authority, the canonical append path for the two report-bound events
-therefore **fails closed for every operational source**::
+``EVAL-RUNTIME-BRIDGE-01`` closes this, and the authority is deliberately not
+anything the caller hands over. Runtime keeps a process-local publication
+ledger (:mod:`tomtit.reporting`) of the terminal reports it actually published;
+``append`` takes ``publication_receipt_id``, an opaque string, and
+:func:`~tomtit.evaluation.bridge.verify_published_report` resolves it against
+that ledger. The ledger re-reads the path it recorded and re-hashes those
+bytes, then this module compares the draft's §11 target against the facts that
+come back. Nothing caller-controlled executes anywhere in that path — the
+receipt id must be exactly :class:`str`, so there is no method to override and
+no attribute access to intercept.
 
-    ReviewAssessmentEventDraft  -> ReportBoundAppendUnavailableError
-    OwnerAssessmentEventDraft   -> ReportBoundAppendUnavailableError
+What that does and does not buy::
 
-The V1 draft and persisted models still exist and are still validated as
-data-contract shapes; only canonical *publication* is blocked. There is no
-public parameter, keyword, subclass hook or issuer name that opens it.
+    arbitrary report file        -> no ledger entry     -> refused
+    copied published bytes       -> no ledger entry     -> refused
+    replayed/reused report id    -> allocation consumed -> refused
+    tampered published artifact  -> hash mismatch       -> refused
+    duck type / subclass / dict  -> not a str           -> refused
+    genuine receipt, no revision -> §4.2 unassessable   -> refused
+
+The last line is the current state of every real Product Runtime run.
+``PRODUCT_RUNTIME_SOURCE_REVISION_AUTHORITY`` is unimplemented — nothing
+establishes the source revision a run executed against — so Runtime publishes
+``source_revision = null`` and §4.2 admits no Review or Owner assessment
+against such a report. Canonical report-bound publication therefore still fails
+closed today, but for a different and narrower reason than before: the bridge
+exists, the artifact's provenance does not. A publication that carries both a
+ledger receipt and an authoritative source revision is assessable; producing
+one is separately authorized future work, and this module must not fabricate
+it.
+
+Authenticity here is process-local, and that is the whole claim. The ledger is
+in-memory: it says "this process published this artifact" and nothing about
+another process or host. No signing, no attestation, no malicious-host
+resistance.
+
+The gate holds because the store ships exactly one write callable. Publication
+is written inline inside :meth:`EvaluationAssessmentStore.append`, after the
+authority check, and no helper — public or private, method or module-level —
+reaches that code. The three private module functions here,
+:func:`_classify_draft`, :func:`_require_verified_publication` and
+:func:`_rehydrate`, are read-only: they classify a type, refuse an unproven
+publication, and rebuild a detached record from JSON. None can place anything
+into a store, so there is no inner entry point to call instead of ``append``.
+Tests that need *non-canonical* report-bound history represent it entirely in
+the test tree; the package offers no seam for writing it.
 
 Durability
 ----------
@@ -56,7 +95,9 @@ from tomtit.evaluation.assessments import (
     ReviewAssessmentEvent,
     ReviewAssessmentEventDraft,
     SourceAwareAssessment,
+    report_target_key,
 )
+from tomtit.evaluation.bridge import verify_published_report
 from tomtit.evaluation.provenance import OperationalSource
 
 #: Stream names, per Contract V1 §8.
@@ -74,9 +115,18 @@ _DRAFT_TO_PERSISTED: dict[type, type] = {
     EscapedDefectEventDraft: EscapedDefectEvent,
 }
 
-#: Report-bound drafts have no canonical append path in V0A (F04): only the
-#: observed operational source can assign the terminal-report identity they
-#: bind to, and no bridge exists to attest it, so both fail closed.
+#: Report-bound drafts do have a canonical append path: EVAL-RUNTIME-BRIDGE-01
+#: is implemented. It requires a verified Runtime publication receipt, which
+#: rebinds the assessment target to the process-local Runtime/reporting ledger's
+#: own facts — not to anything the caller supplies — and the published report
+#: must also carry an active authoritative source revision.
+#:
+#: That second requirement is what still fails closed today:
+#: PRODUCT_RUNTIME_SOURCE_REVISION_AUTHORITY is not established, so Runtime
+#: publishes ``source_revision = null`` and §4.2 leaves current real Product
+#: Runtime reports unassessable. The blocker is the artifact's provenance, not a
+#: missing bridge. Authenticity here is process-local only: no signing, no
+#: cross-process authentication, no hostile-host resistance.
 _REPORT_BOUND_DRAFTS = (ReviewAssessmentEventDraft, OwnerAssessmentEventDraft)
 
 #: The canonical identity field for each draft type, used for duplicate
@@ -110,18 +160,131 @@ class DuplicateAssessmentIdentityError(ValueError):
 
 
 class ReportBoundAppendUnavailableError(ValueError):
-    """Raised for every canonical append of a report-bound assessment.
+    """Raised when a report-bound assessment arrives with no publication evidence.
 
     Contract V1 §4 admits a valid Review or Owner assessment only against a
     terminal report whose ``report_id``/``source_revision`` were assigned by the
     observed operational source (§4.1). Evaluation neither assigns nor can
-    verify those values, and EVAL-RUNTIME-BRIDGE — the authorized component
-    that would — does not exist yet.
-
-    Accepting caller-supplied "proof" instead would make the caller its own
-    authority, so V0A refuses the append outright. This is a deliberate
-    unavailability, not a validation failure of the draft.
+    verify those values on its own, so an append without a publication receipt
+    id — or with something that merely resembles one — is refused: absence of
+    evidence is not authority, and neither is a convincing-looking object.
     """
+
+
+class PublicationTargetMismatchError(ValueError):
+    """Raised when the assessment target disagrees with the published artifact.
+
+    Contract V1 §9/§11 require ``run_id``, ``target_terminal_report_id``,
+    ``target_terminal_report_hash`` and ``target_source_revision`` to match the
+    report exactly. Every one of those is compared against values the
+    publication ledger re-proved from the artifact, never against anything the
+    caller stated.
+    """
+
+
+def _classify_draft(draft: object, operational_source: OperationalSource) -> type:
+    """Classify a draft as one of the five exact V1 types. Pure, and read-only.
+
+    Returns a type and touches no store: it cannot publish anything, which is
+    why it is safe for it to live outside :meth:`EvaluationAssessmentStore.append`
+    while the record-appending code does not.
+    """
+
+    if not isinstance(operational_source, OperationalSource):
+        raise UnsupportedAssessmentError(
+            "operational_source must be an OperationalSource member"
+        )
+
+    draft_type = type(draft)
+    if draft_type not in _DRAFT_TO_PERSISTED:
+        raise UnsupportedAssessmentError(
+            f"{draft_type.__name__} is not one of the exact Contract V1 "
+            f"assessment drafts "
+            f"{[cls.__name__ for cls in _DRAFT_TO_PERSISTED]}; subclasses "
+            "are refused because they can alter the persisted schema"
+        )
+    return draft_type
+
+
+def _require_verified_publication(
+    draft: object,
+    draft_type: type,
+    operational_source: OperationalSource,
+    publication_receipt_id: object,
+) -> None:
+    """Prove a report-bound draft targets a real Runtime publication. Read-only.
+
+    The whole trust decision lives here, and none of it runs caller code:
+
+    1. a publication receipt id must be present (no evidence, no assessment —
+       §4.2), and it must be exactly a string. Anything else — an object with
+       a ``verify()``, a mapping, a subclass of a trusted-looking type — is
+       refused here rather than consulted, because the store must never invoke
+       a method a caller supplied to decide whether that caller is authorized;
+    2. :func:`~tomtit.evaluation.bridge.verify_published_report` asks Runtime's
+       publication ledger to re-prove the receipt: that it names a real
+       publication, that the recorded artifact still hashes to what was
+       published, and that the report is assessable at all under §4.2/§5.3;
+    3. the draft's §11 target key must equal the key the ledger derived —
+       run_id, report id, exact-byte SHA-256, revision type and revision value,
+       all five.
+
+    The caller therefore chooses *which* publication to assess and nothing
+    else. A caller who wants a different target must get Runtime to publish a
+    different report, which is Runtime's job, not Evaluation's.
+
+    Pure and store-free: it can refuse an append but can never perform one.
+    """
+
+    if publication_receipt_id is None:
+        raise ReportBoundAppendUnavailableError(
+            f"{draft_type.__name__} binds to a terminal report identity that only "
+            "the observed operational source assigns (Contract V1 §4.1). Supply "
+            "the publication receipt id Runtime kept when it published the report "
+            "(runtime.publication_receipt.receipt_id); Evaluation cannot originate "
+            "report_id or source_revision, and no caller-stated value substitutes "
+            "for a recorded publication."
+        )
+    # noqa rationale: isinstance() is wrong here. A str subclass can override
+    # __eq__/__hash__ and so influence its own lookup, which puts caller code
+    # back in the trust path. Only the exact built-in type is accepted.
+    if type(publication_receipt_id) is not str:  # noqa: E721
+        raise ReportBoundAppendUnavailableError(
+            "publication_receipt_id must be the opaque receipt id string Runtime "
+            f"issued, not {type(publication_receipt_id).__name__}; an object that "
+            "looks authoritative proves nothing, because authority is the "
+            "publication ledger and not the value presented"
+        )
+
+    verified = verify_published_report(
+        publication_receipt_id, operational_source=operational_source
+    )
+
+    expected = report_target_key(operational_source, draft)  # type: ignore[arg-type]
+    if expected != verified.target_key:
+        raise PublicationTargetMismatchError(
+            "assessment target does not match the published terminal report: "
+            f"assessment={expected} report={verified.target_key}. Contract V1 "
+            "§9/§11 require run_id, report id, exact-byte hash and source "
+            "revision to match exactly; an assessment of an old report or "
+            "revision never applies to a newer output."
+        )
+
+
+def _rehydrate(
+    source_value: str, persisted_name: str, serialized: str
+) -> SourceAwareAssessment:
+    """Rebuild one detached record from stored JSON. Read-only."""
+
+    persisted_cls = next(
+        cls
+        for cls in _DRAFT_TO_PERSISTED.values()
+        if cls.__name__ == persisted_name
+    )
+    return SourceAwareAssessment(
+        operational_source=OperationalSource(source_value),
+        assessment=persisted_cls.model_validate_json(serialized),
+    )
 
 
 class EvaluationAssessmentStore:
@@ -144,69 +307,42 @@ class EvaluationAssessmentStore:
         draft: object,
         *,
         operational_source: OperationalSource,
+        publication_receipt_id: str | None = None,
     ) -> SourceAwareAssessment:
         """Validate, then atomically publish one persisted V1 event.
 
-        Report-bound drafts are refused unconditionally: see
-        :class:`ReportBoundAppendUnavailableError`. There is no keyword,
-        binding object or issuer name that changes that — the decision is made
-        from the draft's exact type alone, before any other work.
+        This is the whole write surface of the store, and publication is
+        written inline rather than delegated: there is no second callable —
+        public or private, on this class or beside it — that reaches the
+        record-appending code below. A caller cannot therefore skip the
+        report-bound gate by calling something further in, because the gate and
+        the append are the same function body.
+
+        Report-bound drafts require ``publication_receipt_id``: the opaque id
+        Runtime kept when it published the terminal report. It is resolved
+        against Runtime's publication ledger, which re-reads the artifact it
+        recorded and re-hashes it, and every §11 target field is compared
+        against the facts that come back. What authorizes the append is a
+        recorded Runtime publication — never the type of the object presented,
+        a method on it, or anything the caller asserts.
 
         Nothing mutates store state until every fallible step has succeeded:
-        type check, report-bound check, duplicate check, persisted-event
+        type check, publication verification, duplicate check, persisted-event
         construction, serialization, and rehydration all happen first. A
         failure therefore leaves length, sequence, and history untouched — no
         burned sequence number and no partially visible record.
         """
 
-        draft_type = self._validated_draft_type(draft, operational_source)
+        draft_type = _classify_draft(draft, operational_source)
         if draft_type in _REPORT_BOUND_DRAFTS:
-            raise ReportBoundAppendUnavailableError(
-                f"{draft_type.__name__} binds to a terminal report identity that "
-                "only the observed operational source can assign (Contract V1 "
-                "§4.1). Evaluation cannot originate or verify report_id and "
-                "source_revision, and no caller-supplied value can stand in for "
-                "that authority, so canonical publication of report-bound "
-                "assessments is unavailable in V0A. Future dependency: "
-                "EVAL-RUNTIME-BRIDGE."
+            _require_verified_publication(
+                draft, draft_type, operational_source, publication_receipt_id
             )
-        return self._publish(draft, draft_type, operational_source)
-
-    # -- internals ----------------------------------------------------------
-
-    @staticmethod
-    def _validated_draft_type(
-        draft: object, operational_source: OperationalSource
-    ) -> type:
-        """Exact-type gate for the canonical append path."""
-
-        if not isinstance(operational_source, OperationalSource):
+        elif publication_receipt_id is not None:
             raise UnsupportedAssessmentError(
-                "operational_source must be an OperationalSource member"
+                f"{draft_type.__name__} is not report-bound under Contract V1 and "
+                "must not be appended with a publication receipt"
             )
-
-        draft_type = type(draft)
-        if draft_type not in _DRAFT_TO_PERSISTED:
-            raise UnsupportedAssessmentError(
-                f"{draft_type.__name__} is not one of the exact Contract V1 "
-                f"assessment drafts "
-                f"{[cls.__name__ for cls in _DRAFT_TO_PERSISTED]}; subclasses "
-                "are refused because they can alter the persisted schema"
-            )
-        return draft_type
-
-    def _publish(
-        self,
-        draft: object,
-        draft_type: type,
-        operational_source: OperationalSource,
-    ) -> SourceAwareAssessment:
-        """Duplicate check, construct, serialize, rehydrate, then publish.
-
-        Private. Reached from :meth:`append` only for non-report-bound drafts;
-        the report-bound gate above is the sole authority decision and it is
-        made before this runs.
-        """
 
         persisted_cls = _DRAFT_TO_PERSISTED[draft_type]
         identity = (
@@ -231,7 +367,7 @@ class EvaluationAssessmentStore:
             operational_source=operational_source, assessment=persisted
         )
         serialized = persisted.model_dump_json()
-        rehydrated = self._rehydrate(
+        rehydrated = _rehydrate(
             operational_source.value, persisted_cls.__name__, serialized
         )
 
@@ -246,26 +382,12 @@ class EvaluationAssessmentStore:
 
     # -- reads --------------------------------------------------------------
 
-    @staticmethod
-    def _rehydrate(
-        source_value: str, persisted_name: str, serialized: str
-    ) -> SourceAwareAssessment:
-        persisted_cls = next(
-            cls
-            for cls in _DRAFT_TO_PERSISTED.values()
-            if cls.__name__ == persisted_name
-        )
-        return SourceAwareAssessment(
-            operational_source=OperationalSource(source_value),
-            assessment=persisted_cls.model_validate_json(serialized),
-        )
-
     @property
     def records(self) -> tuple[SourceAwareAssessment, ...]:
         """All appended records in Evaluation-local append order."""
 
         return tuple(
-            self._rehydrate(source_value, persisted_name, serialized)
+            _rehydrate(source_value, persisted_name, serialized)
             for source_value, persisted_name, serialized in self._serialized
         )
 
@@ -284,7 +406,7 @@ class EvaluationAssessmentStore:
 
         persisted_name = _DRAFT_TO_PERSISTED[draft_cls].__name__
         return tuple(
-            self._rehydrate(source_value, name, serialized)
+            _rehydrate(source_value, name, serialized)
             for source_value, name, serialized in self._serialized
             if name == persisted_name
             and (
