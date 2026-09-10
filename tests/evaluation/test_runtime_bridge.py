@@ -1056,3 +1056,159 @@ def test_defect_window_stays_closed_without_acceptance(
     target = report_target_key(RUNTIME, envelope.assessment)
     result = escaped_defect_status(store, target, evaluated_at=NOW + timedelta(days=8))
     assert not result.available
+
+
+# -- a genuine Product Runtime run, and exactly where it stops -----------------
+#
+# These use the production composition root against a real Git repository: real
+# binding, real adapter invocation, real checks, real publication ledger. What
+# they demonstrate is the *fail-closed* boundary, not an enablement claim.
+#
+# Contract V1 §4.1 defines ``source_revision`` as identifying "the exact source
+# output represented by the report". A coding worker normally leaves the
+# workspace dirty, and §5.2/§5.3 keep the revision types that could describe
+# uncommitted output RESERVED_NOT_ACTIVE. So a normal real run publishes
+# ``source_revision = null``: the report is genuine, the publication verifies,
+# and canonical Eval append still refuses. Publishing the execution base instead
+# would be a report describing source it does not represent.
+
+
+def _real_product_runtime_run(tmp_path: Path):
+    """One real run: real repo, real adapter invocation, real checks."""
+
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from runtime._workspace_fixture import (
+        head_commit,
+        make_repository,
+        task_contract,
+        verification_plan,
+        write_provider,
+    )
+
+    from tomtit.runtime.execution import create_product_runtime
+
+    repository = tmp_path / "project"
+    make_repository(repository)
+    base = head_commit(repository)
+
+    runtime = create_product_runtime(
+        run_id="run-product",
+        task_contract=task_contract(),
+        verification_plan=verification_plan(),
+        workspace_path=repository,
+        report_directory=tmp_path / "reports",
+        executable_path=str(write_provider(tmp_path)),
+        allowed_changed_paths=("src/fixture.py",),
+    )
+    runtime.run_scenario_1()
+    return runtime, repository, base
+
+
+def test_real_dirty_runtime_report_publishes_and_verifies(tmp_path: Path) -> None:
+    """The publication is genuine even though the report is unassessable."""
+
+    runtime, repository, base = _real_product_runtime_run(tmp_path)
+
+    assert "VALUE = 42" in (repository / "src" / "fixture.py").read_text()
+    assert runtime.workspace.collect_delta().has_uncommitted_changes
+
+    published = json.loads(
+        (tmp_path / "reports" / "report.v1.json").read_text(encoding="utf-8")
+    )
+    # §4.1: no active revision type represents this output, so the field is null
+    # and the execution base deliberately does not stand in for it.
+    assert published["source_revision"] is None
+    assert runtime.execution_base_revision.revision_value == base
+
+    # The publication itself is real and the ledger verifies its exact bytes.
+    from tomtit.reporting import publication_authority
+
+    assert runtime.publication_receipt is not None
+    facts = publication_authority().verify_publication(
+        runtime.publication_receipt.receipt_id
+    )
+    assert facts.report_sha256 == hashlib.sha256(
+        (tmp_path / "reports" / "report.v1.json").read_bytes()
+    ).hexdigest()
+    assert facts.source_revision is None
+
+
+@pytest.mark.parametrize("kind", ["review", "owner"])
+def test_real_dirty_runtime_report_cannot_be_assessed(
+    tmp_path: Path, kind: str
+) -> None:
+    """Canonical Review and Owner append both fail closed, store unchanged."""
+
+    runtime, _, base = _real_product_runtime_run(tmp_path)
+    receipt = runtime.publication_receipt.receipt_id
+
+    with pytest.raises(UnassessableTerminalReportError) as excinfo:
+        verify_published_report(receipt)
+    assert "source_revision" in str(excinfo.value)
+
+    common = {
+        "run_id": "run-product",
+        "target_terminal_report_id": "any",
+        "target_terminal_report_hash": "a" * 64,
+        "target_source_revision": SourceRevision(
+            revision_type=RevisionType.GIT_COMMIT, revision_value=base
+        ),
+        "timestamp": NOW,
+        "evidence_refs": ("e",),
+    }
+    draft = (
+        ReviewAssessmentEventDraft(
+            assessment_id="rev-1",
+            review_outcome=ReviewOutcome.REVIEWER_APPROVED,
+            reviewer="codex",
+            **common,
+        )
+        if kind == "review"
+        else OwnerAssessmentEventDraft(
+            assessment_id="own-1",
+            owner_outcome=OwnerOutcome.OWNER_ACCEPTED,
+            **common,
+        )
+    )
+
+    store = EvaluationAssessmentStore()
+    with pytest.raises(UnassessableTerminalReportError):
+        store.append(draft, operational_source=RUNTIME, publication_receipt_id=receipt)
+    assert len(store) == 0 and store.sequence == 0 and store.records == ()
+
+
+def test_real_report_metadata_is_not_fixture_metadata(tmp_path: Path) -> None:
+    """A11/A12: a real run and a fixture run describe themselves differently."""
+
+    _real_product_runtime_run(tmp_path)
+    real = json.loads(
+        (tmp_path / "reports" / "report.v1.json").read_text(encoding="utf-8")
+    )
+    assert real["implementer"] == "ProductRuntimeClaudeWorker"
+    joined = " ".join(real["adapter_capability_limitations"])
+    assert "fake dependency" not in joined
+    assert "deterministic fixture evidence" not in joined
+    assert "ClaudeCodeCLIAdapter" in joined
+    # The limitation is stated, not hidden.
+    assert "process-local" in joined
+
+    fixture_runtime = run_product_runtime(tmp_path / "fixture")
+    fixture = json.loads(
+        published_report(tmp_path / "fixture").read_text(encoding="utf-8")
+    )
+    assert fixture_runtime.workspace is None
+    assert fixture["implementer"] == "FakeWorker"
+    assert "fake dependency" in " ".join(fixture["adapter_capability_limitations"])
+
+
+def test_worker_result_cannot_self_attest_the_execution_profile(
+    tmp_path: Path,
+) -> None:
+    """The profile is Runtime-owned; no worker field reaches it."""
+
+    runtime, _, _ = _real_product_runtime_run(tmp_path)
+    claim = runtime.record.worker_result.model_dump()
+    for forbidden in ("implementer", "adapter_capability_limitations"):
+        assert forbidden not in claim, forbidden

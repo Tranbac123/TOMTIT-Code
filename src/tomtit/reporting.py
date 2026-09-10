@@ -14,11 +14,12 @@ weakening of it: §4.2 states that a terminal report lacking ``report_id`` or
 outside Runtime's completion path simply carries neither and can never be
 assessed. Runtime assigns ``report_id`` on the canonical path; nothing else may.
 
-``source_revision`` is currently never assigned at all — see
-:class:`ReportSourceRevision` — because no component in this repository
-establishes the source revision a run executed against. That is recorded as an
-open dependency rather than papered over, and it is why a report published
-today is unassessable under §4.2.
+``source_revision`` is assigned only when an active Contract V1 revision
+describes the run's exact source *output*. Runtime resolves it on the
+completion path from the final workspace state (see
+:mod:`tomtit.runtime.workspace`); a run whose worker left uncommitted changes
+has no such representation and publishes ``null``, which §4.2 turns into an
+unassessable report. That is the contract working, not a gap.
 
 Publication authority
 ---------------------
@@ -94,14 +95,14 @@ class ReportSourceRevision(DomainModel):
     Declared in this module rather than imported from ``tomtit.evaluation`` so
     terminal reporting keeps no dependency on Evaluation.
 
-    Nothing in this repository constructs one on a production path, and that is
-    deliberate. A source revision is only provenance if it was established by
-    whoever prepared the source state the run executed against; no component
-    here does that, and accepting one from a caller would make the caller its
-    own authority. So Runtime publishes ``source_revision = None`` and §4.2
-    makes the report unassessable. This model defines the shape an execution
-    provenance authority will fill once one exists; it does not pretend one
-    does.
+    The sole producer is Runtime's completion path, from a workspace it bound
+    and validated itself; nothing accepts one from a caller, which would make
+    the caller its own authority.
+
+    The value describes the **output** the report represents, not the base the
+    run started from. A coding worker normally leaves the workspace dirty, and
+    §5.2/§5.3 give uncommitted output no active revision type, so the usual and
+    correct answer is that no revision is published at all.
     """
 
     revision_type: Literal["GIT_COMMIT"] = "GIT_COMMIT"
@@ -197,6 +198,12 @@ def _build_terminal_report_from_validated_record(
     *,
     generated_at: datetime,
     report_id: str | None = None,
+    source_revision: ReportSourceRevision | None = None,
+    implementer: str = "FakeWorker",
+    adapter_capability_limitations: tuple[str, ...] = (
+        "fake dependency; no filesystem, network, or command enforcement claims",
+        "patch evidence is deterministic fixture evidence, not a real Git workspace snapshot",
+    ),
 ) -> TerminalReport:
     """Private: build the report from a record the caller has already proven.
 
@@ -236,8 +243,10 @@ def _build_terminal_report_from_validated_record(
         task_id=validated_record.task_contract.task_id,
         run_id=validated_record.run_id,
         report_id=report_id,
-        # Never set: no execution provenance authority exists to establish it.
-        source_revision=None,
+        # §4.1: the exact source output this report represents. Established by
+        # Runtime's completion path from the workspace's final state, or None
+        # when no active revision type can describe that output.
+        source_revision=source_revision,
         outcome=validated_record.outcome,
         stop_reason=validated_record.stop_reason,
         verification_status=validated_record.verification_status,
@@ -246,13 +255,14 @@ def _build_terminal_report_from_validated_record(
         interpreted_scope=validated_record.task_contract.allowed_scope,
         acceptance_criteria=criteria,
         attempts=validated_record.attempt_count,
-        implementer="FakeWorker",
+        # Runtime-owned execution facts, supplied by the composition layer that
+        # actually built the run and never read from worker output. The defaults
+        # describe the fixture scenarios, which is what a record built outside a
+        # real execution binding truthfully is.
+        implementer=implementer,
         verifier=None,
         verification_mode=validated_record.verification_plan.mode,
-        adapter_capability_limitations=(
-            "fake dependency; no filesystem, network, or command enforcement claims",
-            "patch evidence is deterministic fixture evidence, not a real Git workspace snapshot",
-        ),
+        adapter_capability_limitations=adapter_capability_limitations,
         worker_claims=validated_record.worker_result,
         observed_evidence=validated_record.observed_checks,
         observed_patch_evidence=validated_record.observed_patch,

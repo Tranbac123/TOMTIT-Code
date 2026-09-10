@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from tomtit.domain.contracts import (
     Finding,
@@ -31,9 +31,14 @@ from tomtit.domain.evaluation import (
     EvaluationEvent,
     PersistedDecisionEvent,
 )
-from tomtit.fakes import FakeCheckRunner, FakeWorker
+from tomtit.runtime.ports import CheckRunnerPort, WorkerPort
+from tomtit.runtime.workspace import (
+    UnrelatedHistoryError,
+    assert_output_outside_workspace,
+)
 from tomtit.reporting import (
     STAGED_REPORT_NAME,
+    ReportSourceRevision,
     PublicationReceipt,
     _build_terminal_report_from_validated_record,
     publication_authority,
@@ -175,14 +180,81 @@ class Runtime:
         run_id: str,
         task_contract: TaskContract,
         verification_plan: VerificationPlan,
-        worker: FakeWorker,
-        check_runner: FakeCheckRunner,
         event_log: InMemoryEventLog,
         report_directory: Path,
+        worker: WorkerPort | None = None,
+        check_runner: CheckRunnerPort | None = None,
         clock: Callable[[], datetime] = utc_now,
+        execution: object | None = None,
     ) -> None:
+        # Exactly one of the two shapes, never a mixture. A real execution
+        # binding supplies its own worker and check runner, both already proven
+        # bound to its workspace; accepting extras alongside it would reopen the
+        # substitution the binding exists to close.
+        if execution is not None:
+            if worker is not None or check_runner is not None:
+                raise ValueError(
+                    "an execution binding already supplies its worker and check "
+                    "runner; passing either separately would let a component "
+                    "bound to a different workspace run under this run's "
+                    "provenance"
+                )
+            from tomtit.runtime.execution import ProductRuntimeExecution
+
+            if type(execution) is not ProductRuntimeExecution:
+                raise ValueError(
+                    "execution must be a ProductRuntimeExecution, not "
+                    f"{type(execution).__name__}"
+                )
+            worker = execution.worker
+            check_runner = execution.check_runner
+
+            # Runtime-owned output must not sit inside the source it is about to
+            # describe. Enforced here rather than only in the composition
+            # factory: every supported real path reaches this constructor, so
+            # this is the point where the rule is actually an invariant.
+            root = execution.workspace.path
+            assert_output_outside_workspace(report_directory, root, "report_directory")
+            assert_output_outside_workspace(
+                worker.artifact_directory, root, "worker artifact_directory"
+            )
+            assert_output_outside_workspace(
+                check_runner.artifact_directory, root, "check runner artifact_directory"
+            )
+        else:
+            if worker is None or check_runner is None:
+                raise ValueError(
+                    "a run needs either an execution binding or both a worker "
+                    "and a check runner"
+                )
+
+            # The loose pair exists for the fixture scenarios and stays open to
+            # them. A *real* component arriving this way would skip everything
+            # the binding exists to guarantee -- canonical scope application,
+            # workspace and history validation, the trusted profile -- and the
+            # run would publish itself as fixture work. Refuse rather than try to
+            # reconstruct a binding from loose parts.
+            from tomtit.runtime.execution import (
+                ProductRuntimeCheckRunner,
+                ProductRuntimeClaudeWorker,
+            )
+
+            for label, component, real in (
+                ("worker", worker, ProductRuntimeClaudeWorker),
+                ("check_runner", check_runner, ProductRuntimeCheckRunner),
+            ):
+                if isinstance(component, real):
+                    raise ValueError(
+                        f"{label} is a {type(component).__name__}, which carries "
+                        "real execution authority and must be supplied through a "
+                        "ProductRuntimeExecution binding. Passing it directly "
+                        "would skip workspace, history and scope validation and "
+                        "publish the run under the fixture profile."
+                    )
+
         self._worker = worker
         self._check_runner = check_runner
+        self._execution = execution
         self._event_log = event_log
         self._report_directory = report_directory
         self._clock = clock
@@ -220,6 +292,30 @@ class Runtime:
         """
 
         return self._publication_receipt
+
+    @property
+    def execution(self) -> object | None:
+        """The immutable execution binding this run uses, if any."""
+
+        return self._execution
+
+    @property
+    def workspace(self):
+        """The bound workspace this run executes in, if any."""
+
+        return self._execution.workspace if self._execution is not None else None
+
+    @property
+    def execution_base_revision(self) -> ReportSourceRevision | None:
+        """The commit execution started from. Internal fact, not §4.1.
+
+        Provenance about the *input*, exposed under a name that says so. It is
+        never published as the report's ``source_revision``, which §4.1 reserves
+        for the output.
+        """
+
+        workspace = self.workspace
+        return workspace.execution_base_revision if workspace is not None else None
 
     @property
     def canonical_task_contract_hash(self) -> str:
@@ -323,6 +419,7 @@ class Runtime:
             self._record.run_id,
             attempt_number,
         )
+        observed_patch = self._apply_canonical_scope(observed_patch)
         self._replace_record(
             observed_checks=observed_checks,
             observed_patch=observed_patch,
@@ -743,6 +840,12 @@ class Runtime:
         # Known up front so a staging call that fails part-way through still has
         # its partial file removed by the handler below.
         staged_report = self._report_directory / STAGED_REPORT_NAME
+        # On the completion path, not beside it. complete_run() is the only
+        # route to COMPLETED -- the public transition() refuses COMPLETED as a
+        # protected target -- so validating the final source state here is what
+        # makes the guarantee real rather than a helper nobody calls.
+        source_revision = self._validated_output_revision()
+        profile = self._execution_profile()
         # Allocated before the try so a failure anywhere below can hand it back
         # unused; an allocation that never publishes must not stay publishable.
         report_id = self._publication_authority._allocate_report_id()
@@ -789,6 +892,12 @@ class Runtime:
                 # published bytes and nothing outside Runtime can choose it
                 # (§4.1). Only this id will be recordable as published.
                 report_id=report_id,
+                # §4.1: the exact source output this report represents. Resolved
+                # on the completion path from the workspace's final state --
+                # never the base it started from, and never worker-reported.
+                source_revision=source_revision,
+                implementer=profile.implementer,
+                adapter_capability_limitations=profile.adapter_capability_limitations,
             )
             rendered = render_terminal_report(report)
             stage_terminal_report(self._report_directory, rendered)
@@ -810,6 +919,82 @@ class Runtime:
             events=(run_completed, report_generated),
             report_id=report_id,
         )
+
+    def _apply_canonical_scope(self, evidence):
+        """Interpret observed changes against *this run's* TaskContract.
+
+        The check runner observes; Runtime decides. Scope is a contract
+        question, and the canonical contract is the one Runtime was created
+        with, so the decision is made here from ``self._record.task_contract``
+        and nowhere else. A component holding its own contract would be a second
+        configurable owner of the same fact, and a broader one would authorise
+        what the canonical contract withholds.
+
+        Only real executions are re-interpreted. The fixture scenarios keep
+        supplying their own fixture violations, which is what their recorded
+        history has always meant.
+        """
+
+        if self._execution is None:
+            return evidence
+
+        allowed = self._record.task_contract.allowed_scope
+        violations = tuple(
+            item.path
+            for item in evidence.changed_files
+            if not any(
+                item.operation in rule.operations
+                and PurePath(item.path).match(rule.pattern)
+                for rule in allowed
+            )
+        )
+        if violations == evidence.scope_violations:
+            return evidence
+        return evidence.model_copy(update={"scope_violations": violations})
+
+    def _validated_output_revision(self) -> ReportSourceRevision | None:
+        """Validate the final source state and return its §4.1 revision.
+
+        Two jobs, done from one observation of the repository so they cannot
+        disagree with each other:
+
+        1. **Integrity, which can fail the run.** If the final ``HEAD`` does not
+           descend from the bound execution base, the history was reset or
+           rewritten and every delta computed against that base is meaningless.
+           That raises, so no canonical success occurs.
+        2. **Representability, which cannot.** A dirty tree is a perfectly
+           ordinary outcome of a coding run; it simply has no active Contract V1
+           revision describing it, so the report publishes ``None`` and
+           Evaluation refuses to assess it. Execution success and Eval
+           assessability are separate questions and stay separate.
+
+        A fixture run has no workspace and therefore no revision -- the same
+        fail-closed answer, for a different reason.
+        """
+
+        workspace = self.workspace
+        if workspace is None:
+            return None
+
+        delta = workspace.collect_delta()
+        if not delta.base_is_ancestor:
+            raise UnrelatedHistoryError(
+                f"workspace {workspace.path} is at {delta.current_head}, which "
+                f"does not descend from the bound execution base "
+                f"{delta.base_commit}; the source present cannot be explained by "
+                "this run's own base, so no evidence computed against it is "
+                "trustworthy"
+            )
+        return workspace.resolve_output_revision(delta)
+
+    def _execution_profile(self):
+        """How this run executed. Owned by Runtime, never by the worker."""
+
+        from tomtit.runtime.execution import FIXTURE_EXECUTION_PROFILE
+
+        if self._execution is None:
+            return FIXTURE_EXECUTION_PROFILE
+        return self._execution.profile
 
     def _commit_completion(self, prepared: _PreparedCompletion) -> RunRecord:
         """Apply the prepared completion, or restore the pre-completion run.
