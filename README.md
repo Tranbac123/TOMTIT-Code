@@ -1,6 +1,6 @@
-# TOMTIT Coordinator
+# TOMTIT-Code
 
-TOMTIT Coordinator is a coding-first coordinator designed to supervise an existing coding agent through bounded execution, observed evidence, proportional verification, explicit revision limits, and auditable stop decisions.
+TOMTIT-Code is a coding-first coordinator designed to supervise an existing coding agent through bounded execution, observed evidence, proportional verification, explicit revision limits, and auditable stop decisions.
 
 The product goal is not to replace the coding model. It is to preserve or improve accepted result quality while reducing the user's coordination and review effort.
 

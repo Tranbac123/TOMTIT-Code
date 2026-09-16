@@ -1,1 +1,1 @@
-"""TOMTIT Coordinator MVP."""
+"""TOMTIT-Code MVP."""

@@ -1,4 +1,4 @@
-# TOMTIT Coordinator — System Rules
+# TOMTIT-Code — System Rules
 
 **Status:** Active
 
@@ -14,7 +14,7 @@ If any authority document changes version or semantics, review this file for dri
 
 ## 1. Mission
 
-Build the smallest coding-first TOMTIT Coordinator that can:
+Build the smallest coding-first TOMTIT-Code that can:
 
 - assign a bounded task to an existing coding agent;
 - collect observed evidence instead of trusting worker claims;

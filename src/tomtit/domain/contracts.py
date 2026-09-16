@@ -1,4 +1,4 @@
-"""Machine-readable execution contracts for TOMTIT Coordinator MVP V0."""
+"""Machine-readable execution contracts for TOMTIT-Code MVP V0."""
 
 from __future__ import annotations
 

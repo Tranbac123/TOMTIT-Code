@@ -109,7 +109,7 @@ def validate_workspace(raw_workspace: str) -> Path:
     if not workspace.exists() or not workspace.is_dir():
         raise ConfigurationError("workspace must exist and be a directory")
     if workspace == COORDINATOR_ROOT or is_within(workspace, COORDINATOR_ROOT):
-        raise ConfigurationError("the TOMTIT Coordinator repository may not be a target")
+        raise ConfigurationError("the TOMTIT-Code repository may not be a target")
     code, inside = git_output(workspace, "rev-parse", "--is-inside-work-tree")
     if code != 0 or inside != "true":
         raise ConfigurationError("workspace must be a Git repository")

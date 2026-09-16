@@ -3537,7 +3537,7 @@ def _validate_workspace(raw_workspace: str) -> Path:
     if not workspace.exists() or not workspace.is_dir():
         raise PreflightFailure("INVALID_WORKSPACE", "workspace must exist and be a directory")
     if workspace == REPO_ROOT or _is_within(workspace, REPO_ROOT):
-        raise PreflightFailure("WORKSPACE_INSIDE_COORDINATOR", "the TOMTIT Coordinator repository may not be a target")
+        raise PreflightFailure("WORKSPACE_INSIDE_COORDINATOR", "the TOMTIT-Code repository may not be a target")
     completed = _run_git(["rev-parse", "--is-inside-work-tree"], workspace)
     if completed.returncode != 0 or completed.stdout.strip() != "true":
         raise PreflightFailure("NOT_A_GIT_REPOSITORY", "workspace must be a Git repository")

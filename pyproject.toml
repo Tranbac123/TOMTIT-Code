@@ -3,9 +3,9 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "tomtit-coordinator"
+name = "tomtit-code"
 version = "0.1.0"
-description = "Domain contracts for the TOMTIT Coordinator MVP"
+description = "Domain contracts for the TOMTIT-Code MVP"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
