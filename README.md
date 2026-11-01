@@ -46,22 +46,26 @@ python -m pytest
 
 Use the exact environment and additional commands required by the current Owner-authorized task. Do not invent substitute checks when a required command is unavailable; record the limitation instead.
 
+## Documentation
+
+The full documentation index is [`docs/README.md`](docs/README.md).
+
 ## Governance
 
 Primary policy and process documents:
 
-- `docs/MVP_EXECUTION_POLICY_V0.md` — V0.3
-- `docs/OFFICIAL_BUILD_AND_AI_CODING_PROCESS_V1.md` — V1
-- `docs/EVALUATION_CONTRACT_V1.md` — V1
-- `docs/VERIFIER_POLICY_V1.md` — V1
-- `docs/DOGFOOD_EXPERIMENT_PROTOCOL_V0.md` — V0.2
+- [`docs/MVP_EXECUTION_POLICY_V0.md`](docs/MVP_EXECUTION_POLICY_V0.md) — V0.3
+- [`docs/OFFICIAL_BUILD_AND_AI_CODING_PROCESS_V1.md`](docs/OFFICIAL_BUILD_AND_AI_CODING_PROCESS_V1.md) — V1
+- [`docs/EVALUATION_CONTRACT_V1.md`](docs/EVALUATION_CONTRACT_V1.md) — V1
+- [`docs/VERIFIER_POLICY_V1.md`](docs/VERIFIER_POLICY_V1.md) — V1
+- [`docs/DOGFOOD_EXPERIMENT_PROTOCOL_V0.md`](docs/DOGFOOD_EXPERIMENT_PROTOCOL_V0.md) — V0.2
 
 Bootstrap and operating summaries:
 
-- `SYSTEM.md`
-- `CLAUDE.md`
+- [`SYSTEM.md`](SYSTEM.md)
+- [`CLAUDE.md`](CLAUDE.md)
 
-Gate decisions and exact artifact identities belong in `docs/gate-evidence/` and the corresponding implementation and review reports. README summaries do not replace those records.
+Gate decisions and exact artifact identities belong in [`docs/gate-evidence/`](docs/gate-evidence/) and the corresponding implementation and review reports, now archived under [`docs/archive/`](docs/archive/README.md). README summaries do not replace those records.
 
 ## Verification model
 
